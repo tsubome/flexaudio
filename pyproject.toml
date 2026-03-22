@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyflexaudio"
+version = "0.1.0"
+description = "Flexible cross-platform audio capture library for Python"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "pyflexaudio contributors" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+]
+dependencies = [
+    "numpy>=1.24",
+    "soxr>=0.5",
+    "sounddevice>=0.5",
+]
+
+[project.optional-dependencies]
+mic-fallback = ["miniaudio>=1.57"]
+vad = ["onnxruntime>=1.16"]
+win-system = ["pyaudiowpatch>=0.2.12"]
+win-process = ["pyflexaudio-win-dll>=1.0"]
+mac = [
+    "pyobjc-framework-ScreenCaptureKit>=10.0",
+    "pyobjc-framework-CoreAudio>=10.0",
+    "pyobjc-framework-CoreMedia>=10.0",
+    "pyobjc-framework-AVFoundation>=10.0",
+    "pyobjc-framework-Quartz>=10.0",
+    "pyobjc-framework-libdispatch>=10.0",
+    "pyobjc-core>=10.0",
+]
+linux = ["pulsectl>=23.0"]
+full = [
+    "pyflexaudio[mic-fallback]",
+    "pyflexaudio[vad]",
+    "pyflexaudio[win-system]",
+    "pyflexaudio[win-process]",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+pyflexaudio = "pyflexaudio.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "hardware: marks tests that require real audio hardware",
+]
