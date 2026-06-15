@@ -257,6 +257,14 @@ impl Stream {
         &self.config
     }
 
+    /// backend のネイティブフォーマット `(sample_rate, channels)`。
+    ///
+    /// open 時に backend から取得して保持した値（再オープン後も不変前提）。
+    /// 表示・診断用（出力フォーマットは `config().output`）。
+    pub fn native_format(&self) -> (u32, u16) {
+        self.shared.native_format
+    }
+
     // --- 内部 ---
 
     /// RawRing を新規作成して backend を start し、RawConsumer を共有へ載せる。

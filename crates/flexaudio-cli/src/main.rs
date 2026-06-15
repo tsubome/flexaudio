@@ -41,13 +41,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 
-use flexaudio::core::{
-    AudioChunk, CaptureBackend, Error, OutputFormat, SourceKind, StreamConfig,
-};
+use flexaudio::core::{AudioChunk, Error, OutputFormat, SourceKind, StreamConfig};
 use flexaudio::Stream;
-use flexaudio_mic::CpalMicBackend;
-#[cfg(target_os = "linux")]
-use flexaudio_os_linux::{PwProcessBackend, PwSystemBackend};
 
 /// キャプチャするソース種別（CLI 引数用）。
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -180,60 +175,56 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         };
     }
 
-    // --- ソース種別から backend / SourceKind / 表示ラベルを解決 ---
-    // Stream::open は Box<dyn CaptureBackend> を取る汎用設計なので、
-    // 以降のキャプチャ本体は全ソース共通。
-    let (backend, kind, source_label): (Box<dyn CaptureBackend>, SourceKind, &str) =
-        match cli.source {
-            SourceArg::Mic => (
-                Box::new(CpalMicBackend::new()),
-                SourceKind::Mic,
-                "mic（既定入力デバイス）",
-            ),
-            SourceArg::System => {
-                #[cfg(target_os = "linux")]
-                {
-                    (
-                        Box::new(PwSystemBackend::new()),
-                        SourceKind::SystemLoopback,
-                        "system（既定出力の monitor / PipeWire）",
-                    )
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
+    // --- ソース種別から SourceKind / 表示ラベルを解決 ---
+    // バックエンドの構築・選択は facade `flexaudio::open` に一元化されている
+    // （DRY）。CLI 側では SourceKind・表示ラベルの決定と、人間向けの事前チェック
+    // （process の PID 必須・非 Linux の system/process 拒否）だけを担う。
+    // open は Box<dyn CaptureBackend> を内部で選んで Stream を返す。
+    let (kind, source_label): (SourceKind, &str) = match cli.source {
+        SourceArg::Mic => (SourceKind::Mic, "mic（既定入力デバイス）"),
+        SourceArg::System => {
+            #[cfg(target_os = "linux")]
+            {
+                (
+                    SourceKind::SystemLoopback,
+                    "system（既定出力の monitor / PipeWire）",
+                )
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(
+                    "--source system（システム出力ループバック）は現在 Linux のみ対応です。"
+                        .into(),
+                );
+            }
+        }
+        SourceArg::Process => {
+            #[cfg(target_os = "linux")]
+            {
+                // process では PID 必須。無ければ分かりやすいエラーで止める
+                // （facade も InvalidArg を返すが、CLI では人間向け文言で先に弾く）。
+                if cli.process_id.is_none() {
                     return Err(
-                        "--source system（システム出力ループバック）は現在 Linux のみ対応です。"
+                        "--source process には --process-id <PID> が必要です。\
+                         （対象プロセスの PID を指定してください。例: \
+                         speaker-test を鳴らして得た PID）"
                             .into(),
                     );
                 }
+                (
+                    SourceKind::ProcessLoopback,
+                    "process（特定 PID 出力の fan-out / PipeWire）",
+                )
             }
-            SourceArg::Process => {
-                #[cfg(target_os = "linux")]
-                {
-                    // process では PID 必須。無ければ分かりやすいエラーで止める。
-                    let Some(pid) = cli.process_id else {
-                        return Err(
-                            "--source process には --process-id <PID> が必要です。\
-                             （対象プロセスの PID を指定してください。例: \
-                             speaker-test を鳴らして得た PID）"
-                                .into(),
-                        );
-                    };
-                    (
-                        Box::new(PwProcessBackend::new(pid, cli.exclude_self)),
-                        SourceKind::ProcessLoopback,
-                        "process（特定 PID 出力の fan-out / PipeWire）",
-                    )
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    return Err(
-                        "--source process（プロセス出力ループバック）は現在 Linux のみ対応です。"
-                            .into(),
-                    );
-                }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(
+                    "--source process（プロセス出力ループバック）は現在 Linux のみ対応です。"
+                        .into(),
+                );
             }
-        };
+        }
+    };
 
     // --- 出力フォーマット解決・検証 ---
     let output = cli.output_format();
@@ -246,8 +237,20 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     let out_rate = output.sample_rate;
     let out_ch = output.channels;
 
+    // --- ストリームを開く（backend 選択は facade flexaudio::open に一元化） ---
+    // open は config.kind に応じて Box<dyn CaptureBackend> を内部で選んで返す。
+    // まだ start しない（二段方式）。native_format は開いた Stream から取る。
+    let config = StreamConfig {
+        kind,
+        output,
+        target_pid: cli.process_id,
+        exclude_self: cli.exclude_self,
+        ..Default::default()
+    };
+    let mut stream = flexaudio::open(config).map_err(describe_error)?;
+
     // --- ネイティブフォーマット表示 ---
-    let (native_rate, native_ch) = backend.native_format();
+    let (native_rate, native_ch) = stream.native_format();
     log!("ソース            : {source_label}");
     log!("ネイティブフォーマット: {native_rate} Hz / {native_ch} ch");
     if stdout_stream {
@@ -271,15 +274,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     }
     log!("");
 
-    // --- ストリームを開いて開始 ---
-    let config = StreamConfig {
-        kind,
-        output,
-        target_pid: cli.process_id,
-        exclude_self: cli.exclude_self,
-        ..Default::default()
-    };
-    let mut stream = Stream::open(config, backend).map_err(describe_error)?;
+    // --- キャプチャ開始（open 済みの Stream を start する二段方式） ---
     stream.start().map_err(describe_error)?;
 
     log!("キャプチャ中 ...");
