@@ -20,4 +20,10 @@ rust-version = "1.85"
 repository = "https://github.com/tsubome/pyflexaudio"
 
 [workspace.dependencies]
-# 実装フェーズで追加 (rtrb, ringbuf, rubato, cpal, ort, pyo3, numpy 等)
+# flexaudio-core が要求する純 Rust 依存 (システムライブラリ不要・実行時ネットワーク禁止)
+bitflags = "2"
+ringbuf = "0.4"
+rtrb = "0.3"
+rubato = "3"
+thiserror = "2"
+# 実装フェーズで追加 (cpal, ort, pyo3, numpy 等)
