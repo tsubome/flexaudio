@@ -195,6 +195,779 @@ impl Drop for PwSystemBackend {
     }
 }
 
+// ============================================================================
+// プロセス出力ループバック（特定 PID のアプリ音声を fan-out 複製でキャプチャ）
+// ============================================================================
+
+/// PipeWire 経由で**特定プロセス（PID）の音声出力**をキャプチャする
+/// [`CaptureBackend`]。WASAPI の process-loopback（`AUDIOCLIENT_ACTIVATION_PARAMS`）
+/// の Linux 相当。
+///
+/// # 方式 B（link-factory で出力ポート→自入力ポートを明示リンク）
+///
+/// **実機検証で方式 A（`stream.connect` の target/`target.object` でノード指定）は
+/// WirePlumber に無視され、capture が既定ソース＝マイクへ繋がる偽陽性が出ることが
+/// 判明した**ため、方式 A は採らない。代わりに、自前のキャプチャ stream の入力ポートと
+/// 対象プロセスの出力ノードのポートを **link-factory で明示リンク**する（`pw-link
+/// out_FL→in_FL / out_FR→in_FR` の API 版）。アプリ→既定 sink の本来のリンクは
+/// そのまま残る（fan-out）ため、ユーザーのスピーカーは**鳴ったまま**（非侵襲）。
+///
+/// PID とノードの対応は二段で解決する。PipeWire では PID は **ノードではなく Client
+/// オブジェクト**に載り、`pipewire.sec.pid`（`*pw::keys::SEC_PID`）が registry の
+/// Client global props に**常在**する（デーモンがソケット資格情報から付与＝詐称不能。
+/// 実機 stock 検証で確定）。ノードは `client.id` で所有 Client を指すだけ。よって
+/// 「PID → `pipewire.sec.pid == target_pid` の Client の global id → その id を
+/// `client.id` に持つ `Stream/Output/Audio` ノード」の順に辿る（[`resolve_node_pid`]
+/// 参照）。
+///
+/// 自前 stream は `stream.connect(Direction::Input, None, ...)` で接続するが
+/// **`AUTOCONNECT` を付けない**（マイクへの自動リンクを防ぐ＝明示リンクのみ）。これで
+/// 入力ポート（input_FL/FR）が生成され、リンクされるまでデータは来ない。対象出力ポートと
+/// 自入力ポートが揃ったら `core.create_object::<Link>("link-factory", ...)` で
+/// `LINK_OUTPUT_NODE/PORT`・`LINK_INPUT_NODE/PORT` を指定してチャンネル対応リンクを張る。
+///
+/// # `!Send` 回避
+///
+/// [`PwSystemBackend`] と同型の「専用スレッド 1 本所有」方式。`MainLoop`/`Context`/
+/// `Core`/`Registry`/`Stream` はいずれも `!Send` なので**専用スレッド
+/// （`flexaudio-pw-process`）に閉じ込め**、本体が持つのは `Send` なものだけ（停止用
+/// [`pipewire::channel::Sender`]・[`JoinHandle`]・[`AtomicBool`]）。
+///
+/// # 待機を許容（後から鳴り始める/消えるは正常系）
+///
+/// 対象 PID のノードがまだ出ていない/後から現れるのは正常系。PipeWire デーモンに
+/// 接続でき registry を取れたら [`start`](CaptureBackend::start) は**成功扱いで待機**
+/// し、registry の `global` で対象出力ポートと自入力ポートが揃った瞬間に link-factory で
+/// リンクする。`global_remove` でターゲット消失を検知したらリンクを drop して**再待機**
+/// （冪等に再リンク可能）。PipeWire デーモン不在・registry 取得失敗のみ
+/// [`Error::Backend`] で即返す（panic しない）。
+///
+/// # `exclude_self`
+///
+/// プロセスキャプチャは対象 PID のノードのみ録るので、自プロセスの再生は構造的に
+/// 入らない＝[`exclude_self`](StreamConfig::exclude_self) は**常に成立し no-op**。
+/// フラグは受け取って保持するだけで、リンク挙動の分岐には使わない。
+/// （システムキャプチャの `exclude_self` は PipeWire に OS プリミティブが無く未実装
+/// ＝将来課題。）
+///
+/// ```no_run
+/// use flexaudio_os_linux::PwProcessBackend;
+/// use flexaudio_core::backend::CaptureBackend;
+///
+/// let backend = PwProcessBackend::new(12345, false);
+/// assert_eq!(backend.native_format(), (48_000, 2));
+/// // let mut backend = backend;
+/// // backend.start(sink)?;  // PipeWire 不在/registry 失敗なら Err(Backend)、
+/// //                        // それ以外は成功して対象 PID 出現まで待機
+/// // ...
+/// // backend.stop();
+/// ```
+pub struct PwProcessBackend {
+    /// キャプチャ対象プロセスの PID。registry の Client オブジェクトの
+    /// `pipewire.sec.pid`（`*pw::keys::SEC_PID`）と突合し、その Client を `client.id` で
+    /// 指す出力ノードを対象にする（二段照合。[`resolve_node_pid`] 参照）。
+    target_pid: u32,
+    /// 自プロセス除外フラグ。プロセス経路では構造的に常に成立する no-op だが、
+    /// 契約（[`StreamConfig::exclude_self`]）を保持するために控える。リンク挙動の
+    /// 分岐には使わない。
+    exclude_self: bool,
+    /// 起動中フラグ（二重 start ガード／drop 判定用）。`Send`。
+    running: Arc<AtomicBool>,
+    /// PipeWire ループスレッドへ停止を伝える送信端。`start` で `Some`。
+    /// [`PwSystemBackend`] と同じ [`Terminate`] を再利用する。
+    stop_tx: Option<pw::channel::Sender<Terminate>>,
+    /// PipeWire ループスレッドのハンドル。`start` で `Some`。
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PwProcessBackend {
+    /// 対象 PID と `exclude_self` フラグからバックエンドを構築する（この時点では
+    /// PipeWire へ接続しない）。実際の接続・ストリーム作成・link-factory リンクは
+    /// [`start`](CaptureBackend::start) 内で専用スレッド上で行われる。
+    ///
+    /// `exclude_self` はプロセス経路では no-op（対象 PID のみ録るため構造的に成立）
+    /// だが、契約として受け取り保持する。
+    pub fn new(target_pid: u32, exclude_self: bool) -> Self {
+        Self {
+            target_pid,
+            exclude_self,
+            running: Arc::new(AtomicBool::new(false)),
+            stop_tx: None,
+            handle: None,
+        }
+    }
+
+    /// キャプチャ対象の PID。
+    pub fn target_pid(&self) -> u32 {
+        self.target_pid
+    }
+
+    /// 保持している `exclude_self` フラグ（プロセス経路では構造的に常に成立する
+    /// no-op。値はあくまで契約[`StreamConfig::exclude_self`]の保持用）。
+    pub fn exclude_self(&self) -> bool {
+        self.exclude_self
+    }
+}
+
+impl CaptureBackend for PwProcessBackend {
+    fn native_format(&self) -> (u32, u16) {
+        (NATIVE_RATE, NATIVE_CHANNELS)
+    }
+
+    fn start(&mut self, sink: RawSink) -> Result<()> {
+        // 二重 start に安全（既に動作中なら何もしない）。
+        if self.running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        // ループスレッドへの停止チャネル（受信端は loop に attach する）。
+        let (stop_tx, stop_rx) = pw::channel::channel::<Terminate>();
+        // ループスレッドのセットアップ成否を start() へ同期返却するチャネル。
+        // ここでの「成功」は「PipeWire 接続 + registry 取得 + stream 生成 + registry
+        // リスナ登録」まで。**対象 PID への fan-out リンクは成功条件に含めない**
+        // （未出現は正常系で、出現時に registry コールバックからリンクする）。
+        let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();
+
+        let running = self.running.clone();
+        running.store(true, Ordering::SeqCst);
+
+        let target_pid = self.target_pid;
+        let handle = thread::Builder::new()
+            .name("flexaudio-pw-process".into())
+            .spawn(move || {
+                run_pw_process_loop(target_pid, sink, stop_rx, &ready_tx);
+            })
+            .map_err(|e| Error::Backend(format!("spawn pipewire process thread: {e}")))?;
+
+        // セットアップ結果を待つ。ready を送らずスレッドが終了した場合も失敗扱い。
+        match ready_rx.recv() {
+            Ok(Ok(())) => {
+                // セットアップ成功（接続〜registry リスナ登録まで）。以後は対象 PID
+                // 出現までスレッドが待機し、出力ポート/自入力ポートが揃った時点で
+                // link-factory リンクを張る。
+                self.stop_tx = Some(stop_tx);
+                self.handle = Some(handle);
+                Ok(())
+            }
+            Ok(Err(msg)) => {
+                // セットアップ失敗（pipewire 不在・connect/registry 失敗等）。
+                running.store(false, Ordering::SeqCst);
+                let _ = handle.join();
+                Err(Error::Backend(msg))
+            }
+            Err(_) => {
+                // ready を一度も送らずスレッドが消えた（想定外パニック等）。
+                running.store(false, Ordering::SeqCst);
+                let _ = handle.join();
+                Err(Error::Backend(
+                    "pipewire process setup thread terminated before signaling readiness".into(),
+                ))
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        // 二重 stop / 未 start に安全（PwSystemBackend::stop と同型）。
+        if !self.running.swap(false, Ordering::SeqCst) {
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+            self.stop_tx = None;
+            return;
+        }
+
+        // ループスレッドへ停止を通知（受信端コールバックが loop.quit() を呼ぶ）。
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(Terminate);
+        }
+
+        // run() を抜けてスレッドが終了するのを待つ。終了時に Stream→Registry→Core→
+        // Context→MainLoop が drop 順に破棄される（すべてループスレッド上で）。
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for PwProcessBackend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// プロセスキャプチャ用 PipeWire ループスレッド本体。
+///
+/// この関数の中だけで `MainLoop`/`Context`/`Core`/`Registry`/`Stream` を生成・実行・
+/// 破棄する（いずれも `!Send`）。セットアップ完了/失敗を `ready_tx` で呼び出し元へ
+/// 返し、成功時は `main_loop.run()` で停止指示（[`Terminate`]）まで回り続ける。
+/// 対象 PID のノードを registry で待ち受け、対象出力ポートと自入力ポートが揃った
+/// 時点で link-factory リンクを張る。
+fn run_pw_process_loop(
+    target_pid: u32,
+    sink: RawSink,
+    stop_rx: pw::channel::Receiver<Terminate>,
+    ready_tx: &mpsc::Sender<std::result::Result<(), String>>,
+) {
+    // セットアップ（接続・stream 生成・registry リスナ登録）を別関数に集約。
+    // 戻り値はループ実行中ずっと生かす所有物（drop すると監視/リンクが止まる）。
+    let (main_loop, _keep) = match setup_pw_process(target_pid, sink) {
+        Ok(t) => t,
+        Err(msg) => {
+            // セットアップ失敗を通知して終了（panic しない）。
+            let _ = ready_tx.send(Err(msg));
+            return;
+        }
+    };
+
+    // 停止チャネルの受信端を loop に attach。Terminate 受信で quit()。
+    // quit() は loop 駆動のコールバック内 = このスレッド上から呼ばれる。
+    let main_loop_for_quit = main_loop.clone();
+    let _attached = stop_rx.attach(main_loop.loop_(), move |_terminate| {
+        main_loop_for_quit.quit();
+    });
+
+    // セットアップ成功を通知。以後は run() がブロックし、対象 PID の出現を待ち受ける。
+    if ready_tx.send(Ok(())).is_err() {
+        // 呼び出し元が消えている（start が drop 済み等）。起動しない。
+        return;
+    }
+
+    // 停止指示（Terminate）受信 or プロセス終了まで回り続ける。
+    // 対象 PID が未出現の間もここで待機し、registry コールバックがリンクする。
+    main_loop.run();
+    // ここを抜けると _attached → _keep（listener→stream→registry→core→main_loop）の
+    // 順で drop され、PipeWire リソースがこのスレッド上で安全に破棄される。
+}
+
+/// プロセスキャプチャの run 中ずっと保持する所有物。drop するとキャプチャが止まる。
+///
+/// - `CoreRc`: `core.create_object("link-factory", ...)` の主体。registry コールバック
+///   から link を生成するため `Rc` で共有しつつ、drop 順の末尾として保持する。
+/// - `StreamRc`: 自前キャプチャ stream 本体（`Direction::Input` で接続済み。入力ポートを
+///   持ち、対象出力ポートとのリンク確立でデータが流入する）。
+/// - `StreamListener`: param_changed/process コールバック登録。drop で外れる。
+/// - `RegistryRc`: registry プロキシ本体。
+/// - `Registry Listener`: global/global_remove リスナ（drop で外れる）。
+/// - `links`: link-factory で生成した [`pw::link::Link`] プロキシ群。**drop すると
+///   リンクが切れる**ため、ループスレッド上で生かし続ける。registry コールバックが
+///   ここへ push / clear するので `Rc<RefCell<…>>` で共有する。
+#[allow(clippy::type_complexity)]
+struct ProcessKeep {
+    _stream: pw::stream::StreamRc,
+    _listener: pw::stream::StreamListener<UserData>,
+    _registry: pw::registry::RegistryRc,
+    _registry_listener: pw::registry::Listener,
+    _links: std::rc::Rc<std::cell::RefCell<Vec<pw::link::Link>>>,
+    _core: pw::core::CoreRc,
+}
+
+/// 監視中の Stream/Output/Audio ノード 1 件の登録情報（registry global から拾う）。
+///
+/// PipeWire では PID は**ノードではなく Client オブジェクト**のプロパティ
+/// （`pipewire.sec.pid`）に載る。ノード側には通常 PID は無く、`client.id` で所有
+/// Client を指すだけ。そのため PID 解決は二段（ノード→client.id→Client の PID）。
+/// 将来互換のためノード自身に PID が載っていればそれも控える（`app_pid`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NodeEntry {
+    /// このノードを所有する Client の registry global id（ノード props の `client.id`）。
+    /// 無い場合もある（その場合は `app_pid` か `client_pid` 解決のいずれも当たらない）。
+    owning_client_id: Option<u32>,
+    /// ノード自身の props に PID が載っていた場合の PID
+    /// （通常は `None`。将来 PipeWire がノードに PID を載せる構成への互換用）。
+    app_pid: Option<u32>,
+}
+
+/// 1 ポートの登録情報（registry の `ObjectType::Port` global から拾う）。
+///
+/// 対象出力ノードの出力ポート（`direction == "out"`）と、自前キャプチャ stream の
+/// 入力ポート（`direction == "in"`）の双方をここに蓄積し、チャンネル名（`audio.channel`）
+/// で対応付けてリンクする。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PortEntry {
+    /// このポートを持つノードの registry global id（ポート props の `node.id`）。
+    node_id: u32,
+    /// 方向（`"out"` = 出力ポート / `"in"` = 入力ポート）。
+    direction: String,
+    /// オーディオチャンネル名（`"FL"` / `"FR"` / `"MONO"` 等）。無ければ空。
+    channel: String,
+}
+
+/// 出力ポートと入力ポートをチャンネルで対応付け、張るべきリンクのペアを返す純ロジック
+/// （PipeWire 非依存・到着順非依存）。引数 `(out_port_id, channel)` の出力ポート集合と
+/// `(in_port_id, channel)` の入力ポート集合から、`(out_port_id, in_port_id)` のリンク
+/// ペアを構築する。
+///
+/// 対応規則:
+/// 1. **チャンネル名一致**（FL→FL / FR→FR / MONO→MONO 等）を最優先で対応付ける。
+/// 2. **モノラル出力の複製**: 出力が 1 ポート（典型的に MONO）で入力が複数ポートある
+///    場合、その単一出力を全入力ポートへ複製リンクする（モノ→FL/FR 両方）。
+/// 3. **順序フォールバック**: チャンネル名が取れない/一致しないときは、残った出力ポートと
+///    入力ポートを並び順で best-effort 対応付ける。
+///
+/// 戻り値は重複の無いリンクペア列。1 つも作れなければ空 `Vec`。
+fn pair_ports(out_ports: &[(u32, String)], in_ports: &[(u32, String)]) -> Vec<(u32, u32)> {
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+
+    // 既に対応付けた入力ポートを記録（同一入力ポートへ二重リンクしない）。
+    let mut used_in: Vec<bool> = vec![false; in_ports.len()];
+
+    // --- 1. チャンネル名一致を最優先 ---
+    // 出力ポートごとに、同じ非空チャンネル名の未使用入力ポートを探して対応付ける。
+    for (out_id, out_ch) in out_ports {
+        if out_ch.is_empty() {
+            continue;
+        }
+        if let Some(idx) = in_ports
+            .iter()
+            .enumerate()
+            .position(|(i, (_in_id, in_ch))| !used_in[i] && in_ch == out_ch)
+        {
+            used_in[idx] = true;
+            pairs.push((*out_id, in_ports[idx].0));
+        }
+    }
+
+    // --- 2. モノラル出力の複製 ---
+    // 出力が 1 ポートだけで、まだ未対応の入力ポートが残っているなら、その単一出力を
+    // 残り全入力へ複製する（モノ → FL/FR 両方など）。チャンネル一致で既に対応済みの
+    // 入力は除く（二重リンク防止）。
+    if out_ports.len() == 1 {
+        let (out_id, _out_ch) = &out_ports[0];
+        for (i, _in_port) in in_ports.iter().enumerate() {
+            if !used_in[i] {
+                used_in[i] = true;
+                pairs.push((*out_id, in_ports[i].0));
+            }
+        }
+        return pairs;
+    }
+
+    // --- 3. 順序フォールバック ---
+    // チャンネル名一致で対応付けられなかった出力ポート（空チャンネル含む）を、残った
+    // 入力ポートへ並び順で best-effort 対応付ける。
+    // 既に対応付けた出力ポートを記録。
+    let mut paired_out: Vec<u32> = pairs.iter().map(|(o, _)| *o).collect();
+    for (out_id, _out_ch) in out_ports {
+        if paired_out.contains(out_id) {
+            continue;
+        }
+        if let Some(idx) = used_in.iter().position(|used| !*used) {
+            used_in[idx] = true;
+            paired_out.push(*out_id);
+            pairs.push((*out_id, in_ports[idx].0));
+        }
+    }
+
+    pairs
+}
+
+/// ノードの PID を解決する純ロジック（PipeWire 非依存・到着順非依存）。
+///
+/// 解決順:
+/// 1. ノード自身に PID があれば（将来互換）それを直接使う。
+/// 2. 無ければ `client.id` で所有 Client を引き、`client_pid` 表（Client global id →
+///    その Client の `pipewire.sec.pid`）から PID を解決する。
+///
+/// Client が先に来ても Node が先に来ても、各 global 到着時にこの関数で再評価すれば
+/// 順序に依存せず正しく PID を解決できる（どちらも揃った時点で `Some(pid)` になる）。
+fn resolve_node_pid(entry: &NodeEntry, client_pid: &std::collections::HashMap<u32, u32>) -> Option<u32> {
+    if let Some(pid) = entry.app_pid {
+        // ノードに直接 PID が載る将来構成。Client を介さず確定。
+        return Some(pid);
+    }
+    // 通常経路: client.id → Client の PID。
+    let client_id = entry.owning_client_id?;
+    client_pid.get(&client_id).copied()
+}
+
+/// 自前キャプチャ stream のノード名（registry で自分の入力ポートを引くための固有名）。
+/// 対象 PID を埋め込んで衝突を避ける。
+fn capture_node_name(target_pid: u32) -> String {
+    format!("flexaudio-capture-{target_pid}")
+}
+
+/// プロセスキャプチャのセットアップ一式。失敗は `Err(String)`（panic しない）。
+///
+/// 方式 B（link-factory）。[`setup_pw`]（システム monitor）との違い:
+/// - **`STREAM_CAPTURE_SINK` を付けない**。**`AUTOCONNECT` も付けない**（マイクへの
+///   自動リンクを防ぐ＝明示リンクのみ）。`node.name` に固有名
+///   （[`capture_node_name`]）を付け、registry で自分の入力ポートを引けるようにする。
+/// - **ここで一度だけ `stream.connect(Direction::Input, None, ...)` する**。これで自前の
+///   入力ポート（input_FL/FR）が生成されるが、リンクされるまでデータは来ない
+///   （リンク確立で format ネゴ→データ流入）。
+/// - registry の `global` を張りっぱなしで購読し、**Client / Node / Port** を追跡する。
+///   PID は **Client** の `pipewire.sec.pid`（`*pw::keys::SEC_PID`）に常在する（実機 stock
+///   検証で確定。デーモンがソケット資格情報から付与＝詐称不能）。ノードは `client.id` で
+///   Client を指すだけなので、PID 照合は二段（node → client.id → Client の PID。
+///   [`resolve_node_pid`]）。Client が先でも Node が先でも、各 global 到着時に再評価する
+///   （到着順非依存）。
+/// - 「`target_pid` に属する Stream/Output/Audio ノードの出力ポート」と「自ノードの入力
+///   ポート」が揃った時点で、registry コールバック（ループスレッド実行）から
+///   `core.create_object::<pw::link::Link>("link-factory", ...)` でチャンネル対応
+///   （[`pair_ports`]：FL→FL/FR→FR、モノは複製）のリンクを張る。
+/// - `global_remove` でリンク中ノード/対象 Client/対象出力ポートの消失を検知したら、保持中の
+///   Link を drop してリンクを切り、表からも除去して再待機する（冪等に再リンク可能）。
+///
+/// 使うキー定数（いずれも crate `keys.rs` で feature gate 外を確認済み）:
+/// `*pw::keys::SEC_PID`(="pipewire.sec.pid")・`*pw::keys::CLIENT_ID`(="client.id")・
+/// `*pw::keys::NODE_ID`(="node.id")・`*pw::keys::PORT_DIRECTION`(="port.direction")・
+/// `*pw::keys::AUDIO_CHANNEL`(="audio.channel")・`*pw::keys::LINK_OUTPUT_NODE`/
+/// `LINK_OUTPUT_PORT`/`LINK_INPUT_NODE`/`LINK_INPUT_PORT`。
+#[allow(clippy::type_complexity)]
+fn setup_pw_process(
+    target_pid: u32,
+    sink: RawSink,
+) -> std::result::Result<(pw::main_loop::MainLoopRc, ProcessKeep), String> {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::rc::Rc;
+
+    pw::init();
+
+    let main_loop = pw::main_loop::MainLoopRc::new(None)
+        .map_err(|e| format!("create pipewire main loop failed: {e}"))?;
+    let context = pw::context::ContextRc::new(&main_loop, None)
+        .map_err(|e| format!("create pipewire context failed: {e}"))?;
+    let core = context
+        .connect_rc(None)
+        .map_err(|e| format!("connect to pipewire daemon failed (is PipeWire running?): {e}"))?;
+    let registry = core
+        .get_registry_rc()
+        .map_err(|e| format!("get pipewire registry failed: {e}"))?;
+
+    // 入力（キャプチャ）ストリームのプロパティ。
+    // - media.type=Audio / media.category=Capture: 音声キャプチャストリーム
+    // - media.class=Stream/Input/Audio: グラフ上の役割（入力＝録る側）
+    // - media.role=Music: ヒント
+    // - node.name=flexaudio-capture-<pid>: registry で自分の入力ポートを引くための固有名
+    // **STREAM_CAPTURE_SINK は付けない**。**AUTOCONNECT も付けない**（マイクへの自動
+    // リンクを防ぐ。明示 link-factory リンクのみ）。
+    let node_name = capture_node_name(target_pid);
+    let props = properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+        *pw::keys::MEDIA_CLASS => "Stream/Input/Audio",
+        *pw::keys::MEDIA_ROLE => "Music",
+        *pw::keys::NODE_NAME => node_name.as_str(),
+    };
+
+    let stream = pw::stream::StreamRc::new(core.clone(), "flexaudio-process-capture", props)
+        .map_err(|e| format!("create pipewire capture stream failed: {e}"))?;
+
+    let user_data = UserData {
+        format: spa::param::audio::AudioInfoRaw::new(),
+        sink,
+    };
+    // コールバック登録（共通ヘルパ。システム経路と同一の param_changed/process 挙動）。
+    let listener = add_capture_listener(&stream, user_data)?;
+
+    // 自前 stream を一度だけ connect する（Direction::Input・target=None・AUTOCONNECT なし）。
+    // これで入力ポート（input_FL/FR）が生成される。リンクされるまでデータは来ない
+    // （リンク確立で format ネゴ→データ流入）。フォーマット POD は F32LE/48000/2ch。
+    {
+        let values = build_format_pod_bytes()?;
+        let pod = Pod::from_bytes(&values)
+            .ok_or_else(|| "build audio format pod from bytes failed".to_string())?;
+        let mut params = [pod];
+        stream
+            .connect(
+                spa::utils::Direction::Input,
+                None,
+                StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+                &mut params,
+            )
+            .map_err(|e| format!("connect pipewire capture stream failed: {e}"))?;
+    }
+
+    // 自ノードの registry global id（自分の入力ポートを `node.id` で引くために使う）。
+    // connect 直後は未確定（0）のことがあるが、入力ポートが registry に出る頃には
+    // 確定している。Port 到着のたびに stream.node_id() で読み直す。
+    let self_node_id: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
+
+    // --- 状態機械（registry コールバックはループスレッド単一スレッドからのみ呼ばれる
+    //     ので、内部可変は Cell/RefCell で十分。Mutex 不要）---
+
+    // 監視中ノード表: registry node global id → 登録情報（owning client.id / 直 PID）。
+    let nodes: Rc<RefCell<HashMap<u32, NodeEntry>>> = Rc::new(RefCell::new(HashMap::new()));
+    // Client 表: Client の registry global id → その Client の pipewire.sec.pid。
+    let client_pid: Rc<RefCell<HashMap<u32, u32>>> = Rc::new(RefCell::new(HashMap::new()));
+    // application PID == target_pid の Client の registry global id（判明時 Some）。
+    let target_client_id: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
+    // ポート表: registry port global id → 登録情報（所有 node.id / direction / channel）。
+    let ports: Rc<RefCell<HashMap<u32, PortEntry>>> = Rc::new(RefCell::new(HashMap::new()));
+    // 現在リンク中の対象ノードの registry global id（None=未リンク。MVP は代表 1 ノード）。
+    let linked_node_id: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
+    // 生成した Link プロキシ群。drop でリンクが切れるため run 中ずっと保持する。
+    let links: Rc<RefCell<Vec<pw::link::Link>>> = Rc::new(RefCell::new(Vec::new()));
+
+    // 全状態が更新されるたびに「未リンク かつ 対象出力ポート・自入力ポートが揃った」を
+    // 再評価し、揃っていれば link-factory でチャンネル対応リンクを張るヘルパ。
+    // ループスレッド上で呼ばれる（`!Send` な core/stream を触ってよい）。
+    #[allow(clippy::too_many_arguments)]
+    fn try_link(
+        core: &pw::core::CoreRc,
+        stream: &pw::stream::StreamRc,
+        target_pid: u32,
+        self_node_id: &Cell<Option<u32>>,
+        nodes: &RefCell<HashMap<u32, NodeEntry>>,
+        client_pid: &RefCell<HashMap<u32, u32>>,
+        ports: &RefCell<HashMap<u32, PortEntry>>,
+        linked_node_id: &Cell<Option<u32>>,
+        links: &RefCell<Vec<pw::link::Link>>,
+    ) {
+        // 既にリンク済みなら何もしない（MVP は代表 1 ノードのみ）。
+        if linked_node_id.get().is_some() {
+            return;
+        }
+
+        // 自ノード id を stream から読み直す（connect 直後は未確定のことがある）。
+        // 未確定時は SPA_ID_INVALID(=ID_ANY=u32::MAX) または 0 が返る。
+        let sid = stream.node_id();
+        if sid != 0 && sid != pw::constants::ID_ANY {
+            self_node_id.set(Some(sid));
+        }
+        let Some(self_nid) = self_node_id.get() else {
+            return;
+        };
+
+        // 対象 PID に属する Stream/Output/Audio ノードを 1 件選ぶ（代表 1 ノード）。
+        let target_node_id = {
+            let nodes = nodes.borrow();
+            let client_pid = client_pid.borrow();
+            nodes
+                .iter()
+                .find(|(_id, entry)| resolve_node_pid(entry, &client_pid) == Some(target_pid))
+                .map(|(&node_id, _)| node_id)
+        };
+        let Some(target_node_id) = target_node_id else {
+            return;
+        };
+
+        // 対象ノードの出力ポートと、自ノードの入力ポートを ports 表から引く。
+        let (out_ports, in_ports): (Vec<(u32, String)>, Vec<(u32, String)>) = {
+            let ports = ports.borrow();
+            let out_ports = ports
+                .iter()
+                .filter(|(_pid, p)| p.node_id == target_node_id && p.direction == "out")
+                .map(|(&pid, p)| (pid, p.channel.clone()))
+                .collect();
+            let in_ports = ports
+                .iter()
+                .filter(|(_pid, p)| p.node_id == self_nid && p.direction == "in")
+                .map(|(&pid, p)| (pid, p.channel.clone()))
+                .collect();
+            (out_ports, in_ports)
+        };
+
+        // どちらかが未出現ならまだリンクできない（次の global 到着で再評価）。
+        if out_ports.is_empty() || in_ports.is_empty() {
+            return;
+        }
+
+        // チャンネル対応（FL→FL/FR→FR、モノは複製、取れなければ順序）でペアを作る。
+        let pairs = pair_ports(&out_ports, &in_ports);
+        if pairs.is_empty() {
+            return;
+        }
+
+        // link-factory で各ペアをリンクする。1 つでも張れたらリンク確立とみなす。
+        let mut created: Vec<pw::link::Link> = Vec::with_capacity(pairs.len());
+        for (out_port_id, in_port_id) in pairs {
+            let link_props = properties! {
+                *pw::keys::LINK_OUTPUT_NODE => target_node_id.to_string(),
+                *pw::keys::LINK_OUTPUT_PORT => out_port_id.to_string(),
+                *pw::keys::LINK_INPUT_NODE => self_nid.to_string(),
+                *pw::keys::LINK_INPUT_PORT => in_port_id.to_string(),
+            };
+            match core.create_object::<pw::link::Link>("link-factory", &link_props) {
+                Ok(link) => created.push(link),
+                Err(_e) => {
+                    // このペアのリンク生成に失敗。他ペアは試す（best-effort）。
+                }
+            }
+        }
+
+        if created.is_empty() {
+            // 全ペア失敗。リンクせず待機を続ける（drop で何も残らない）。
+            return;
+        }
+
+        // 1 つ以上張れた。Link プロキシを保持してリンク確立とみなす。
+        links.borrow_mut().extend(created);
+        linked_node_id.set(Some(target_node_id));
+    }
+
+    // --- registry global / global_remove リスナ ---
+    // global: Client→client_pid 表 / Stream/Output/Audio ノード→nodes 表 /
+    // Port→ports 表 に登録し、毎回 try_link で「対象出力ポート＋自入力ポート → リンク」
+    // を再評価する。
+    let core_for_global = core.clone();
+    let stream_for_global = stream.clone();
+    let self_node_for_global = self_node_id.clone();
+    let nodes_for_global = nodes.clone();
+    let client_pid_for_global = client_pid.clone();
+    let target_client_for_global = target_client_id.clone();
+    let ports_for_global = ports.clone();
+    let linked_for_global = linked_node_id.clone();
+    let links_for_global = links.clone();
+
+    let core_for_remove = core.clone();
+    let stream_for_remove = stream.clone();
+    let self_node_for_remove = self_node_id.clone();
+    let nodes_for_remove = nodes.clone();
+    let client_pid_for_remove = client_pid.clone();
+    let target_client_for_remove = target_client_id.clone();
+    let ports_for_remove = ports.clone();
+    let linked_for_remove = linked_node_id.clone();
+    let links_for_remove = links.clone();
+
+    let _registry_listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            let Some(props) = global.props else {
+                return;
+            };
+            match global.type_ {
+                pw::types::ObjectType::Client => {
+                    // PID は Client の pipewire.sec.pid に常在（実機 stock 検証で確定。
+                    // デーモンがソケット資格情報から付与＝詐称不能）。
+                    let Some(pid_str) = props.get(*pw::keys::SEC_PID) else {
+                        return;
+                    };
+                    let Ok(pid) = pid_str.parse::<u32>() else {
+                        return;
+                    };
+                    client_pid_for_global.borrow_mut().insert(global.id, pid);
+                    if pid == target_pid {
+                        target_client_for_global.set(Some(global.id));
+                    }
+                }
+                pw::types::ObjectType::Node => {
+                    // アプリの**出力**ノードだけを対象にする（再生ストリーム）。
+                    let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
+                    if media_class != "Stream/Output/Audio" {
+                        return;
+                    }
+                    // 所有 Client を指す client.id。
+                    let owning_client_id =
+                        props.get(*pw::keys::CLIENT_ID).and_then(|s| s.parse::<u32>().ok());
+                    // 将来互換: ノード自身に PID が載れば直接照合可。
+                    let app_pid = props
+                        .get(*pw::keys::SEC_PID)
+                        .and_then(|s| s.parse::<u32>().ok());
+                    nodes_for_global.borrow_mut().insert(
+                        global.id,
+                        NodeEntry {
+                            owning_client_id,
+                            app_pid,
+                        },
+                    );
+                }
+                pw::types::ObjectType::Port => {
+                    // ポートを蓄積する（対象出力ポート・自入力ポートの双方をここから引く）。
+                    let Some(node_id) =
+                        props.get(*pw::keys::NODE_ID).and_then(|s| s.parse::<u32>().ok())
+                    else {
+                        return;
+                    };
+                    let direction = props.get(*pw::keys::PORT_DIRECTION).unwrap_or("").to_string();
+                    if direction != "out" && direction != "in" {
+                        return;
+                    }
+                    let channel = props.get(*pw::keys::AUDIO_CHANNEL).unwrap_or("").to_string();
+                    ports_for_global.borrow_mut().insert(
+                        global.id,
+                        PortEntry {
+                            node_id,
+                            direction,
+                            channel,
+                        },
+                    );
+                }
+                _ => return,
+            }
+
+            // Client / Node / Port どの到着でも状態が更新されたので再評価する
+            // （到着順非依存）。ここはループスレッド上なので `!Send` core/stream を触ってよい。
+            try_link(
+                &core_for_global,
+                &stream_for_global,
+                target_pid,
+                &self_node_for_global,
+                &nodes_for_global,
+                &client_pid_for_global,
+                &ports_for_global,
+                &linked_for_global,
+                &links_for_global,
+            );
+        })
+        .global_remove(move |id| {
+            // 消えた id の種類に応じて表から除去し、リンク状態を見直す。
+            let mut relink_needed = false;
+
+            // 消えた id が「リンク中ノード」or「対象 Client」or「対象出力ポート」なら
+            // 保持中の Link を drop してリンク解除し再待機する。
+            let was_linked_node = linked_for_remove.get() == Some(id);
+            let was_target_client = target_client_for_remove.get() == Some(id);
+            // リンク中ノードに属する出力ポートが消えたか（ports 表で判定）。
+            let was_linked_port = {
+                if let Some(linked) = linked_for_remove.get() {
+                    ports_for_remove
+                        .borrow()
+                        .get(&id)
+                        .map(|p| p.node_id == linked && p.direction == "out")
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            };
+
+            if was_linked_node || was_target_client || was_linked_port {
+                // 保持中の Link を全部 drop（= リンク解除）して未リンクに戻す。
+                links_for_remove.borrow_mut().clear();
+                linked_for_remove.set(None);
+                relink_needed = true;
+            }
+            if was_target_client {
+                target_client_for_remove.set(None);
+            }
+
+            // 各表から消えた id を除去（pid/port 解決が古い値を引かないように）。
+            nodes_for_remove.borrow_mut().remove(&id);
+            client_pid_for_remove.borrow_mut().remove(&id);
+            ports_for_remove.borrow_mut().remove(&id);
+
+            // 消失で再待機状態になったら、別の対象が既に揃っていれば即再リンクを試みる
+            // （冪等に再リンク可能）。
+            if relink_needed {
+                try_link(
+                    &core_for_remove,
+                    &stream_for_remove,
+                    target_pid,
+                    &self_node_for_remove,
+                    &nodes_for_remove,
+                    &client_pid_for_remove,
+                    &ports_for_remove,
+                    &linked_for_remove,
+                    &links_for_remove,
+                );
+            }
+        })
+        .register();
+
+    Ok((
+        main_loop,
+        ProcessKeep {
+            _stream: stream,
+            _listener: listener,
+            _registry: registry,
+            _registry_listener,
+            _links: links,
+            _core: core,
+        },
+    ))
+}
+
 /// `process` コールバックと `param_changed` の間で共有する状態。
 ///
 /// 確定したフォーマット（channels）を `process` から参照するために保持する。
@@ -203,6 +976,133 @@ struct UserData {
     format: spa::param::audio::AudioInfoRaw,
     /// 生フレームを流す先。`process` から `&mut` で push する。
     sink: RawSink,
+}
+
+/// キャプチャ stream へ標準の `param_changed` / `process` コールバックを登録する。
+///
+/// [`PwSystemBackend`]（システム monitor）と [`PwProcessBackend`]（プロセス
+/// fan-out）の双方で**同一**のコールバック挙動を使うため、共通ヘルパに括り出す。
+/// 挙動は元の [`setup_pw`] のインライン実装と完全に等価（`param_changed` で確定
+/// フォーマットを控え、`process` で dequeue した interleaved f32 を [`RawSink::push`]
+/// へ非ブロッキングに流す）。
+///
+/// 登録した [`StreamListener`](pw::stream::StreamListener) を返す（drop すると
+/// コールバックが外れるため、呼び出し元が run 中ずっと保持する）。
+fn add_capture_listener(
+    stream: &pw::stream::StreamRc,
+    user_data: UserData,
+) -> std::result::Result<pw::stream::StreamListener<UserData>, String> {
+    stream
+        .add_local_listener_with_user_data(user_data)
+        .param_changed(|_stream, user_data, id, param| {
+            // NULL は format クリア。
+            let Some(param) = param else {
+                return;
+            };
+            if id != pw::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let (media_type, media_subtype) = match format_utils::parse_format(param) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            // raw audio のみ受理。
+            if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
+                return;
+            }
+            // 確定フォーマットを控える（process でチャンネル数として使う）。
+            if user_data.format.parse(param).is_err() {
+                // パース失敗時は更新しない（直前の値を保持）。
+            }
+        })
+        .process(|stream, user_data| {
+            // RT スレッドで呼ばれる。ブロック禁止・確保禁止が望ましい。
+            // バッファが無ければ何もしない（panic しない）。
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            let datas = buffer.datas_mut();
+            if datas.is_empty() {
+                return;
+            }
+            let data = &mut datas[0];
+            // 有効バイト数とオフセット（リング上の位置）を控えてから data() を借りる。
+            let chunk = data.chunk();
+            let size = chunk.size() as usize;
+            let offset = chunk.offset() as usize;
+            if size == 0 {
+                return;
+            }
+            let Some(bytes) = data.data() else {
+                return;
+            };
+            // [offset, offset+size) が有効領域。範囲外は弾く（防御的）。
+            let end = offset.saturating_add(size);
+            if end > bytes.len() {
+                return;
+            }
+            let valid = &bytes[offset..end];
+            // f32 の倍数だけ取り出す（端数バイトは無視）。
+            let n_floats = valid.len() / std::mem::size_of::<f32>();
+            if n_floats == 0 {
+                return;
+            }
+            // バイト列を f32 interleaved として読む。`data` のアライメントは
+            // 保証されないため、align_to ではなく from_le_bytes で安全に読む。
+            // スタック上の小バッファに詰めてから 1 回で push する（RawSink::push は
+            // 非ブロッキングで満杯時 DROP）。
+            //
+            // 典型ブロックは ~数百〜数千 frames。スレッドローカルな再利用バッファ
+            // を使い、process ごとの確保を避ける。
+            PROC_SCRATCH.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                scratch.clear();
+                scratch.reserve(n_floats);
+                for i in 0..n_floats {
+                    let b = i * 4;
+                    let v = f32::from_le_bytes([
+                        valid[b],
+                        valid[b + 1],
+                        valid[b + 2],
+                        valid[b + 3],
+                    ]);
+                    scratch.push(v);
+                }
+                // PTS は将来 pw_buffer.time の device クロックを使う（TODO）。
+                // 現状は到着時刻の単調クロックで代用（§clock の ClockNormalizer が
+                // 初回原点を取るため、単調近似でも下流は破綻しない）。
+                user_data.sink.push(&scratch, monotonic_now_ns());
+            });
+        })
+        .register()
+        .map_err(|e| format!("register pipewire stream listener failed: {e}"))
+}
+
+/// 要求フォーマット POD（f32 / 48000 / 2ch）のバイト列を組み立てる。
+///
+/// rate/channels を明示するので、グラフが異なれば PipeWire が `audioconvert` を
+/// 自動挿入して 48k/stereo/f32 に変換してくれる（§0.6）。両 backend で同一の要求を
+/// 使うため共通化する。返り値のバイト列から [`Pod::from_bytes`] で POD を作る
+/// （バイト列は POD が指す実体なので connect 呼び出しまで生かしておくこと）。
+fn build_format_pod_bytes() -> std::result::Result<Vec<u8>, String> {
+    let mut audio_info = spa::param::audio::AudioInfoRaw::new();
+    audio_info.set_format(spa::param::audio::AudioFormat::F32LE);
+    audio_info.set_rate(NATIVE_RATE);
+    audio_info.set_channels(NATIVE_CHANNELS as u32);
+
+    let obj = pw::spa::pod::Object {
+        type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: pw::spa::param::ParamType::EnumFormat.as_raw(),
+        properties: audio_info.into(),
+    };
+    let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &pw::spa::pod::Value::Object(obj),
+    )
+    .map_err(|e| format!("serialize audio format pod failed: {e}"))?
+    .0
+    .into_inner();
+    Ok(values)
 }
 
 /// PipeWire ループスレッド本体。
@@ -305,113 +1205,13 @@ fn setup_pw(
     };
 
     // コールバック登録。`param_changed` で確定 format を控え、`process` で
-    // dequeue したバッファを RawSink へ流す。
-    let listener = stream
-        .add_local_listener_with_user_data(user_data)
-        .param_changed(|_stream, user_data, id, param| {
-            // NULL は format クリア。
-            let Some(param) = param else {
-                return;
-            };
-            if id != pw::spa::param::ParamType::Format.as_raw() {
-                return;
-            }
-            let (media_type, media_subtype) = match format_utils::parse_format(param) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            // raw audio のみ受理。
-            if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw {
-                return;
-            }
-            // 確定フォーマットを控える（process でチャンネル数として使う）。
-            if user_data.format.parse(param).is_err() {
-                // パース失敗時は更新しない（直前の値を保持）。
-            }
-        })
-        .process(|stream, user_data| {
-            // RT スレッドで呼ばれる。ブロック禁止・確保禁止が望ましい。
-            // バッファが無ければ何もしない（panic しない）。
-            let Some(mut buffer) = stream.dequeue_buffer() else {
-                return;
-            };
-            let datas = buffer.datas_mut();
-            if datas.is_empty() {
-                return;
-            }
-            let data = &mut datas[0];
-            // 有効バイト数とオフセット（リング上の位置）を控えてから data() を借りる。
-            let chunk = data.chunk();
-            let size = chunk.size() as usize;
-            let offset = chunk.offset() as usize;
-            if size == 0 {
-                return;
-            }
-            let Some(bytes) = data.data() else {
-                return;
-            };
-            // [offset, offset+size) が有効領域。範囲外は弾く（防御的）。
-            let end = offset.saturating_add(size);
-            if end > bytes.len() {
-                return;
-            }
-            let valid = &bytes[offset..end];
-            // f32 の倍数だけ取り出す（端数バイトは無視）。
-            let n_floats = valid.len() / std::mem::size_of::<f32>();
-            if n_floats == 0 {
-                return;
-            }
-            // バイト列を f32 interleaved として読む。`data` のアライメントは
-            // 保証されないため、align_to ではなく from_le_bytes で安全に読む。
-            // スタック上の小バッファに詰めてから 1 回で push する（RawSink::push は
-            // 非ブロッキングで満杯時 DROP）。
-            //
-            // 典型ブロックは ~数百〜数千 frames。スレッドローカルな再利用バッファ
-            // を使い、process ごとの確保を避ける。
-            PROC_SCRATCH.with(|cell| {
-                let mut scratch = cell.borrow_mut();
-                scratch.clear();
-                scratch.reserve(n_floats);
-                for i in 0..n_floats {
-                    let b = i * 4;
-                    let v = f32::from_le_bytes([
-                        valid[b],
-                        valid[b + 1],
-                        valid[b + 2],
-                        valid[b + 3],
-                    ]);
-                    scratch.push(v);
-                }
-                // PTS は将来 pw_buffer.time の device クロックを使う（TODO）。
-                // 現状は到着時刻の単調クロックで代用（§clock の ClockNormalizer が
-                // 初回原点を取るため、単調近似でも下流は破綻しない）。
-                user_data.sink.push(&scratch, monotonic_now_ns());
-            });
-        })
-        .register()
-        .map_err(|e| format!("register pipewire stream listener failed: {e}"))?;
+    // dequeue したバッファを RawSink へ流す（共通ヘルパ。両 backend で同一挙動）。
+    let listener = add_capture_listener(&stream, user_data)?;
 
-    // 要求フォーマット param: f32 / 48000 / 2ch。
+    // 要求フォーマット param: f32 / 48000 / 2ch（共通ヘルパでバイト列を組む）。
     // rate/channels を明示するので、グラフが異なれば PipeWire が audioconvert を
     // 自動挿入して 48k/stereo/f32 に変換してくれる（§0.6）。
-    let mut audio_info = spa::param::audio::AudioInfoRaw::new();
-    audio_info.set_format(spa::param::audio::AudioFormat::F32LE);
-    audio_info.set_rate(NATIVE_RATE);
-    audio_info.set_channels(NATIVE_CHANNELS as u32);
-
-    let obj = pw::spa::pod::Object {
-        type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
-        id: pw::spa::param::ParamType::EnumFormat.as_raw(),
-        properties: audio_info.into(),
-    };
-    let values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &pw::spa::pod::Value::Object(obj),
-    )
-    .map_err(|e| format!("serialize audio format pod failed: {e}"))?
-    .0
-    .into_inner();
-
+    let values = build_format_pod_bytes()?;
     let pod = Pod::from_bytes(&values)
         .ok_or_else(|| "build audio format pod from bytes failed".to_string())?;
     let mut params = [pod];
@@ -1338,6 +2138,221 @@ mod tests {
         let mut out = vec![0.0f32; 1920];
         let got = cons.pop_slice(&mut out);
         assert!(got > 0, "expected captured samples from the default sink monitor");
+    }
+
+    // ------------------------------------------------------------------------
+    // PwProcessBackend（プロセス出力ループバック）
+    // ------------------------------------------------------------------------
+
+    /// [`CaptureBackend`] 契約どおり `PwProcessBackend: Send` であること
+    /// （PipeWire の `!Send` を専用スレッドへ閉じ込められている証左）。
+    /// コンパイルが通れば成立。
+    #[test]
+    fn process_backend_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PwProcessBackend>();
+    }
+
+    /// 構築直後にネイティブフォーマットが固定契約どおり (48000, 2) であること。
+    /// PID / exclude_self の保持も確認する。
+    #[test]
+    fn process_native_format_is_48k_stereo() {
+        let be = PwProcessBackend::new(4242, true);
+        assert_eq!(be.native_format(), (NATIVE_RATE, NATIVE_CHANNELS));
+        assert_eq!(be.native_format(), (48_000, 2));
+        // 構築引数が保持されること。
+        assert_eq!(be.target_pid(), 4242);
+        assert!(be.exclude_self());
+        let be2 = PwProcessBackend::new(1, false);
+        assert!(!be2.exclude_self());
+    }
+
+    /// 未 start での stop / 二重 stop が安全（panic しない）。
+    #[test]
+    fn process_stop_without_start_is_safe() {
+        let mut be = PwProcessBackend::new(1234, false);
+        be.stop();
+        be.stop();
+    }
+
+    /// `resolve_node_pid` の純ロジック検証（PipeWire 非依存）。
+    ///
+    /// 実機 pw-dump で確定した事実: PID は **Client** に載り、ノードは `client.id` で
+    /// Client を指すだけ。よって PID 解決は二段（node → client.id → Client の PID）。
+    /// Client が先に来ても Node が先に来ても、各到着で再評価すれば正しく解決できる
+    /// （到着順非依存）ことを、`client_pid` 表に値を入れる前後で確認する。
+    #[test]
+    fn resolve_node_pid_via_client_table() {
+        use std::collections::HashMap;
+
+        // pw-cat の実例: node.id=62 が client.id=60 を指し、client.id=60 の Client が
+        // application.process.id=13394 を持つ。
+        let node = NodeEntry {
+            owning_client_id: Some(60),
+            app_pid: None,
+        };
+
+        // --- Node が先に来て Client がまだ表に無い状態 → 未解決（None）。
+        let mut client_pid: HashMap<u32, u32> = HashMap::new();
+        assert_eq!(
+            resolve_node_pid(&node, &client_pid),
+            None,
+            "client.id に対応する Client がまだ無ければ PID 未解決"
+        );
+
+        // --- 後から Client(global id=60, pid=13394) が到着して表へ → 解決される。
+        client_pid.insert(60, 13394);
+        assert_eq!(
+            resolve_node_pid(&node, &client_pid),
+            Some(13394),
+            "client.id=60 → Client の pid=13394 を二段で解決"
+        );
+
+        // --- client.id が無いノードは（直 PID も無い限り）解決不能。
+        let orphan = NodeEntry {
+            owning_client_id: None,
+            app_pid: None,
+        };
+        assert_eq!(resolve_node_pid(&orphan, &client_pid), None);
+
+        // --- 将来互換: ノード自身に application.process.id が載れば Client を介さず直解決。
+        //     その場合は client_pid 表が空でも解決できる。
+        let node_with_pid = NodeEntry {
+            owning_client_id: Some(99), // 表に無い client.id でも
+            app_pid: Some(424242),
+        };
+        let empty: HashMap<u32, u32> = HashMap::new();
+        assert_eq!(
+            resolve_node_pid(&node_with_pid, &empty),
+            Some(424242),
+            "ノード自身の PID を優先して直解決"
+        );
+
+        // --- 別 client.id のノードは別 PID（取り違えないこと）。
+        let other_node = NodeEntry {
+            owning_client_id: Some(61),
+            app_pid: None,
+        };
+        // client 61 は未登録なので None、登録すればその PID。
+        assert_eq!(resolve_node_pid(&other_node, &client_pid), None);
+        client_pid.insert(61, 555);
+        assert_eq!(resolve_node_pid(&other_node, &client_pid), Some(555));
+        // node(client 60) の解決は影響を受けない。
+        assert_eq!(resolve_node_pid(&node, &client_pid), Some(13394));
+    }
+
+    /// `pair_ports` のチャンネル対応付け純ロジック検証（PipeWire 非依存）。
+    /// 方式 B（link-factory）のポート対応の核心。
+    #[test]
+    fn pair_ports_maps_channels() {
+        // --- ステレオ→ステレオ: FL→FL / FR→FR（チャンネル名一致）。
+        // 出力ポート: id 10=FL, 11=FR。入力ポート: id 20=FL, 21=FR。
+        let out = vec![(10u32, "FL".to_string()), (11u32, "FR".to_string())];
+        let inp = vec![(20u32, "FL".to_string()), (21u32, "FR".to_string())];
+        let mut pairs = pair_ports(&out, &inp);
+        pairs.sort();
+        assert_eq!(pairs, vec![(10, 20), (11, 21)], "FL→FL / FR→FR");
+
+        // --- 入力の並びが逆でもチャンネル名で正しく対応付く（順序非依存）。
+        let inp_rev = vec![(21u32, "FR".to_string()), (20u32, "FL".to_string())];
+        let mut pairs = pair_ports(&out, &inp_rev);
+        pairs.sort();
+        assert_eq!(pairs, vec![(10, 20), (11, 21)], "並び逆でも FL→FL / FR→FR");
+
+        // --- モノラル出力 → ステレオ入力: 単一出力を FL/FR 両方へ複製。
+        let mono_out = vec![(30u32, "MONO".to_string())];
+        let stereo_in = vec![(40u32, "FL".to_string()), (41u32, "FR".to_string())];
+        let mut pairs = pair_ports(&mono_out, &stereo_in);
+        pairs.sort();
+        assert_eq!(pairs, vec![(30, 40), (30, 41)], "モノは FL/FR へ複製");
+
+        // --- チャンネル名が取れない（空）出力 → 順序フォールバックで best-effort。
+        let out_noch = vec![(50u32, String::new()), (51u32, String::new())];
+        let in_noch = vec![(60u32, String::new()), (61u32, String::new())];
+        let pairs = pair_ports(&out_noch, &in_noch);
+        // 2 ポート同士が 1 対 1 で対応すること（順序対応・各入力は高々 1 回）。
+        assert_eq!(pairs.len(), 2);
+        let ins: std::collections::HashSet<u32> = pairs.iter().map(|(_, i)| *i).collect();
+        assert_eq!(ins.len(), 2, "各入力ポートは高々 1 回");
+
+        // --- 空集合は空リンク（どちらかが未出現ならリンクしない）。
+        assert!(pair_ports(&[], &inp).is_empty());
+        assert!(pair_ports(&out, &[]).is_empty());
+
+        // --- 一致するチャンネルが片方にしか無い場合でも、モノ複製でなく順序で埋める。
+        // 出力 FL のみ、入力 FR のみ（名前不一致）→ 順序フォールバックで 1 対応。
+        let out_fl = vec![(70u32, "FL".to_string())];
+        let in_fr = vec![(80u32, "FR".to_string())];
+        // 出力 1 ポートなのでモノ複製規則が走り、残り入力へ複製される。
+        let pairs = pair_ports(&out_fl, &in_fr);
+        assert_eq!(pairs, vec![(70, 80)], "出力1ポートは残り入力へ複製");
+    }
+
+    /// スモークテスト: プロセスキャプチャの `start` は PipeWire 不在/registry 取得
+    /// 失敗の homelab では `Err(Error::Backend)` になり得るが、**panic はしない**。
+    /// PipeWire セッションがある環境では、対象 PID が未出現でも**成功扱いで待機**する
+    /// （registry が取れれば成功＝出現時にリンクするため）。Ok の場合は対象 PID が
+    /// 鳴っていなくても `stop()` まで一巡できること（破棄が安全）を確認する。
+    #[test]
+    fn process_start_is_graceful_without_pipewire() {
+        let (prod, _cons) = raw_ring(1 << 16);
+        let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
+        // 実在しないであろう PID。出現しなくても start は待機成功し得る。
+        let mut be = PwProcessBackend::new(u32::MAX, false);
+        match be.start(sink) {
+            Ok(()) => {
+                // PipeWire セッションがある環境。対象 PID 未出現でも待機成功。
+                // 二重 start に安全（no-op で Ok）。
+                let (prod2, _cons2) = raw_ring(1 << 16);
+                let sink2 = RawSink::new(prod2, NATIVE_RATE, NATIVE_CHANNELS);
+                assert!(be.start(sink2).is_ok());
+                // 停止まで一巡できること（リンク前でも安全に破棄）。
+                be.stop();
+                // 二重 stop も安全。
+                be.stop();
+            }
+            Err(Error::Backend(_)) => {
+                // PipeWire 不在/registry 失敗: 想定内。panic していないことが要点。
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    /// 実キャプチャ end-to-end（PipeWire が動くデスクトップ/ラップトップでのみ）。
+    ///
+    /// 実行方法（ラップトップ等、PipeWire + 対象 PID で何か音を鳴らした状態で）:
+    /// ```text
+    /// # 例: speaker-test を鳴らして PID を取る
+    /// speaker-test -t sine -f 1000 -c 2 &  # → PID を控える
+    /// FLEXAUDIO_TEST_PID=<PID> \
+    ///   cargo test -p flexaudio-os-linux -- --ignored process_capture_smoke
+    /// ```
+    /// 対象 PID のアプリ出力ポートへ link-factory でリンクし、サンプルが流れてくることを
+    /// 期待する。`FLEXAUDIO_TEST_PID` 未指定ならスキップ（PID が分からないため）。
+    /// homelab/CI では PipeWire も音源も無いため `#[ignore]`。
+    #[test]
+    #[ignore = "requires a running PipeWire session with the target PID playing audio (set FLEXAUDIO_TEST_PID)"]
+    fn process_capture_smoke() {
+        use std::time::Duration;
+        let Ok(pid_str) = std::env::var("FLEXAUDIO_TEST_PID") else {
+            eprintln!("FLEXAUDIO_TEST_PID 未指定のためスキップ");
+            return;
+        };
+        let pid: u32 = pid_str.parse().expect("FLEXAUDIO_TEST_PID は u32");
+        let (prod, mut cons) = raw_ring(1 << 18);
+        let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
+        let mut be = PwProcessBackend::new(pid, false);
+        be.start(sink)
+            .expect("start should succeed on a PipeWire desktop");
+        // リンク確立 + 録音が回るのを少し待つ。
+        thread::sleep(Duration::from_millis(800));
+        be.stop();
+        let mut out = vec![0.0f32; 1920];
+        let got = cons.pop_slice(&mut out);
+        assert!(
+            got > 0,
+            "expected captured samples link-factory-linked from PID {pid}"
+        );
     }
 
     // ------------------------------------------------------------------------

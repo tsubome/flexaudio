@@ -47,18 +47,16 @@ use flexaudio::core::{
 use flexaudio::Stream;
 use flexaudio_mic::CpalMicBackend;
 #[cfg(target_os = "linux")]
-use flexaudio_os_linux::PwSystemBackend;
+use flexaudio_os_linux::{PwProcessBackend, PwSystemBackend};
 
 /// キャプチャするソース種別（CLI 引数用）。
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SourceArg {
     /// 既定マイク入力。
     Mic,
-    // TODO: process（特定プロセスのループバック）は
-    // 対応バックエンド（flexaudio-os-*）が配線され次第ここへ追加する。
     /// システム出力ループバック（Linux のみ）。
     System,
-    /// プロセス出力ループバック（未対応）。
+    /// プロセス出力ループバック（Linux のみ・`--process-id <PID>` 必須）。
     Process,
 }
 
@@ -85,9 +83,22 @@ struct Cli {
     #[arg(long)]
     watch_devices: bool,
 
-    /// キャプチャするソース（mic / system[Linux]）。
+    /// キャプチャするソース（mic / system[Linux] / process[Linux]）。
     #[arg(long, value_enum, default_value_t = SourceArg::Mic)]
     source: SourceArg,
+
+    /// `--source process` の対象プロセス PID（Linux のみ・process では必須）。
+    /// 対象 PID のアプリ出力ノードへ fan-out リンクして複製で録る（非侵襲：
+    /// ユーザーのスピーカーは鳴ったまま）。対象が後から鳴り始めるのは正常系。
+    #[arg(long)]
+    process_id: Option<u32>,
+
+    /// 自プロセスの再生音を除外する（フィードバックループ防止）。
+    /// `--source process` では対象 PID のみ録るため**常に成立し no-op**
+    /// （フラグは受け取って保持するだけ）。system キャプチャの exclude_self は
+    /// PipeWire に OS プリミティブが無く未実装＝将来課題。
+    #[arg(long, default_value_t = false)]
+    exclude_self: bool,
 
     /// キャプチャ秒数。`0` で無限ストリーミング（`--out -` 想定、Ctrl-C / パイプ切れで停止）。
     #[arg(long, default_value_t = 5)]
@@ -197,11 +208,30 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
                 }
             }
             SourceArg::Process => {
-                return Err(
-                    "--source process（プロセス出力ループバック）は未対応です。\
-                     対応バックエンドが配線され次第サポート予定です。"
-                        .into(),
-                );
+                #[cfg(target_os = "linux")]
+                {
+                    // process では PID 必須。無ければ分かりやすいエラーで止める。
+                    let Some(pid) = cli.process_id else {
+                        return Err(
+                            "--source process には --process-id <PID> が必要です。\
+                             （対象プロセスの PID を指定してください。例: \
+                             speaker-test を鳴らして得た PID）"
+                                .into(),
+                        );
+                    };
+                    (
+                        Box::new(PwProcessBackend::new(pid, cli.exclude_self)),
+                        SourceKind::ProcessLoopback,
+                        "process（特定 PID 出力の fan-out / PipeWire）",
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(
+                        "--source process（プロセス出力ループバック）は現在 Linux のみ対応です。"
+                            .into(),
+                    );
+                }
             }
         };
 
@@ -245,6 +275,8 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     let config = StreamConfig {
         kind,
         output,
+        target_pid: cli.process_id,
+        exclude_self: cli.exclude_self,
         ..Default::default()
     };
     let mut stream = Stream::open(config, backend).map_err(describe_error)?;
