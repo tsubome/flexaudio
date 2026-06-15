@@ -30,14 +30,15 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
-use flexaudio_core::types::{DeviceInfo, Error, Result, SourceKind};
+use flexaudio_core::types::{DeviceEvent, DeviceInfo, Error, Result, SourceKind};
 
 use pipewire as pw;
 use pw::spa;
@@ -706,6 +707,512 @@ fn extract_json_name(value: &str) -> Option<String> {
     }
 }
 
+// ============================================================================
+// デバイス着脱監視（ホットプラグ通知 / `watch_devices()` の Linux/PipeWire 分）
+// ============================================================================
+
+/// PipeWire レジストリを**永続的に**監視してデバイスの着脱（ホットプラグ）を
+/// [`DeviceEvent`] として配信する watcher。
+///
+/// # [`PwSystemBackend`] / [`enumerate_pw`] との関係
+///
+/// [`PwSystemBackend`] と同型の「専用スレッド 1 本所有」方式だが、性質が異なる:
+/// - **短命でなく永続**: [`enumerate_pw`] は `core.sync` の `done` で `quit()` して
+///   即終了するが、こちらは `done` でも `quit()` せず**回し続け**、registry の
+///   `global` / `global_remove` を [`stop`](Self::stop) まで受け取り続ける。
+/// - **RawSink 無し**: 音声は録らず、registry の global/global_remove だけを見る。
+///
+/// `MainLoop` / `Context` / `Core` / `Registry` はいずれも `!Send` なので
+/// **専用スレッド（`flexaudio-pw-watch`）に閉じ込め**、本体が持つのは `Send` な
+/// ものだけ（配信キュー [`Arc<Mutex<VecDeque>>`]・停止フラグ・停止用
+/// [`pipewire::channel::Sender`]・[`JoinHandle`]）。
+///
+/// # 配信されるイベント
+/// - [`DeviceEvent::Added`]: 初期スキャン**完了後**に出現した Audio/Sink|Source ノード。
+///   初期スキャン中に既に存在したノードは（登録のみで）配信しない。
+/// - [`DeviceEvent::Removed`]: 監視中に消えたノード（id = `node.name`）。
+/// - [`DeviceEvent::DefaultChanged`]: 既定 sink / source の切替（default メタデータ監視）。
+///
+/// # PipeWire 不在
+/// PipeWire デーモン不在・接続失敗時は [`start`](Self::start) が
+/// [`Error::Backend`] を返す（panic しない）。facade 層がこれを no-op 縮退として
+/// 握る方針（着脱監視は変化が来なければ何も配信しなくてよい）。
+/// 「PipeWire セッションはあるが空」では正常に回る。
+///
+/// ```no_run
+/// use flexaudio_os_linux::PwDeviceWatcher;
+///
+/// // PipeWire 不在なら Err（facade が NoopWatcher へ縮退）。
+/// if let Ok(mut watcher) = PwDeviceWatcher::start() {
+///     while let Some(ev) = watcher.poll_event() {
+///         println!("device event: {ev:?}");
+///     }
+///     watcher.stop();
+/// }
+/// ```
+pub struct PwDeviceWatcher {
+    /// 配信キュー（着脱は低頻度・取りこぼし不可なので無制限）。`Send`。
+    /// 監視スレッドのコールバックが push し、[`poll_event`](Self::poll_event) が pop する。
+    events: Arc<Mutex<VecDeque<DeviceEvent>>>,
+    /// 監視中フラグ（二重 start ガード／drop 判定用）。`Send`。
+    running: Arc<AtomicBool>,
+    /// 監視スレッドへ停止を伝える送信端。[`start`](Self::start) で `Some`。
+    /// [`PwSystemBackend`] と同じ [`Terminate`] を再利用する。
+    stop_tx: Option<pw::channel::Sender<Terminate>>,
+    /// 監視スレッドのハンドル。[`start`](Self::start) で `Some`。
+    handle: Option<JoinHandle<()>>,
+}
+
+impl PwDeviceWatcher {
+    /// 監視を開始する。専用スレッド上で `MainLoop` + `Context` + `Core` + `Registry`
+    /// を生成し、registry に `global` / `global_remove` リスナを張って初期スキャンを
+    /// 終えるところまでをセットアップとし、成否を同期返却する。成功後はスレッドが
+    /// `run()` で回り続け、着脱イベントを配信キューへ push する。
+    ///
+    /// PipeWire デーモン不在・接続失敗は [`Error::Backend`] を返す（panic しない）。
+    pub fn start() -> Result<Self> {
+        // 配信キューは start 前に作り、セットアップへ move（クローン）して渡す。
+        let events: Arc<Mutex<VecDeque<DeviceEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+
+        // 監視スレッドへの停止チャネル（受信端は loop に attach する）。
+        let (stop_tx, stop_rx) = pw::channel::channel::<Terminate>();
+        // セットアップ成否を start() へ同期返却するチャネル
+        // （registry リスナ登録 + 初期スキャン完了まで成功なら Ok）。
+        let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();
+
+        let running = Arc::new(AtomicBool::new(true));
+
+        let events_for_thread = events.clone();
+        let handle = thread::Builder::new()
+            .name("flexaudio-pw-watch".into())
+            .spawn(move || {
+                run_watch_loop(events_for_thread, stop_rx, &ready_tx);
+            })
+            .map_err(|e| Error::Backend(format!("spawn pipewire watch thread: {e}")))?;
+
+        // セットアップ結果を待つ。ready を送らずスレッドが終了した場合も失敗扱い。
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                events,
+                running,
+                stop_tx: Some(stop_tx),
+                handle: Some(handle),
+            }),
+            Ok(Err(msg)) => {
+                // セットアップ失敗（pipewire 不在・connect/registry 失敗等）。
+                // スレッドは既に return しているので join して片付ける。
+                running.store(false, Ordering::SeqCst);
+                let _ = handle.join();
+                Err(Error::Backend(msg))
+            }
+            Err(_) => {
+                // ready を一度も送らずスレッドが消えた（想定外パニック等）。
+                running.store(false, Ordering::SeqCst);
+                let _ = handle.join();
+                Err(Error::Backend(
+                    "pipewire watch thread terminated before signaling readiness".into(),
+                ))
+            }
+        }
+    }
+
+    /// 配信キューから次のホットプラグイベントを 1 つ取り出す（無ければ `None`）。
+    /// 非ブロッキング。lock 失敗時も panic せず `None`。
+    pub fn poll_event(&mut self) -> Option<DeviceEvent> {
+        self.events.lock().ok().and_then(|mut q| q.pop_front())
+    }
+
+    /// 監視を停止する（二重 stop / 未 start 後の stop に安全）。
+    ///
+    /// [`PwSystemBackend::stop`] と同型: 監視スレッドへ [`Terminate`] を送ると、
+    /// loop に attach 済みの受信端コールバックが `main_loop.quit()` を
+    /// **スレッド自身から**呼び、`run()` を抜ける。`join()` で破棄完了まで待つ。
+    pub fn stop(&mut self) {
+        // 二重 stop / 未 start に安全。
+        if !self.running.swap(false, Ordering::SeqCst) {
+            // 既に停止済み or 未起動。念のため残骸を join。
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+            self.stop_tx = None;
+            return;
+        }
+
+        // 監視スレッドへ停止を通知（受信端コールバックが loop.quit() を呼ぶ）。
+        // 失敗（受信端消失）は無視（既に終わっている）。
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(Terminate);
+        }
+
+        // run() を抜けてスレッドが終了するのを待つ。終了時に Registry→Core→Context→
+        // MainLoop が drop 順に破棄される（すべて監視スレッド上で）。
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for PwDeviceWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// 監視ループスレッド全体で共有するローカル状態（`!Send`・スレッド内に閉じる）。
+#[derive(Default)]
+struct WatchState {
+    /// registry の global id → 配信用 [`DeviceInfo`] の逆引き表。
+    /// `global_remove` は数値 id しか渡さないため、この表で `node.name` を引き戻す。
+    by_global_id: std::collections::HashMap<u32, DeviceInfo>,
+    /// 初期スキャン（最初の二段 sync→done バリア）が完了したか。
+    /// `false` の間に来た global は登録のみで `Added` を配信しない（初期スキャン抑制）。
+    initial_scan_done: bool,
+    /// 既定 sink の `node.name`（`default.audio.sink` メタデータから）。
+    /// 初期スキャン完了後の変化を [`DeviceEvent::DefaultChanged`] として配信する。
+    default_sink: Option<String>,
+    /// 既定 source の `node.name`（`default.audio.source` メタデータから）。
+    default_source: Option<String>,
+}
+
+/// PipeWire 監視ループスレッド本体。
+///
+/// この関数の中だけで `MainLoop`/`Context`/`Core`/`Registry` を生成・実行・破棄する
+/// （いずれも `!Send`）。セットアップ完了/失敗を `ready_tx` で呼び出し元へ返し、
+/// 成功時は `main_loop.run()` で停止指示（[`Terminate`]）まで回り続ける。
+fn run_watch_loop(
+    events: Arc<Mutex<VecDeque<DeviceEvent>>>,
+    stop_rx: pw::channel::Receiver<Terminate>,
+    ready_tx: &mpsc::Sender<std::result::Result<(), String>>,
+) {
+    // セットアップ（接続・registry リスナ登録・初期スキャン）を別関数に集約。
+    // 戻り値はループ実行中ずっと生かす所有物（drop されると監視が止まる）。
+    let (main_loop, _core, _registry, _listeners) = match setup_watch(events) {
+        Ok(t) => t,
+        Err(msg) => {
+            // セットアップ失敗を通知して終了（panic しない）。
+            let _ = ready_tx.send(Err(msg));
+            return;
+        }
+    };
+
+    // 停止チャネルの受信端を loop に attach。Terminate 受信で quit()。
+    // quit() は loop 駆動のコールバック内 = このスレッド上から呼ばれる。
+    let main_loop_for_quit = main_loop.clone();
+    let _attached = stop_rx.attach(main_loop.loop_(), move |_terminate| {
+        main_loop_for_quit.quit();
+    });
+
+    // セットアップ成功を通知。以後は run() がブロックし、着脱イベントを配信し続ける。
+    if ready_tx.send(Ok(())).is_err() {
+        // 呼び出し元が消えている（start が drop 済み等）。起動しない。
+        return;
+    }
+
+    // 停止指示（Terminate）受信 or プロセス終了まで回り続ける。
+    // enumerate_pw と違い done では quit しないので、ここは「永続」に回る。
+    main_loop.run();
+    // ここを抜けると _attached → _listeners → _registry → _core → main_loop の順
+    // （宣言の逆順）で drop され、PipeWire リソースがこのスレッド上で安全に破棄される。
+}
+
+/// 監視 watcher が run 中ずっと保持する所有物。drop すると監視が止まるため、
+/// `run_watch_loop` のスタックに置いておく。
+///
+/// - `MainLoopRc`: `run()`/`quit()` の主体。
+/// - `CoreRc`: registry / sync の親（downgrade して done コールバックで使う）。
+/// - `RegistryRc`: registry プロキシ本体。
+/// - リスナ群: registry リスナ・core(done) リスナ・bind した default メタデータの
+///   プロキシ＋リスナ。drop するとコールバックが外れるので Box で型消去して保持する。
+#[allow(clippy::type_complexity)]
+type WatchKeep = (
+    pw::main_loop::MainLoopRc,
+    pw::core::CoreRc,
+    pw::registry::RegistryRc,
+    WatchListeners,
+);
+
+/// bind した default メタデータのプロキシ＋リスナ 1 組（drop でコールバックが外れる）。
+/// [`enumerate_pw`] のローカル `MetaKeep` と同型。
+type MetaKeepEntry = (Box<dyn pw::proxy::ProxyT>, Box<dyn pw::proxy::Listener>);
+
+/// `MetaKeepEntry` の保管庫（監視スレッド内で Rc 共有・`!Send`）。
+type MetaKeepStore = std::rc::Rc<std::cell::RefCell<Vec<MetaKeepEntry>>>;
+
+/// 監視で生かしておくリスナ群（drop でコールバックが外れる）。
+struct WatchListeners {
+    /// registry の global/global_remove リスナ。
+    _registry_listener: pw::registry::Listener,
+    /// core の done リスナ（初期スキャンの二段バリア完了検知）。
+    _core_listener: pw::core::Listener,
+    /// global コールバック内で bind した default メタデータのプロキシ＋リスナ保管庫
+    /// （[`enumerate_pw`] と同型。Rc 共有で監視スレッド内に閉じる）。
+    _meta_keep: MetaKeepStore,
+}
+
+/// PipeWire 監視のセットアップ一式。失敗は `Err(String)`（panic しない）。
+///
+/// [`enumerate_pw`] の registry global 抽出ロジック・二段 sync→done バリアを
+/// **そのまま流用**するが、`done` では `quit()` せず初期スキャン完了フラグを
+/// 立てるだけにし、以後は永続的に global/global_remove を受け続ける。
+#[allow(clippy::type_complexity)]
+fn setup_watch(
+    events: Arc<Mutex<VecDeque<DeviceEvent>>>,
+) -> std::result::Result<WatchKeep, String> {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    pw::init();
+
+    let main_loop = pw::main_loop::MainLoopRc::new(None)
+        .map_err(|e| format!("create pipewire main loop failed: {e}"))?;
+    let context = pw::context::ContextRc::new(&main_loop, None)
+        .map_err(|e| format!("create pipewire context failed: {e}"))?;
+    let core = context
+        .connect_rc(None)
+        .map_err(|e| format!("connect to pipewire daemon failed (is PipeWire running?): {e}"))?;
+    let registry = core
+        .get_registry_rc()
+        .map_err(|e| format!("get pipewire registry failed: {e}"))?;
+
+    // 監視スレッド内ローカル状態（!Send）。各クロージャへ Rc で共有する。
+    let state = Rc::new(RefCell::new(WatchState::default()));
+    // 配信キュー（events: Arc<Mutex<VecDeque>>）は各クロージャへ clone して move する。
+
+    // default メタデータの property リスナを生かしておくための保管庫
+    // （enumerate_pw と同型。型は MetaKeepStore = Rc<RefCell<Vec<MetaKeepEntry>>>）。
+    let meta_keep: MetaKeepStore = Rc::new(RefCell::new(Vec::new()));
+
+    // --- registry global / global_remove リスナ ---
+    let state_for_global = state.clone();
+    let events_for_global = events.clone();
+    let registry_for_global = registry.clone();
+    let meta_keep_for_global = meta_keep.clone();
+    let state_for_remove = state.clone();
+    let events_for_remove = events.clone();
+    let _registry_listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            let Some(props) = global.props else {
+                return;
+            };
+            match global.type_ {
+                pw::types::ObjectType::Node => {
+                    // enumerate_pw と同一の抽出ロジック。
+                    // media.class が Audio/Sink|Source のノードだけ拾う。
+                    let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
+                    if media_class != "Audio/Sink" && media_class != "Audio/Source" {
+                        return;
+                    }
+                    let node_name = props.get(*pw::keys::NODE_NAME).unwrap_or("");
+                    if node_name.is_empty() {
+                        // 安定キーが無いノードは扱えない（スキップ）。
+                        return;
+                    }
+                    let description = props
+                        .get(*pw::keys::NODE_DESCRIPTION)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(node_name);
+                    let rate = props.get("audio.rate").and_then(|s| s.parse::<u32>().ok());
+                    let channels = props
+                        .get(*pw::keys::AUDIO_CHANNELS)
+                        .and_then(|s| s.parse::<u16>().ok());
+
+                    let is_loopback = media_class == "Audio/Sink";
+                    let source_kind = if is_loopback {
+                        SourceKind::SystemLoopback
+                    } else {
+                        SourceKind::Mic
+                    };
+                    // is_default は既知の default メタデータ値と突き合わせる。
+                    // 初期スキャン中はメタデータがまだ来ていないこともあり、その場合は
+                    // false。正確化は DefaultChanged 経由で後追いされる。
+                    let mut st = state_for_global.borrow_mut();
+                    let is_default = if is_loopback {
+                        st.default_sink.as_deref() == Some(node_name)
+                    } else {
+                        st.default_source.as_deref() == Some(node_name)
+                    };
+
+                    let info = DeviceInfo {
+                        id: node_name.to_string(),
+                        name: description.to_string(),
+                        source_kind,
+                        // 取れなければ要求ネイティブ（48000/2）を既定にする（enumerate_pw 同様）。
+                        sample_rate: rate.unwrap_or(NATIVE_RATE),
+                        channels: channels.unwrap_or(NATIVE_CHANNELS),
+                        is_loopback,
+                        is_default,
+                    };
+                    st.by_global_id.insert(global.id, info.clone());
+                    let initial_scan_done = st.initial_scan_done;
+                    drop(st);
+
+                    // 初期スキャン中は登録のみ（Added を抑制）。完了後の出現だけ配信。
+                    if initial_scan_done {
+                        enqueue_event(&events_for_global, DeviceEvent::Added(info));
+                    }
+                }
+                pw::types::ObjectType::Metadata => {
+                    // 既定 sink/source を保持する "default" メタデータだけ bind する
+                    // （enumerate_pw と同型）。
+                    let meta_name = props.get("metadata.name").unwrap_or("");
+                    if meta_name != "default" {
+                        return;
+                    }
+                    let metadata: pw::metadata::Metadata = match registry_for_global.bind(global) {
+                        Ok(m) => m,
+                        Err(_) => return,
+                    };
+                    let state_for_meta = state_for_global.clone();
+                    let events_for_meta = events_for_global.clone();
+                    let listener = metadata
+                        .add_listener_local()
+                        .property(move |_subject, key, _type, value| {
+                            // value は JSON（例: {"name":"alsa_output...."}）。name を抜く。
+                            if let (Some(key), Some(value)) = (key, value) {
+                                let new_name = extract_json_name(value);
+                                let mut st = state_for_meta.borrow_mut();
+                                if key == "default.audio.sink" {
+                                    if st.default_sink != new_name {
+                                        st.default_sink = new_name.clone();
+                                        // 初期スキャン完了後の変化のみ配信。
+                                        if st.initial_scan_done {
+                                            if let Some(id) = new_name {
+                                                drop(st);
+                                                enqueue_event(
+                                                    &events_for_meta,
+                                                    DeviceEvent::DefaultChanged {
+                                                        kind: SourceKind::SystemLoopback,
+                                                        id,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    }
+                                } else if key == "default.audio.source"
+                                    && st.default_source != new_name
+                                {
+                                    st.default_source = new_name.clone();
+                                    if st.initial_scan_done {
+                                        if let Some(id) = new_name {
+                                            drop(st);
+                                            enqueue_event(
+                                                &events_for_meta,
+                                                DeviceEvent::DefaultChanged {
+                                                    kind: SourceKind::Mic,
+                                                    id,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            0
+                        })
+                        .register();
+                    meta_keep_for_global
+                        .borrow_mut()
+                        .push((Box::new(metadata), Box::new(listener)));
+                }
+                _ => {}
+            }
+        })
+        .global_remove(move |id| {
+            // 逆引き表にヒットしたノードだけ Removed を配信。表に無い id は無視
+            // （Metadata 等の非ノード global の除去も来るが、表に無いので素通り）。
+            let removed = state_for_remove.borrow_mut().by_global_id.remove(&id);
+            if let Some(info) = removed {
+                enqueue_event(&events_for_remove, DeviceEvent::Removed { id: info.id });
+            }
+        })
+        .register();
+
+    // --- 二段 sync→done バリアで初期スキャン完了を検知（enumerate_pw と同型）---
+    //
+    // enumerate_pw と違い、done では quit() せず initial_scan_done を立てるだけ。
+    // 2 段目の done を受けた時点で「初期 global 列挙 + default メタデータの初期
+    // property ダンプ」が揃っているので、以後の global/global_remove/property
+    // 変化を「ユーザー起因の着脱・既定変更」とみなして配信できる。
+    let stage = Rc::new(Cell::new(0u8));
+    let pending = core.sync(0).map_err(|e| format!("pipewire sync failed: {e}"))?;
+    let pending = Rc::new(Cell::new(pending.seq()));
+
+    let stage_for_cb = stage.clone();
+    let pending_for_cb = pending.clone();
+    let state_for_done = state.clone();
+    let loop_for_done = main_loop.clone();
+    let core_weak = core.downgrade();
+    let _core_listener = core
+        .add_listener_local()
+        .done(move |id, seq| {
+            if id != pw::core::PW_ID_CORE {
+                return;
+            }
+            let seq = seq.seq();
+            match stage_for_cb.get() {
+                0 if seq == pending_for_cb.get() => {
+                    // 1 段目完了 → メタデータ property を待つため 2 段目の sync を打つ。
+                    stage_for_cb.set(1);
+                    if let Some(core) = core_weak.upgrade() {
+                        match core.sync(0) {
+                            Ok(p) => pending_for_cb.set(p.seq()),
+                            Err(_) => {
+                                // 2 段目を打てない場合は初期スキャン完了とみなす。
+                                stage_for_cb.set(2);
+                                state_for_done.borrow_mut().initial_scan_done = true;
+                                loop_for_done.quit();
+                            }
+                        }
+                    } else {
+                        stage_for_cb.set(2);
+                        state_for_done.borrow_mut().initial_scan_done = true;
+                        loop_for_done.quit();
+                    }
+                }
+                1 if seq == pending_for_cb.get() => {
+                    // 2 段目完了 → 初期スキャン終了。
+                    // ここで quit() を呼ぶのは「初期スキャン用の run() を抜ける」ため
+                    // だけ（下の while ループ用）。永続監視の run() は run_watch_loop
+                    // 側で別途回す。stage を 2 に進めてあるので、以後 done が来ても
+                    // この match はどの腕にも当たらず quit() は二度と呼ばれない。
+                    stage_for_cb.set(2);
+                    state_for_done.borrow_mut().initial_scan_done = true;
+                    loop_for_done.quit();
+                }
+                _ => {}
+            }
+        })
+        .register();
+
+    // 初期スキャン完了（= 2 段の往復完了）まで run() を回す。done で
+    // initial_scan_done を立て quit() するので、enumerate_pw と同じく必ず抜ける
+    // （無限化しない）。これで「初期 global 列挙 + default メタデータ初期ダンプ」が
+    // 揃った状態にしてから返す。**永続的な監視 run() は run_watch_loop が担う**。
+    // stage が 2 に達した後は done で quit されないため、その後の run() は止まらない。
+    while !state.borrow().initial_scan_done {
+        main_loop.run();
+    }
+
+    Ok((
+        main_loop,
+        core,
+        registry,
+        WatchListeners {
+            _registry_listener,
+            _core_listener,
+            _meta_keep: meta_keep,
+        },
+    ))
+}
+
+/// 配信キューへイベントを 1 つ積む。lock 失敗時は何もしない（panic しない）。
+/// `VecDeque` は無制限（着脱は低頻度・取りこぼし不可）。
+fn enqueue_event(events: &Arc<Mutex<VecDeque<DeviceEvent>>>, ev: DeviceEvent) {
+    if let Ok(mut q) = events.lock() {
+        q.push_back(ev);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -831,5 +1338,90 @@ mod tests {
         let mut out = vec![0.0f32; 1920];
         let got = cons.pop_slice(&mut out);
         assert!(got > 0, "expected captured samples from the default sink monitor");
+    }
+
+    // ------------------------------------------------------------------------
+    // PwDeviceWatcher（ホットプラグ通知）
+    // ------------------------------------------------------------------------
+
+    /// [`PwDeviceWatcher`] が `Send` であること（PipeWire の `!Send` 型を専用
+    /// スレッドへ閉じ込められている証左）。コンパイルが通れば成立。
+    /// `PwSystemBackend` の同テストに倣う。
+    #[test]
+    fn watcher_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PwDeviceWatcher>();
+    }
+
+    /// PipeWire 不在の homelab でも `start()` が **panic しない**こと。
+    /// PipeWire セッションがあれば `Ok`、無ければ `Err(Backend)` になり得るが、
+    /// どちらでも panic していないことが要点（facade が Err を no-op 縮退に握る）。
+    /// Ok になった場合は stop まで一巡できること（破棄が安全）も確認する。
+    #[test]
+    fn watcher_graceful_without_pipewire() {
+        match PwDeviceWatcher::start() {
+            Ok(mut w) => {
+                // PipeWire セッションがある環境。poll_event は非ブロッキングで、
+                // 初期スキャン分は抑制済みなので即 None になり得る（出ても問題ない）。
+                let _ = w.poll_event();
+                w.stop();
+            }
+            Err(Error::Backend(_)) => {
+                // PipeWire 不在: 想定内。panic していないことが要点。
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    /// `start()` に成功した後、`stop()` を二度呼んでも安全（panic しない・二度目は
+    /// no-op）。PipeWire 不在で `start()` が Err の環境ではスキップ。
+    #[test]
+    fn watcher_double_stop_is_safe() {
+        if let Ok(mut w) = PwDeviceWatcher::start() {
+            w.stop();
+            w.stop();
+        }
+        // start に失敗した環境（PipeWire 不在）では検証対象が無い＝panic しなければ OK。
+    }
+
+    /// `enqueue_event` / `poll` 相当のキュー入出力が FIFO で機能すること
+    /// （PipeWire 非依存。配信キューのロジックだけを検証する）。
+    #[test]
+    fn enqueue_and_drain_is_fifo() {
+        let events: Arc<Mutex<VecDeque<DeviceEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let mic = DeviceInfo {
+            id: "mic.a".into(),
+            name: "Mic A".into(),
+            source_kind: SourceKind::Mic,
+            sample_rate: NATIVE_RATE,
+            channels: NATIVE_CHANNELS,
+            is_loopback: false,
+            is_default: false,
+        };
+        enqueue_event(&events, DeviceEvent::Added(mic.clone()));
+        enqueue_event(&events, DeviceEvent::Removed { id: "mic.a".into() });
+        enqueue_event(
+            &events,
+            DeviceEvent::DefaultChanged {
+                kind: SourceKind::SystemLoopback,
+                id: "sink.x".into(),
+            },
+        );
+        // poll_event 相当（FIFO で取り出す）。
+        let mut drained = Vec::new();
+        while let Some(ev) = events.lock().unwrap().pop_front() {
+            drained.push(ev);
+        }
+        assert_eq!(
+            drained,
+            vec![
+                DeviceEvent::Added(mic),
+                DeviceEvent::Removed { id: "mic.a".into() },
+                DeviceEvent::DefaultChanged {
+                    kind: SourceKind::SystemLoopback,
+                    id: "sink.x".into(),
+                },
+            ]
+        );
     }
 }

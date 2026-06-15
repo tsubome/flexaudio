@@ -80,6 +80,11 @@ struct Cli {
     #[arg(long)]
     list_devices: bool,
 
+    /// 録音せず、デバイスの着脱（ホットプラグ）を監視して stderr に表示し続ける
+    /// （`watch_devices()`。Ctrl-C で停止。`--source` 等とは独立に動く）。
+    #[arg(long)]
+    watch_devices: bool,
+
     /// キャプチャするソース（mic / system[Linux]）。
     #[arg(long, value_enum, default_value_t = SourceArg::Mic)]
     source: SourceArg,
@@ -140,6 +145,12 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     // `--source` 等とは独立。最優先で処理する。
     if cli.list_devices {
         return list_devices();
+    }
+
+    // --- デバイス着脱監視モード（録音せず監視し続ける） ---
+    // list_devices の直後。`--source` 等とは独立に最優先で処理する。
+    if cli.watch_devices {
+        return watch_devices_loop();
     }
 
     let stdout_stream = cli.is_stdout_stream();
@@ -288,6 +299,71 @@ fn list_devices() -> std::result::Result<(), String> {
     }
     println!();
     println!("（DEFAULT の * は OS 既定デバイス。ID は --device-id 等で使える安定キー。）");
+    Ok(())
+}
+
+/// `--watch-devices`: デバイスの着脱（ホットプラグ）を `watch_devices()` で監視し、
+/// 着脱イベントを **stderr** へ表示し続ける（Ctrl-C で停止）。
+///
+/// stdout は将来の機械可読出力用に空けておく既存思想に従い、ログ・イベントは全て
+/// stderr へ出す。起動時に `devices()` で既存デバイスを数えて件数を表示する。
+///
+/// 表示形式（いずれも stderr）:
+/// - `[+] ADDED   <source> <name> (<id>)` — デバイス追加
+/// - `[-] REMOVED <id>` — デバイス取り外し（id = node.name のみ）
+/// - `[*] DEFAULT <source> -> <id>` — 既定デバイス切替
+fn watch_devices_loop() -> std::result::Result<(), String> {
+    use flexaudio::core::DeviceEvent;
+
+    // 起動時に既存デバイス数を数えて案内（stderr）。列挙失敗は致命的にしない。
+    let existing = flexaudio::devices().map(|d| d.len()).unwrap_or(0);
+    eprintln!("デバイス着脱監視を開始しました（既存 {existing} 件）。Ctrl-C で停止します。");
+    eprintln!();
+
+    // Ctrl-C(SIGINT) で停止フラグを倒す。
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let r = running.clone();
+        ctrlc::set_handler(move || {
+            r.store(false, Ordering::SeqCst);
+        })
+        .map_err(|e| format!("Ctrl-C ハンドラの登録に失敗しました: {e}"))?;
+    }
+
+    // 監視開始。PipeWire 不在等でも縮退して Ok（着脱が来ないだけ）。
+    let mut watcher =
+        flexaudio::watch_devices().map_err(|e| format!("デバイス監視の開始に失敗しました: {e}"))?;
+
+    while running.load(Ordering::SeqCst) {
+        while let Some(ev) = watcher.poll_event() {
+            match ev {
+                DeviceEvent::Added(info) => {
+                    eprintln!(
+                        "[+] ADDED   {:<7} {} ({})",
+                        source_kind_label(info.source_kind),
+                        info.name,
+                        info.id,
+                    );
+                }
+                DeviceEvent::Removed { id } => {
+                    eprintln!("[-] REMOVED {id}");
+                }
+                DeviceEvent::DefaultChanged { kind, id } => {
+                    eprintln!(
+                        "[*] DEFAULT {:<7} -> {}",
+                        source_kind_label(kind),
+                        id,
+                    );
+                }
+            }
+        }
+        // 着脱は低頻度。空転を避けて適度に眠る（応答性 100ms で十分）。
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    watcher.stop();
+    eprintln!();
+    eprintln!("デバイス着脱監視を停止しました（Ctrl-C）。");
     Ok(())
 }
 

@@ -95,6 +95,30 @@ pub struct DeviceInfo {
     pub is_default: bool,
 }
 
+/// デバイスの着脱・既定変更を表すホットプラグイベント。
+/// capture stream 単位の [`Event`] とは別系統で、`DeviceWatcher`（facade 層）が
+/// デバイス単位の事象として配信する。pull 型（`poll_event`）で取る。
+///
+/// 着脱は低頻度だが取りこぼし不可なので、配信キューは無制限で溜める。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceEvent {
+    /// デバイスが追加された（接続・新規ノード出現）。
+    Added(DeviceInfo),
+    /// デバイスが取り外された（切断・ノード消滅）。
+    /// PipeWire の `global_remove` は数値 id しか渡さないため、安定 ID（`node.name`）のみ返す。
+    Removed {
+        /// 取り外されたデバイスの安定 ID（= [`DeviceInfo::id`] = PipeWire の `node.name`）。
+        id: String,
+    },
+    /// OS 既定デバイスが変わった（既定 sink / source の切替）。
+    DefaultChanged {
+        /// 既定が切り替わったソース種別（`Mic` = 既定 source / `SystemLoopback` = 既定 sink）。
+        kind: SourceKind,
+        /// 新しい既定デバイスの安定 ID（= `node.name`）。
+        id: String,
+    },
+}
+
 /// キャプチャするオーディオソースの種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {

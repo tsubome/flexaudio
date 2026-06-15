@@ -5,9 +5,12 @@
 
 pub use flexaudio_core as core;
 
+pub mod device_watcher;
 pub mod mock;
 pub mod stream;
 
+pub use device_watcher::DeviceWatcher;
+pub use flexaudio_core::types::DeviceEvent;
 pub use mock::MockBackend;
 pub use stream::Stream;
 
@@ -44,4 +47,22 @@ pub fn devices() -> Result<Vec<DeviceInfo>> {
     }
 
     Ok(all)
+}
+
+/// デバイスの着脱・既定変更（ホットプラグ）を監視する [`DeviceWatcher`] を開始する。
+///
+/// 返ったウォッチャの [`DeviceWatcher::poll_event`] を周期的に呼ぶと、デバイスの
+/// 接続・切断・既定変更が [`DeviceEvent`] として **pull 型**で取り出せる。capture
+/// stream 単位の [`core::Event`] とは別系統で、デバイス単位の事象を扱う。
+///
+/// # OS 分岐 / 縮退
+/// - **Linux**: PipeWire レジストリを永続監視する（`flexaudio-os-linux`）。
+///   PipeWire デーモン不在・接続失敗時は **[`NoopWatcher`](device_watcher) へ縮退**
+///   して `Ok` を返す（着脱が来ないだけ。`devices()` がデーモン不在を空リストに
+///   握るのと一貫）。
+/// - **その他 OS**: 常に no-op（着脱は配信されない）。
+///
+/// したがって本関数は実用上 `Ok` を返す（PipeWire 不在でも panic せず縮退）。
+pub fn watch_devices() -> Result<DeviceWatcher> {
+    device_watcher::watch_devices()
 }
