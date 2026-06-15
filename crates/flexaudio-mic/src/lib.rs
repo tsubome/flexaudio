@@ -37,7 +37,7 @@ use cpal::SampleFormat;
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
-use flexaudio_core::types::{Error, Result};
+use flexaudio_core::types::{DeviceInfo, Error, Result, SourceKind};
 
 /// 入力デバイスが取得できない場合に [`native_format`](CpalMicBackend::native_format)
 /// が返す無難な既定フォーマット `(48000 Hz, mono)`。実際の `start` 時にデバイスが
@@ -90,6 +90,58 @@ fn query_native_format() -> Option<(u32, u16)> {
     let device = host.default_input_device()?;
     let config = device.default_input_config().ok()?;
     Some((config.sample_rate().0, config.channels()))
+}
+
+/// 入力（マイク）デバイスを列挙する（統一デバイス列挙 `devices()` のマイク分）。
+///
+/// cpal の `host.input_devices()` を走査し、各デバイスを [`DeviceInfo`] へ写す:
+/// - `id` / `name`: cpal は永続 ID を持たないため、**device name を安定キー**にして
+///   両方へ入れる（M-5: 再接続で index が変わる問題の回避。同一構成なら同じ name）。
+/// - `sample_rate` / `channels`: `default_input_config()` から取得。取れない（その
+///   デバイスが実際には開けない等）場合はそのデバイスを**スキップ**する。
+/// - `source_kind = Mic` / `is_loopback = false`（マイクは録音デバイスでループバック
+///   ではない）。
+/// - `is_default`: `host.default_input_device()` の name と一致すれば `true`。
+///
+/// デバイスが 1 つも無い／ホスト初期化に失敗した環境では**空 `Vec` を返す**
+/// （panic しない）。同名デバイスが複数広告される稀なケースでは id が重複し得るが、
+/// cpal でこれ以上安定なキーは取れないため許容する（既知の限界）。
+pub fn list_devices() -> Result<Vec<DeviceInfo>> {
+    let host = cpal::default_host();
+
+    // 既定入力デバイス名（is_default 判定用）。取れなければ既定一致は付かない。
+    let default_name = host
+        .default_input_device()
+        .and_then(|d| d.name().ok());
+
+    // input_devices() 自体が失敗する環境（ALSA 不在等）は空リスト扱い。
+    let devices = match host.input_devices() {
+        Ok(it) => it,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut out = Vec::new();
+    for device in devices {
+        // name が取れないデバイスは安定キーを作れないのでスキップ。
+        let Ok(name) = device.name() else {
+            continue;
+        };
+        // 既定入力 config が取れない＝広告されていても実際には開けない。スキップ。
+        let Ok(config) = device.default_input_config() else {
+            continue;
+        };
+        let is_default = default_name.as_deref() == Some(name.as_str());
+        out.push(DeviceInfo {
+            id: name.clone(),
+            name,
+            source_kind: SourceKind::Mic,
+            sample_rate: config.sample_rate().0,
+            channels: config.channels(),
+            is_loopback: false,
+            is_default,
+        });
+    }
+    Ok(out)
 }
 
 impl CaptureBackend for CpalMicBackend {
@@ -432,6 +484,24 @@ mod tests {
         // フォーマットは常に正の値（デバイス無しなら FALLBACK_FORMAT）。
         assert!(rate > 0);
         assert!(channels > 0);
+    }
+
+    /// [`list_devices`] はデバイス有無を問わず panic せず `Ok(Vec)` を返す。
+    /// 返ったデバイスは全て `Mic` / 非ループバックで、`id == name` の安定キーを持つ。
+    #[test]
+    fn list_devices_never_panics_and_is_consistent() {
+        let devices = list_devices().expect("list_devices は Err を返さない設計");
+        for d in &devices {
+            assert_eq!(d.source_kind, SourceKind::Mic);
+            assert!(!d.is_loopback, "マイクはループバックではない");
+            // 安定キー: cpal では id にデバイス名を使う。
+            assert_eq!(d.id, d.name);
+            assert!(!d.id.is_empty(), "id（=name）は空でない");
+            assert!(d.sample_rate > 0);
+            assert!(d.channels > 0);
+        }
+        // 既定入力は高々 1 つ。
+        assert!(devices.iter().filter(|d| d.is_default).count() <= 1);
     }
 
     /// `start` は homelab（サーバ）に入力デバイスが無いと `Err(DeviceNotFound)` に

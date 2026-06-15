@@ -416,6 +416,8 @@ name = "flexaudio"
 version = "0.2.0"
 dependencies = [
  "flexaudio-core",
+ "flexaudio-mic",
+ "flexaudio-os-linux",
 ]
 
 [[package]]

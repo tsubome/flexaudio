@@ -75,6 +75,11 @@ enum EncodingArg {
 #[derive(Debug, Parser)]
 #[command(name = "flexaudio-cli", about = "flexaudio キャプチャ CLI（実機テスト用）")]
 struct Cli {
+    /// 録音せず、利用可能なオーディオデバイスを一覧表示して終了する
+    /// （`devices()` の統合列挙。`--source` 等とは独立に動く）。
+    #[arg(long)]
+    list_devices: bool,
+
     /// キャプチャするソース（mic / system[Linux]）。
     #[arg(long, value_enum, default_value_t = SourceArg::Mic)]
     source: SourceArg,
@@ -131,6 +136,12 @@ fn main() -> ExitCode {
 
 /// 実処理本体。失敗は人間向けメッセージ（`String`）として返す。
 fn run(cli: &Cli) -> std::result::Result<(), String> {
+    // --- デバイス一覧モード（録音せず列挙して終了） ---
+    // `--source` 等とは独立。最優先で処理する。
+    if cli.list_devices {
+        return list_devices();
+    }
+
     let stdout_stream = cli.is_stdout_stream();
 
     // ログ出力先の切り替え:
@@ -234,6 +245,70 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         run_stdout_stream(cli, &mut stream)
     } else {
         run_wav(cli, &mut stream, output)
+    }
+}
+
+/// `--list-devices`: 利用可能なオーディオデバイスを `devices()` で取得して表形式で表示する。
+///
+/// 列: SOURCE（mic/system/process）/ LOOPBACK / DEFAULT / RATE / CH / NAME / ID。
+/// id は安定 ID（cpal=デバイス名 / PipeWire=node.name）。デバイスが 1 つも無い環境では
+/// その旨を表示する（エラーにはしない）。
+fn list_devices() -> std::result::Result<(), String> {
+    let devices =
+        flexaudio::devices().map_err(|e| format!("デバイス列挙に失敗しました: {e}"))?;
+
+    if devices.is_empty() {
+        println!("利用可能なオーディオデバイスが見つかりませんでした。");
+        println!(
+            "（PipeWire/オーディオデバイスのある実機で実行してください。\
+             Linux は system 列挙に PipeWire セッションが必要です。）"
+        );
+        return Ok(());
+    }
+
+    println!("利用可能なオーディオデバイス: {} 件", devices.len());
+    println!();
+    // ヘッダ。固定幅で揃える（id/name は可変長なので末尾）。
+    println!(
+        "{:<7} {:<8} {:<7} {:>6} {:>3}  {:<28} ID",
+        "SOURCE", "LOOPBACK", "DEFAULT", "RATE", "CH", "NAME"
+    );
+    println!("{}", "-".repeat(88));
+    for d in &devices {
+        println!(
+            "{:<7} {:<8} {:<7} {:>6} {:>3}  {:<28} {}",
+            source_kind_label(d.source_kind),
+            if d.is_loopback { "yes" } else { "no" },
+            if d.is_default { "*" } else { "" },
+            d.sample_rate,
+            d.channels,
+            truncate(&d.name, 28),
+            d.id,
+        );
+    }
+    println!();
+    println!("（DEFAULT の * は OS 既定デバイス。ID は --device-id 等で使える安定キー。）");
+    Ok(())
+}
+
+/// [`SourceKind`] を CLI 表示用の短いラベルへ。
+fn source_kind_label(kind: SourceKind) -> &'static str {
+    match kind {
+        SourceKind::Mic => "mic",
+        SourceKind::SystemLoopback => "system",
+        SourceKind::ProcessLoopback => "process",
+    }
+}
+
+/// 表示用に文字列を `max` 文字（char 単位）で切り詰める（超過分は `…`）。
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let keep = max.saturating_sub(1);
+        let mut t: String = s.chars().take(keep).collect();
+        t.push('…');
+        t
     }
 }
 

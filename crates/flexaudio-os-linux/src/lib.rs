@@ -37,7 +37,7 @@ use std::thread::{self, JoinHandle};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
-use flexaudio_core::types::{Error, Result};
+use flexaudio_core::types::{DeviceInfo, Error, Result, SourceKind};
 
 use pipewire as pw;
 use pw::spa;
@@ -434,6 +434,278 @@ thread_local! {
     static PROC_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+// ============================================================================
+// デバイス列挙（`devices()` の Linux/PipeWire 分）
+// ============================================================================
+
+/// 列挙中に PipeWire レジストリ globalイベントから集めた 1 ノードの生情報。
+///
+/// コールバックは `!Send` なローカル状態へ書き込むため、ここでは所有 `String` で
+/// 控えておき、列挙ループ終了後に [`DeviceInfo`] へ組み立てる。
+struct NodeRecord {
+    /// 安定 ID に使う `node.name`（永続的）。
+    node_name: String,
+    /// 表示名。`node.description` 優先、無ければ `node.name`。
+    description: String,
+    /// `media.class`（`"Audio/Sink"` / `"Audio/Source"` 等）。
+    media_class: String,
+    /// `audio.rate` を読めた場合のレート（Hz）。
+    rate: Option<u32>,
+    /// `audio.channels` を読めた場合のチャンネル数。
+    channels: Option<u16>,
+}
+
+/// 列挙ループ全体で共有する収集先（`!Send`・ループスレッド内に閉じる）。
+#[derive(Default)]
+struct EnumState {
+    /// 集めた Audio/Sink・Audio/Source ノード。
+    nodes: Vec<NodeRecord>,
+    /// 既定 sink の `node.name`（`default.audio.sink` メタデータから）。
+    default_sink: Option<String>,
+    /// 既定 source の `node.name`（`default.audio.source` メタデータから）。
+    default_source: Option<String>,
+}
+
+/// PipeWire 経由でオーディオデバイス（マイク + システム出力 sink）を列挙する。
+///
+/// レジストリの global イベントを 1 往復ぶん受け取り、
+/// - `media.class == "Audio/Sink"` → システム音声出力（既定 sink の monitor を録る
+///   対象）として **`is_loopback = true` / `source_kind = SystemLoopback`**。
+/// - `media.class == "Audio/Source"` → マイク等の録音デバイスとして
+///   **`is_loopback = false` / `source_kind = Mic`**。
+///
+/// として [`DeviceInfo`] に写す。`id` は永続的な **`node.name`**、`name` は
+/// `node.description`（無ければ `node.name`）。`sample_rate` / `channels` は
+/// `audio.rate` / `audio.channels` プロパティが取れればその値、無ければ既定
+/// `48000 / 2`。既定デバイスは `default` メタデータ（`default.audio.sink` /
+/// `default.audio.source`）の指す `node.name` と一致するものに `is_default = true`。
+///
+/// 実装は短命の `MainLoop` を 1 本回し、`core.sync()` の `done` で列挙完了を検知して
+/// `quit()` する（同期完了したら必ず抜ける）。PipeWire デーモン不在・接続失敗・
+/// レジストリ取得失敗は **`Ok(空 Vec)`** に握る（panic しない・列挙は「無い」と等価）。
+pub fn list_devices() -> Result<Vec<DeviceInfo>> {
+    match enumerate_pw() {
+        Ok(v) => Ok(v),
+        // デーモン不在等は「列挙対象なし」と等価に扱う（呼び出し側を壊さない）。
+        Err(_msg) => Ok(Vec::new()),
+    }
+}
+
+/// PipeWire レジストリ列挙の本体。失敗は `Err(String)`（panic しない）。
+///
+/// この関数内だけで `MainLoop`/`Context`/`Core`/`Registry` を生成・実行・破棄する
+/// （いずれも `!Send`）。`list_devices` は別スレッドを立てずに呼び出しスレッドで
+/// 同期実行する（短命ループで列挙→即終了のため、所有スレッド方式は不要）。
+fn enumerate_pw() -> std::result::Result<Vec<DeviceInfo>, String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    pw::init();
+
+    let main_loop = pw::main_loop::MainLoopRc::new(None)
+        .map_err(|e| format!("create pipewire main loop failed: {e}"))?;
+    let context = pw::context::ContextRc::new(&main_loop, None)
+        .map_err(|e| format!("create pipewire context failed: {e}"))?;
+    let core = context
+        .connect_rc(None)
+        .map_err(|e| format!("connect to pipewire daemon failed (is PipeWire running?): {e}"))?;
+    // RegistryRc はクローン可能で、global コールバックへ move して bind に使える。
+    let registry = core
+        .get_registry_rc()
+        .map_err(|e| format!("get pipewire registry failed: {e}"))?;
+
+    let state = Rc::new(RefCell::new(EnumState::default()));
+    // default メタデータの property リスナを生かしておくための保管庫。
+    // global コールバック内で bind した Metadata プロキシ + リスナをここへ push する。
+    type MetaKeep = (Box<dyn pw::proxy::ProxyT>, Box<dyn pw::proxy::Listener>);
+    let meta_keep: Rc<RefCell<Vec<MetaKeep>>> = Rc::new(RefCell::new(Vec::new()));
+
+    // --- registry global リスナ: Audio ノードと default メタデータを収集 ---
+    let state_for_global = state.clone();
+    let registry_for_global = registry.clone();
+    let meta_keep_for_global = meta_keep.clone();
+    let _reg_listener = registry
+        .add_listener_local()
+        .global(move |global| {
+            let Some(props) = global.props else {
+                return;
+            };
+            match global.type_ {
+                pw::types::ObjectType::Node => {
+                    // media.class が Audio/Sink|Source のノードだけ拾う。
+                    let media_class = props.get(*pw::keys::MEDIA_CLASS).unwrap_or("");
+                    if media_class != "Audio/Sink" && media_class != "Audio/Source" {
+                        return;
+                    }
+                    let node_name = props.get(*pw::keys::NODE_NAME).unwrap_or("");
+                    if node_name.is_empty() {
+                        // 安定キーが無いノードは列挙できない（スキップ）。
+                        return;
+                    }
+                    let description = props
+                        .get(*pw::keys::NODE_DESCRIPTION)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(node_name);
+                    // audio.rate のキー定数は pipewire crate で feature gate 下（未有効）
+                    // のため文字列指定。registry のノード props には載らないことも多く、
+                    // その場合は下流で既定値（48000/2）にフォールバックする。
+                    let rate = props
+                        .get("audio.rate")
+                        .and_then(|s| s.parse::<u32>().ok());
+                    let channels = props
+                        .get(*pw::keys::AUDIO_CHANNELS)
+                        .and_then(|s| s.parse::<u16>().ok());
+                    state_for_global.borrow_mut().nodes.push(NodeRecord {
+                        node_name: node_name.to_string(),
+                        description: description.to_string(),
+                        media_class: media_class.to_string(),
+                        rate,
+                        channels,
+                    });
+                }
+                pw::types::ObjectType::Metadata => {
+                    // 既定 sink/source を保持する "default" メタデータだけ bind する。
+                    // ("metadata.name" のキー定数は pipewire crate に無いので文字列指定)
+                    let meta_name = props.get("metadata.name").unwrap_or("");
+                    if meta_name != "default" {
+                        return;
+                    }
+                    let metadata: pw::metadata::Metadata = match registry_for_global.bind(global) {
+                        Ok(m) => m,
+                        Err(_) => return,
+                    };
+                    let state_for_meta = state_for_global.clone();
+                    let listener = metadata
+                        .add_listener_local()
+                        .property(move |_subject, key, _type, value| {
+                            // value は JSON（例: {"name":"alsa_output...."}）。name を抜く。
+                            if let (Some(key), Some(value)) = (key, value) {
+                                if key == "default.audio.sink" {
+                                    state_for_meta.borrow_mut().default_sink =
+                                        extract_json_name(value);
+                                } else if key == "default.audio.source" {
+                                    state_for_meta.borrow_mut().default_source =
+                                        extract_json_name(value);
+                                }
+                            }
+                            0
+                        })
+                        .register();
+                    meta_keep_for_global
+                        .borrow_mut()
+                        .push((Box::new(metadata), Box::new(listener)));
+                }
+                _ => {}
+            }
+        })
+        .register();
+
+    // --- 二段 sync→done バリアで列挙完了を待つ ---
+    //
+    // 1 段目の done は「registry の初期 global が出揃った」ことを保証するが、その
+    // global 中で bind した default メタデータの**初期 property ダンプ**（既定 sink/
+    // source の値）はまだ届いていないことがある（proxy 経由イベントは別途到着）。
+    // そこで 1 段目の done を受けたら**もう一度 sync** し、2 段目の done で初めて
+    // quit する。これで「global 列挙 + 既定メタデータの property」両方が揃ってから
+    // 抜けられる。done は必ず来るので無限化しない。
+    let done = Rc::new(std::cell::Cell::new(false));
+    let stage = Rc::new(std::cell::Cell::new(0u8));
+    let pending1 = core.sync(0).map_err(|e| format!("pipewire sync failed: {e}"))?;
+    let pending1 = Rc::new(std::cell::Cell::new(pending1.seq()));
+
+    let done_for_cb = done.clone();
+    let stage_for_cb = stage.clone();
+    let pending1_for_cb = pending1.clone();
+    let loop_for_cb = main_loop.clone();
+    let core_weak = core.downgrade();
+    let _core_listener = core
+        .add_listener_local()
+        .done(move |id, seq| {
+            if id != pw::core::PW_ID_CORE {
+                return;
+            }
+            let seq = seq.seq();
+            match stage_for_cb.get() {
+                0 if seq == pending1_for_cb.get() => {
+                    // 1 段目完了 → メタデータ property を待つため 2 段目の sync を打つ。
+                    stage_for_cb.set(1);
+                    if let Some(core) = core_weak.upgrade() {
+                        match core.sync(0) {
+                            Ok(p) => pending1_for_cb.set(p.seq()),
+                            Err(_) => {
+                                // 2 段目を打てない場合はここで打ち切る。
+                                done_for_cb.set(true);
+                                loop_for_cb.quit();
+                            }
+                        }
+                    } else {
+                        done_for_cb.set(true);
+                        loop_for_cb.quit();
+                    }
+                }
+                1 if seq == pending1_for_cb.get() => {
+                    // 2 段目完了 → 列挙終了。
+                    done_for_cb.set(true);
+                    loop_for_cb.quit();
+                }
+                _ => {}
+            }
+        })
+        .register();
+
+    // done が立つ（= 2 段の往復完了）まで回す。done で必ず quit するので無限化しない。
+    while !done.get() {
+        main_loop.run();
+    }
+
+    // --- 収集した生ノードから DeviceInfo を組み立てる ---
+    let state = state.borrow();
+    let mut out = Vec::with_capacity(state.nodes.len());
+    for n in &state.nodes {
+        let is_loopback = n.media_class == "Audio/Sink";
+        let source_kind = if is_loopback {
+            SourceKind::SystemLoopback
+        } else {
+            SourceKind::Mic
+        };
+        let is_default = if is_loopback {
+            state.default_sink.as_deref() == Some(n.node_name.as_str())
+        } else {
+            state.default_source.as_deref() == Some(n.node_name.as_str())
+        };
+        out.push(DeviceInfo {
+            id: n.node_name.clone(),
+            name: n.description.clone(),
+            source_kind,
+            // 取れなければ要求ネイティブ（48000/2）を既定にする。
+            sample_rate: n.rate.unwrap_or(NATIVE_RATE),
+            channels: n.channels.unwrap_or(NATIVE_CHANNELS),
+            is_loopback,
+            is_default,
+        });
+    }
+    Ok(out)
+}
+
+/// PipeWire の `default.audio.{sink,source}` メタデータ値（JSON `{"name":"..."}`）から
+/// `name` 文字列を取り出す。簡易抽出（外部 JSON crate を足さない）。値が想定外なら
+/// `None`。
+fn extract_json_name(value: &str) -> Option<String> {
+    // `"name"` キーの後の最初の文字列リテラルを取る。空白・コロンを飛ばす。
+    let after_key = value.split("\"name\"").nth(1)?;
+    let after_colon = after_key.split(':').nth(1)?;
+    // 最初の `"` から次の `"` までを抜く。
+    let start = after_colon.find('"')? + 1;
+    let rest = &after_colon[start..];
+    let end = rest.find('"')?;
+    let name = &rest[..end];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +734,54 @@ mod tests {
         let mut be = PwSystemBackend::new();
         be.stop();
         be.stop();
+    }
+
+    /// `extract_json_name` が PipeWire のメタデータ値（JSON）から name を抜けること。
+    #[test]
+    fn extract_json_name_parses_default_metadata_value() {
+        assert_eq!(
+            extract_json_name(r#"{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}"#)
+                .as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+        );
+        // 空白入りでも抜ける。
+        assert_eq!(
+            extract_json_name(r#"{ "name" : "foo.bar" }"#).as_deref(),
+            Some("foo.bar")
+        );
+        // name キーが無い / 空 / 不正なら None。
+        assert_eq!(extract_json_name(r#"{"other":"x"}"#), None);
+        assert_eq!(extract_json_name(r#"{"name":""}"#), None);
+        assert_eq!(extract_json_name("not json"), None);
+    }
+
+    /// `list_devices` は PipeWire が無い homelab でも panic せず `Ok(Vec)` を返す
+    /// （デーモン不在は「列挙対象なし」= 空 Vec に握る）。デバイスが返った場合は
+    /// Sink→SystemLoopback / Source→Mic の整合と id（=node.name）非空を検証する。
+    #[test]
+    fn list_devices_is_graceful_without_pipewire() {
+        let devices = list_devices().expect("list_devices は Err を返さない設計");
+        for d in &devices {
+            assert!(!d.id.is_empty(), "id（=node.name）は空でない");
+            match d.source_kind {
+                SourceKind::SystemLoopback => assert!(d.is_loopback, "Sink はループバック"),
+                SourceKind::Mic => assert!(!d.is_loopback, "Source はループバックでない"),
+                other => panic!("想定外の source_kind: {other:?}"),
+            }
+            assert!(d.sample_rate > 0);
+            assert!(d.channels > 0);
+        }
+        // 既定 sink / 既定 source はそれぞれ高々 1 つ。
+        let default_loopback = devices
+            .iter()
+            .filter(|d| d.is_default && d.is_loopback)
+            .count();
+        let default_mic = devices
+            .iter()
+            .filter(|d| d.is_default && !d.is_loopback)
+            .count();
+        assert!(default_loopback <= 1);
+        assert!(default_mic <= 1);
     }
 
     /// スモークテスト: `start` は PipeWire/sink が無い homelab では

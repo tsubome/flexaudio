@@ -7,3 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 flexaudio-core = { path = "../flexaudio-core" }
+# デバイス列挙（`devices()`）でマイク入力（cpal, 全 OS）を束ねる。
+flexaudio-mic = { path = "../flexaudio-mic" }
+
+# デバイス列挙でシステム出力 sink（PipeWire）を束ねる（Linux のみ）。
+[target.'cfg(target_os = "linux")'.dependencies]
+flexaudio-os-linux = { path = "../flexaudio-os-linux" }

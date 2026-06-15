@@ -133,6 +133,26 @@ fn mock_default_output_regression_with_peak_rms() {
     }
 }
 
+/// `devices()` 統合列挙が panic せず `Ok(Vec)` を返し、各 DeviceInfo の不変条件
+/// （id 非空 / loopback と source_kind の整合 / 正の rate・ch）を満たす。
+/// homelab/CI ではデバイスが無く空 Vec になり得るが、それも妥当（panic しないことが要点）。
+#[test]
+fn devices_enumeration_never_panics_and_is_consistent() {
+    use flexaudio::core::types::SourceKind;
+
+    let devices = flexaudio::devices().expect("devices() は Err を返さない設計");
+    for d in &devices {
+        assert!(!d.id.is_empty(), "id（安定キー）は空でない");
+        assert!(d.sample_rate > 0, "sample_rate は正");
+        assert!(d.channels > 0, "channels は正");
+        match d.source_kind {
+            SourceKind::Mic => assert!(!d.is_loopback, "Mic はループバックでない"),
+            SourceKind::SystemLoopback => assert!(d.is_loopback, "SystemLoopback はループバック"),
+            other => panic!("devices() が返さないはずの source_kind: {other:?}"),
+        }
+    }
+}
+
 /// open → start → stop がハング/panic なく完了する（スレッド join の健全性）。
 #[test]
 fn open_start_stop_is_clean() {

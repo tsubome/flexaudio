@@ -61,6 +61,40 @@ pub struct AudioChunk {
     pub rms: f32,
 }
 
+/// `devices()`（統一デバイス列挙）が 1 デバイスにつき返す情報。
+///
+/// 全 OS バックエンド共通の正規形。マイク入力（[`SourceKind::Mic`]）と
+/// システム音声出力（[`SourceKind::SystemLoopback`]）を 1 つのリストへ統合して返す。
+///
+/// # 安定 ID（M-5）
+/// `id` は「再接続で index が変わる」問題を避けるため、取得できる範囲で**最も安定な
+/// キー**を採る:
+/// - cpal（マイク, 全 OS）: cpal は永続 ID を持たないため **デバイス名**を id にする。
+/// - PipeWire（Linux）: 永続的な **`node.name`** を id にする（`node.description` は
+///   表示名として `name` に使う）。
+///
+/// 同一マシン・同一構成で繰り返し列挙すれば同じ `id` が得られる安定性を意図する
+/// （別マシンや OS をまたいだ大域一意性は保証しない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// 安定 ID。[`StreamConfig::device_id`] に渡せるキー（cpal=デバイス名 /
+    /// PipeWire=`node.name`）。
+    pub id: String,
+    /// 人間向け表示名（PipeWire は `node.description` 優先、無ければ `node.name`）。
+    pub name: String,
+    /// このデバイスをキャプチャするときのソース種別。
+    pub source_kind: SourceKind,
+    /// デバイスのネイティブ（既定）サンプルレート（Hz）。不明時は妥当な既定値。
+    pub sample_rate: u32,
+    /// デバイスのネイティブ（既定）チャンネル数。不明時は妥当な既定値。
+    pub channels: u16,
+    /// ループバック（システム出力の monitor）なら `true`、録音デバイス（マイク）なら
+    /// `false`。
+    pub is_loopback: bool,
+    /// OS の既定デバイス（既定入力 / 既定出力 sink）なら `true`。
+    pub is_default: bool,
+}
+
 /// キャプチャするオーディオソースの種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
@@ -308,6 +342,33 @@ mod tests {
         .validate()
         .is_ok());
         assert!(OutputFormat::default().validate().is_ok());
+    }
+
+    #[test]
+    fn device_info_builds_and_clones() {
+        let mic = DeviceInfo {
+            id: "alsa_input.pci-0000_00_1f.3".into(),
+            name: "内蔵マイク".into(),
+            source_kind: SourceKind::Mic,
+            sample_rate: 48_000,
+            channels: 2,
+            is_loopback: false,
+            is_default: true,
+        };
+        // Clone / PartialEq が機能すること（列挙結果の比較・複製に使う）。
+        assert_eq!(mic, mic.clone());
+        assert!(!mic.is_loopback);
+        assert!(mic.is_default);
+        assert_eq!(mic.source_kind, SourceKind::Mic);
+
+        let sys = DeviceInfo {
+            source_kind: SourceKind::SystemLoopback,
+            is_loopback: true,
+            is_default: false,
+            ..mic.clone()
+        };
+        assert!(sys.is_loopback);
+        assert_ne!(mic, sys);
     }
 
     #[test]
