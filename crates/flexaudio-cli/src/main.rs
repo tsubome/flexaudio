@@ -1,6 +1,6 @@
 //! flexaudio-cli — 実機テスト用キャプチャ CLI。
 //!
-//! 既定マイクから N 秒キャプチャし、固定契約（48000 Hz / stereo 2ch /
+//! 既定マイク等から N 秒キャプチャし、固定契約（48000 Hz / stereo 2ch /
 //! interleaved f32）のチャンクを集めて 16-bit PCM WAV に書き出す。
 //! ピーク / RMS(dBFS) / チャンク数 / ドロップ数などのサマリも表示する。
 //!
@@ -8,11 +8,25 @@
 //! flexaudio-cli --source mic --seconds 5 --out mic.wav
 //! ```
 //!
+//! また `--out -` を指定すると、WAV ではなく **ヘッダ無し raw PCM** を
+//! stdout（バイナリ）へチャンク到着次第ストリーミングする。受け手
+//! （例: WhisperApp の `spawn('flexaudio-cli', ...)` + stdout 読み）が
+//! リアルタイムに音声を受け取れる。`--encoding f32|s16` で標本形式を選ぶ。
+//! このモードでは stdout は PCM バイト専用とし、サマリ等のログは stderr へ出す。
+//! `--seconds 0` で無限ストリーミング（パイプ切れ / Ctrl-C で綺麗に停止）。
+//!
+//! ```text
+//! flexaudio-cli --source system --out - --encoding s16 --seconds 0 | aplay -f S16_LE -r 48000 -c 2
+//! ```
+//!
 //! 入力デバイスが無い環境（homelab 等）では実キャプチャはできず、
 //! 分かりやすいメッセージを表示して非ゼロ終了する（panic しない）。
 
-use std::path::PathBuf;
+use std::io::{self, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,33 +45,55 @@ use flexaudio_os_linux::PwSystemBackend;
 enum SourceArg {
     /// 既定マイク入力。
     Mic,
-    // TODO: system（システム出力ループバック）・process（特定プロセスのループバック）は
+    // TODO: process（特定プロセスのループバック）は
     // 対応バックエンド（flexaudio-os-*）が配線され次第ここへ追加する。
-    /// システム出力ループバック（未対応）。
+    /// システム出力ループバック（Linux のみ）。
     System,
     /// プロセス出力ループバック（未対応）。
     Process,
+}
+
+/// stdout ストリーミング時の標本形式（`--out -` 専用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum EncodingArg {
+    /// interleaved f32 little-endian（固定契約そのまま）。TS の Float32Array 直読み用。
+    F32,
+    /// interleaved i16 little-endian。`aplay -f S16_LE` 等の外部ツール互換。
+    S16,
 }
 
 /// flexaudio キャプチャ CLI。
 #[derive(Debug, Parser)]
 #[command(name = "flexaudio-cli", about = "flexaudio キャプチャ CLI（実機テスト用）")]
 struct Cli {
-    /// キャプチャするソース（当面は mic のみ対応）。
+    /// キャプチャするソース（mic / system[Linux]）。
     #[arg(long, value_enum, default_value_t = SourceArg::Mic)]
     source: SourceArg,
 
-    /// キャプチャ秒数。
+    /// キャプチャ秒数。`0` で無限ストリーミング（`--out -` 想定、Ctrl-C / パイプ切れで停止）。
     #[arg(long, default_value_t = 5)]
     seconds: u64,
 
-    /// 出力 WAV パス。
+    /// 出力先。ファイルパスなら WAV 書き出し、`-` なら stdout へ raw PCM ストリーミング。
     #[arg(long, default_value = "capture.wav")]
     out: PathBuf,
+
+    /// stdout ストリーミング時の標本形式（`--out -` 専用。WAV 出力では無視）。
+    #[arg(long, value_enum, default_value_t = EncodingArg::F32)]
+    encoding: EncodingArg,
+}
+
+impl Cli {
+    /// `--out -`（ハイフン 1 文字）かどうか。true なら stdout へ raw PCM ストリーミング。
+    fn is_stdout_stream(&self) -> bool {
+        self.out == Path::new("-")
+    }
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // stdout ストリーミング時はエラーも stdout を汚さないよう stderr へ。
+    // （run 内のログクロージャと同じ方針。main からのエラーは常に stderr で問題ない。）
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
@@ -69,13 +105,25 @@ fn main() -> ExitCode {
 
 /// 実処理本体。失敗は人間向けメッセージ（`String`）として返す。
 fn run(cli: &Cli) -> std::result::Result<(), String> {
-    if cli.seconds == 0 {
-        return Err("--seconds は 1 以上を指定してください。".into());
+    let stdout_stream = cli.is_stdout_stream();
+
+    // ログ出力先の切り替え:
+    //   - stdout ストリーミング時 → 全ログを stderr へ（stdout は PCM 専用）。
+    //   - ファイル出力時 → 従来通り stdout サマリでよい。
+    // クロージャ 1 つで集約し、以降の println!/eprintln! はこれを通す。
+    macro_rules! log {
+        ($($arg:tt)*) => {
+            if stdout_stream {
+                eprintln!($($arg)*);
+            } else {
+                println!($($arg)*);
+            }
+        };
     }
 
     // --- ソース種別から backend / SourceKind / 表示ラベルを解決 ---
     // Stream::open は Box<dyn CaptureBackend> を取る汎用設計なので、
-    // 以降のキャプチャ→WAV 本体は全ソース共通。
+    // 以降のキャプチャ本体は全ソース共通。
     let (backend, kind, source_label): (Box<dyn CaptureBackend>, SourceKind, &str) =
         match cli.source {
             SourceArg::Mic => (
@@ -111,14 +159,32 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
 
     // --- ネイティブフォーマット表示 ---
     let (native_rate, native_ch) = backend.native_format();
-    println!("ソース            : {source_label}");
-    println!("ネイティブフォーマット: {native_rate} Hz / {native_ch} ch");
-    println!(
-        "出力フォーマット   : {SAMPLE_RATE} Hz / {CHANNELS} ch / 16-bit PCM（固定契約）"
-    );
-    println!("キャプチャ秒数     : {} 秒", cli.seconds);
-    println!("出力パス           : {}", cli.out.display());
-    println!();
+    log!("ソース            : {source_label}");
+    log!("ネイティブフォーマット: {native_rate} Hz / {native_ch} ch");
+    if stdout_stream {
+        let enc = match cli.encoding {
+            EncodingArg::F32 => "f32 LE",
+            EncodingArg::S16 => "s16 LE",
+        };
+        log!(
+            "出力フォーマット   : {SAMPLE_RATE} Hz / {CHANNELS} ch / {enc} raw PCM（stdout・固定契約）"
+        );
+    } else {
+        log!(
+            "出力フォーマット   : {SAMPLE_RATE} Hz / {CHANNELS} ch / 16-bit PCM WAV（固定契約）"
+        );
+    }
+    if cli.seconds == 0 {
+        log!("キャプチャ秒数     : 無限（Ctrl-C / パイプ切れで停止）");
+    } else {
+        log!("キャプチャ秒数     : {} 秒", cli.seconds);
+    }
+    if stdout_stream {
+        log!("出力先             : stdout（raw PCM ストリーミング）");
+    } else {
+        log!("出力パス           : {}", cli.out.display());
+    }
+    log!("");
 
     // --- ストリームを開いて開始 ---
     let config = StreamConfig {
@@ -128,7 +194,26 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     let mut stream = Stream::open(config, backend).map_err(describe_error)?;
     stream.start().map_err(describe_error)?;
 
-    println!("キャプチャ中 ...");
+    log!("キャプチャ中 ...");
+
+    if stdout_stream {
+        run_stdout_stream(cli, &mut stream)
+    } else {
+        run_wav(cli, &mut stream)
+    }
+}
+
+/// WAV 出力経路（従来挙動）。N 秒（>0）収集して 16-bit WAV を書き出し、stdout にサマリ表示。
+fn run_wav(cli: &Cli, stream: &mut Stream) -> std::result::Result<(), String> {
+    // WAV 経路で --seconds 0 は意味を持たない（無限に貯め続けてしまう）。従来通り拒否。
+    if cli.seconds == 0 {
+        stream.stop();
+        return Err(
+            "--seconds 0（無限）は raw PCM ストリーミング（--out -）専用です。\
+             WAV 出力では 1 以上を指定してください。"
+                .into(),
+        );
+    }
 
     // --- N 秒間 poll_chunk をループして全チャンクを収集 ---
     let mut chunks: Vec<AudioChunk> = Vec::new();
@@ -166,6 +251,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     }
 
     // --- 解析（ピーク / RMS）と WAV 書き出し ---
+    // NOTE: WAV は現状 s16 固定。将来 f32 WAV が必要になれば encoding を WAV にも波及させる余地あり。
     let total_frames: usize = chunks.iter().map(|c| c.frames).sum();
     let stats = write_wav(&cli.out, &chunks).map_err(|e| format!("WAV 書き出し失敗: {e}"))?;
 
@@ -200,6 +286,156 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     println!("WAV 書き出し       : {}", cli.out.display());
 
     Ok(())
+}
+
+/// stdout raw PCM ストリーミング経路。
+///
+/// チャンク到着次第すぐ stdout へ書き、各回 flush して溜め込まない（低レイテンシ）。
+/// `--seconds 0` なら無限（Ctrl-C / パイプ切れ[BrokenPipe] で正常停止）、
+/// `--seconds N>0` なら N 秒で停止。どちらも stop 後にリング残チャンクを出し切る。
+fn run_stdout_stream(cli: &Cli, stream: &mut Stream) -> std::result::Result<(), String> {
+    let infinite = cli.seconds == 0;
+
+    // Ctrl-C(SIGINT) フラグ。無限時に押されたら綺麗に停止する。
+    // ctrlc は重複登録すると Err を返すので、無限時のみ登録する。
+    let running = Arc::new(AtomicBool::new(true));
+    if infinite {
+        let r = running.clone();
+        ctrlc::set_handler(move || {
+            r.store(false, Ordering::SeqCst);
+        })
+        .map_err(|e| format!("Ctrl-C ハンドラの登録に失敗しました: {e}"))?;
+    }
+
+    // stdout をロックして BufWriter で包む。チャンクごとに flush するので溜め込みは無い。
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+
+    let deadline = (!infinite).then(|| Instant::now() + Duration::from_secs(cli.seconds));
+
+    let mut wrote_any = false;
+    let mut broken_pipe = false;
+
+    // メインループ: ポーリングしてチャンクを stdout へ流す。
+    'outer: loop {
+        // 停止条件チェック（無限時は Ctrl-C、有限時は deadline）。
+        if infinite {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+        } else if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                break;
+            }
+        }
+
+        let mut got_any = false;
+        while let Some(chunk) = stream.poll_chunk() {
+            got_any = true;
+            match write_chunk(&mut out, &chunk, cli.encoding) {
+                Ok(()) => wrote_any = true,
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                    // 受け手が閉じた（| head 等）。エラーにせず正常停止へ。
+                    broken_pipe = true;
+                    break 'outer;
+                }
+                Err(e) => return Err(format!("stdout への書き込みに失敗しました: {e}")),
+            }
+        }
+
+        // イベントは stderr へ（stdout は PCM 専用）。
+        while let Some(ev) = stream.poll_event() {
+            eprintln!("  イベント: {ev:?}");
+        }
+
+        if !got_any {
+            // チャンク 1 つ ≈ 20ms。空転を避けて適度に眠る。
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let dropped = stream.dropped_chunks();
+    stream.stop();
+
+    // stop 後にもリングへ残ったチャンクを出し切る（パイプ切れ後はスキップ）。
+    if !broken_pipe {
+        while let Some(chunk) = stream.poll_chunk() {
+            match write_chunk(&mut out, &chunk, cli.encoding) {
+                Ok(()) => wrote_any = true,
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                    broken_pipe = true;
+                    break;
+                }
+                Err(e) => return Err(format!("stdout への書き込みに失敗しました: {e}")),
+            }
+        }
+    }
+
+    // 最終 flush。パイプ切れはここでも正常扱い。
+    if !broken_pipe {
+        if let Err(e) = out.flush() {
+            if e.kind() != io::ErrorKind::BrokenPipe {
+                return Err(format!("stdout の flush に失敗しました: {e}"));
+            }
+            broken_pipe = true;
+        }
+    }
+
+    // --- サマリ（stderr） ---
+    eprintln!();
+    eprintln!("=== 結果（stderr） ===");
+    if broken_pipe {
+        eprintln!("停止理由           : 受け手がパイプを閉じました（正常終了）");
+    } else if infinite {
+        eprintln!("停止理由           : Ctrl-C（正常終了）");
+    } else {
+        eprintln!("停止理由           : {} 秒経過", cli.seconds);
+    }
+    eprintln!("ドロップチャンク数 : {dropped}");
+
+    // パイプ切れ・Ctrl-C は「受け手都合の停止」なので、サンプル 0 でもエラーにしない。
+    // 有限秒指定で素直に終わったのに 1 サンプルも出ていない場合だけ警告する。
+    if !wrote_any && !broken_pipe && !infinite {
+        return Err(
+            "チャンクを 1 つも取得できませんでした。\
+             デバイスは開けましたがサンプルが流れていません（ミュート/権限等を確認してください）。"
+                .into(),
+        );
+    }
+
+    Ok(())
+}
+
+/// 1 チャンクの interleaved f32 を指定 encoding で `out` へ書く（little-endian）。
+///
+/// 各サンプル単位の小書き込みを避けるため、チャンク分のバイト列を一旦まとめてから
+/// 1 回の `write_all` で出す。書き込み後すぐ flush（低レイテンシ・溜め込み無し）。
+fn write_chunk<W: Write>(
+    out: &mut W,
+    chunk: &AudioChunk,
+    encoding: EncodingArg,
+) -> io::Result<()> {
+    match encoding {
+        EncodingArg::F32 => {
+            // f32 LE: 契約そのまま。1 サンプル 4 byte。
+            let mut buf = Vec::with_capacity(chunk.data.len() * 4);
+            for &x in &chunk.data {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+            out.write_all(&buf)?;
+        }
+        EncodingArg::S16 => {
+            // s16 LE: (clamp(-1,1) * 32767) as i16。1 サンプル 2 byte。
+            let mut buf = Vec::with_capacity(chunk.data.len() * 2);
+            for &x in &chunk.data {
+                let s = (x.clamp(-1.0, 1.0) * 32767.0) as i16;
+                buf.extend_from_slice(&s.to_le_bytes());
+            }
+            out.write_all(&buf)?;
+        }
+    }
+    // 届いたら即出す。BufWriter に溜め込まない。
+    out.flush()
 }
 
 /// WAV 書き出しと同時に計算する信号統計。

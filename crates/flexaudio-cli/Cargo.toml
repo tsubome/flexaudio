@@ -16,6 +16,9 @@ flexaudio-mic = { path = "../flexaudio-mic" }
 hound = "3.5"
 # 引数解析（純 Rust・寛容ライセンス Apache-2.0/MIT）
 clap = { version = "4", features = ["derive"] }
+# Ctrl-C(SIGINT) ハンドラ。無限ストリーミング（--seconds 0）の綺麗な停止に使う。
+# 純 Rust + OS シグナル API のみ（実行時ネットワーク不要・寛容ライセンス MIT/Apache-2.0）。
+ctrlc = "3"
 
 # システム音声（PipeWire）バックエンド。--source system 用（Linux のみ）
 [target.'cfg(target_os = "linux")'.dependencies]
