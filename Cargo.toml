@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flexaudio-core",
+    "crates/flexaudio-os-windows",
+    "crates/flexaudio-os-macos",
+    "crates/flexaudio-os-linux",
+    "crates/flexaudio-mic",
+    "crates/flexaudio",
+    "crates/flexaudio-ffi",
+    "crates/flexaudio-vad",
+    "bindings/pyflexaudio",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+repository = "https://github.com/tsubome/pyflexaudio"
+
+[workspace.dependencies]
+# 実装フェーズで追加 (rtrb, ringbuf, rubato, cpal, ort, pyo3, numpy 等)
