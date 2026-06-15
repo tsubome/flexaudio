@@ -190,48 +190,65 @@ fn run_capture_thread(
     drop(stream);
 }
 
-/// キャプチャ開始直後に破棄する「ウォームアップ」秒数。
+/// プライミング過渡バッファと判定する f32 ピーク振幅の閾値。
 ///
-/// Linux の PipeWire ALSA 互換ブリッジ（`default` PCM）は、アイドル状態から
-/// 冷えた状態で stream を開始すると、最初のコールバックで**フルスケールに張り付いた
-/// プライミング用ダミーバッファ**を 1 回吐く。この DC ステップは下流の DC ブロック
-/// 系を叩き、実測で約 0.8 秒かけて指数的に減衰する（先頭が −0dBFS で張り付き、左右
-/// 逆相の巨大 DC とクリップを生む症状の正体）。安全側に倒して先頭 1.0 秒を捨てる。
-///
-/// 注: これはブリッジ起動時の過渡だけの問題であり、最初の数百ミリ秒を捨てれば
-/// 以降は健全な音声が流れる。dropout ではなく「立ち上がりの破棄」なので、本番でも
-/// 録音開始の頭出しに 1 秒の余白を見込めばよい（VAD/文字起こしは無音から始まる）。
-const WARMUP_SECONDS: f32 = 1.0;
+/// flexaudio の f32 サンプルは契約上 `[-1.0, 1.0]` に正規化される。Linux の PipeWire
+/// ALSA 互換ブリッジ（`default` PCM）は、アイドルから冷えた状態で stream を開くと、
+/// 開始直後の数百 ms ぶん**範囲を大きく超えたフルスケール矩形のプライミング用ダミー
+/// バッファ**を吐く（実測ピーク ≈ 3.3、左右ほぼ逆相のため source 段では DC≈0 だが、
+/// 下流のレート変換で巨大 DC とクリップへ化ける）。このピークは正常音声では決して
+/// 出ない（契約上 1.0 が上限）ため、**ピークが 1.0 を明確に超えたバッファ＝過渡**と
+/// 確実に判定できる。デジタルフルスケール ±1.0 ちょうどの正常音声を誤って捨てない
+/// よう、わずかな余裕を持たせて 1.0 直上に置く。
+const PRIMING_PEAK_LIMIT: f32 = 1.001;
 
-/// 開始直後のウォームアップ区間のフレームを破棄するためのガード。
+/// キャプチャ開始直後のプライミング過渡バッファを破棄する信号ベースのガード。
 ///
-/// コールバックごとに渡されたフレーム数を消費し、予算（`remaining`）が尽きるまで
-/// `true`（＝このバッファは捨てる）を返す。RT コールバック内でのみ使うため
-/// アロケートせず分岐も最小限。
-struct WarmupGuard {
-    /// 破棄し残しているフレーム数。0 になったら以後は常に通す。
-    remaining: u64,
+/// 過渡バッファは契約レンジ `[-1.0, 1.0]` を超えるフルスケール矩形なので、ピークが
+/// [`PRIMING_PEAK_LIMIT`] を超えるバッファだけを破棄する。
+///
+/// 固定秒数で頭を捨てる方式は、過渡の無い環境（Mac / Windows / warm 状態の Linux）
+/// でも無条件に頭出し無音を作ってしまい侵襲的。本ガードは**バッファのピークだけを見て
+/// 過渡か否かを判定**するため、
+/// - 過渡が無い環境では 1 バッファも捨てない（頭出し無音ゼロ）、
+/// - 過渡の実長にも自動追従する（環境差に強い）。
+///
+/// 判定は「先頭側のバッファが過渡（範囲外）に見える間だけ捨て、レンジ内バッファが
+/// 1 つ来たら以後は永久に通す」(latch-open)。過渡は厳密に起動直後のみ現れ単調減衰
+/// するので、途中で再発することはない。RT コールバック内専用のため、判定はバッファ
+/// 1 走査の `abs` 比較のみ（アロケートなし・分岐最小）。
+struct TransientGuard {
+    /// 既に正常（レンジ内）バッファを通したか。`true` 以降は常に通す。
+    latched: bool,
 }
 
-impl WarmupGuard {
-    /// ネイティブレートから [`WARMUP_SECONDS`] 相当のフレーム数で初期化する。
-    fn new(native_rate: u32) -> Self {
-        Self {
-            remaining: (native_rate as f32 * WARMUP_SECONDS) as u64,
-        }
+impl TransientGuard {
+    fn new() -> Self {
+        Self { latched: false }
     }
 
-    /// `frames` フレームを与えた時、このバッファ全体を破棄すべきなら `true`。
-    ///
-    /// 簡明さのため、ウォームアップ境界をまたぐバッファはまるごと破棄する
-    /// （1 バッファ＝20ms 前後なので頭出しへの影響は無視できる）。境界を越えたら
-    /// 以後は予算 0 で常に `false`（通す）になる。
-    fn should_drop(&mut self, frames: u64) -> bool {
-        if self.remaining == 0 {
+    /// interleaved f32 バッファを与え、これがプライミング過渡（＝破棄すべき）なら
+    /// `true`。レンジ内バッファを 1 つでも通したら、以後は常に `false`（通す）。
+    fn should_drop(&mut self, data: &[f32]) -> bool {
+        if self.latched || data.is_empty() {
+            // 既に正常区間。または空バッファ（捨てる意味がない）。
+            self.latched = true;
             return false;
         }
-        self.remaining = self.remaining.saturating_sub(frames);
-        true
+        // バッファ 1 走査でピーク振幅を求める。
+        let mut peak = 0.0f32;
+        for &s in data {
+            let a = s.abs();
+            if a > peak {
+                peak = a;
+            }
+        }
+        // 契約レンジを明確に超える＝プライミング過渡。
+        let is_transient = peak > PRIMING_PEAK_LIMIT;
+        if !is_transient {
+            self.latched = true;
+        }
+        is_transient
     }
 }
 
@@ -239,8 +256,8 @@ impl WarmupGuard {
 ///
 /// sample format に応じてコールバックを分岐し、F32 はそのまま、I16/U16/I32 は
 /// `f32` `[-1.0, 1.0]` へ変換して [`RawSink::push`] へ渡す。開始直後の
-/// [`WARMUP_SECONDS`] 区間は [`WarmupGuard`] で破棄する（PipeWire ALSA ブリッジの
-/// プライミング過渡対策）。
+/// プライミング過渡バッファは [`TransientGuard`] が**信号統計で検出して**破棄する
+/// （PipeWire ALSA ブリッジ対策。過渡の無い環境では 1 バッファも捨てない）。
 fn build_stream(sink: RawSink) -> Result<cpal::Stream> {
     let host = cpal::default_host();
     let device = host
@@ -254,20 +271,7 @@ fn build_stream(sink: RawSink) -> Result<cpal::Stream> {
         .default_input_config()
         .map_err(|_| Error::DeviceNotFound)?;
     let sample_format = supported.sample_format();
-    let native_rate = supported.sample_rate().0;
-    let channels = supported.channels().max(1) as u64;
-    let buf_range = *supported.buffer_size();
-    let mut config: cpal::StreamConfig = supported.into();
-
-    // ALSA バックエンドの buffer_size を明示する。`BufferSize::Default` は
-    // `set_period_time_near` に頼るため、PipeWire ALSA ブリッジ経由だと period が
-    // 不安定に決まり過渡が悪化しやすい。Fixed(4096) は cpal 内部で period=1024
-    // （PipeWire の既定 quantum 相当）へ写されるため安定する。範囲外にならないよう
-    // デバイスが報告する min/max にクランプする。
-    if let cpal::SupportedBufferSize::Range { min, max } = buf_range {
-        let want = 4096u32.clamp(min, max);
-        config.buffer_size = cpal::BufferSize::Fixed(want);
-    }
+    let config: cpal::StreamConfig = supported.into();
 
     let err_fn = |e: cpal::StreamError| {
         // RT 経路外のエラーコールバック。ログ手段が未配線のため現状は黙殺する
@@ -276,17 +280,18 @@ fn build_stream(sink: RawSink) -> Result<cpal::Stream> {
     };
 
     // sink はコールバックへ move する。F32 以外は変換用に閉じ込める。
+    // 過渡判定は f32 値に対して行うため、変換フォーマットでは変換後に判定する。
     let stream = match sample_format {
         SampleFormat::F32 => {
             let mut sink = sink;
-            let mut warmup = WarmupGuard::new(native_rate);
+            let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if warmup.should_drop(data.len() as u64 / channels) {
+                    // 既に interleaved f32。プライミング過渡なら捨てる。
+                    if guard.should_drop(data) {
                         return;
                     }
-                    // 既に interleaved f32。そのまま非ブロッキング push。
                     sink.push(data, monotonic_now_ns());
                 },
                 err_fn,
@@ -297,15 +302,15 @@ fn build_stream(sink: RawSink) -> Result<cpal::Stream> {
             let mut sink = sink;
             // 変換用スクラッチ。コールバック内に閉じ込めて再利用（アロケート回避）。
             let mut scratch: Vec<f32> = Vec::new();
-            let mut warmup = WarmupGuard::new(native_rate);
+            let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    if warmup.should_drop(data.len() as u64 / channels) {
-                        return;
-                    }
                     scratch.clear();
                     scratch.extend(data.iter().map(|&s| s as f32 / -(i16::MIN as f32)));
+                    if guard.should_drop(&scratch) {
+                        return;
+                    }
                     sink.push(&scratch, monotonic_now_ns());
                 },
                 err_fn,
@@ -315,19 +320,19 @@ fn build_stream(sink: RawSink) -> Result<cpal::Stream> {
         SampleFormat::U16 => {
             let mut sink = sink;
             let mut scratch: Vec<f32> = Vec::new();
-            let mut warmup = WarmupGuard::new(native_rate);
+            let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                    if warmup.should_drop(data.len() as u64 / channels) {
-                        return;
-                    }
                     scratch.clear();
                     // u16 [0, 65535] を中点 32768 基準で [-1, 1) へ。
                     scratch.extend(
                         data.iter()
                             .map(|&s| (s as f32 - 32_768.0) / 32_768.0),
                     );
+                    if guard.should_drop(&scratch) {
+                        return;
+                    }
                     sink.push(&scratch, monotonic_now_ns());
                 },
                 err_fn,
@@ -337,15 +342,15 @@ fn build_stream(sink: RawSink) -> Result<cpal::Stream> {
         SampleFormat::I32 => {
             let mut sink = sink;
             let mut scratch: Vec<f32> = Vec::new();
-            let mut warmup = WarmupGuard::new(native_rate);
+            let mut guard = TransientGuard::new();
             device.build_input_stream(
                 &config,
                 move |data: &[i32], _: &cpal::InputCallbackInfo| {
-                    if warmup.should_drop(data.len() as u64 / channels) {
-                        return;
-                    }
                     scratch.clear();
                     scratch.extend(data.iter().map(|&s| s as f32 / -(i32::MIN as f32)));
+                    if guard.should_drop(&scratch) {
+                        return;
+                    }
                     sink.push(&scratch, monotonic_now_ns());
                 },
                 err_fn,
@@ -367,37 +372,56 @@ mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
 
-    /// [`WarmupGuard`] が概ね [`WARMUP_SECONDS`] 相当のフレームを破棄し、その後は
-    /// 通すこと。境界をまたぐバッファはまるごと破棄する仕様も確認する。
-    #[test]
-    fn warmup_guard_drops_initial_frames_then_passes() {
-        let rate = 48_000u32;
-        let mut g = WarmupGuard::new(rate);
-        let budget = (rate as f32 * WARMUP_SECONDS) as u64;
-
-        // 960 フレーム（20ms）刻みで与え、予算ぶんは破棄されること。
-        let chunk = 960u64;
-        let mut dropped = 0u64;
-        // 予算をちょうど使い切るより 1 チャンク多く回す。
-        let iters = budget / chunk + 2;
-        let mut first_pass_at = None;
-        for i in 0..iters {
-            if g.should_drop(chunk) {
-                dropped += chunk;
-            } else if first_pass_at.is_none() {
-                first_pass_at = Some(i);
-            }
+    /// interleaved stereo の f32 バッファを `frames` フレームぶん生成する。
+    /// 各サンプルは交互に `±peak`（ピーク振幅 `peak` の矩形）。
+    fn make_buf(frames: usize, peak: f32) -> Vec<f32> {
+        let mut v = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let s = if i % 2 == 0 { peak } else { -peak };
+            v.push(s); // L
+            v.push(s); // R
         }
-        // 破棄総数は予算以上（境界チャンクをまるごと捨てるため）かつ予算+1チャンク未満。
-        assert!(dropped >= budget, "dropped {dropped} < budget {budget}");
-        assert!(
-            dropped < budget + chunk,
-            "dropped too much: {dropped} >= {}",
-            budget + chunk
-        );
-        // 予算を越えたら以降は必ず通すこと。
-        assert!(first_pass_at.is_some(), "guard never passed any buffer");
-        assert!(!g.should_drop(chunk), "guard should pass after warmup");
+        v
+    }
+
+    /// [`TransientGuard`] が「範囲外フルスケール（過渡）→ 減衰 → レンジ内」の列の
+    /// 先頭側（ピークが [`PRIMING_PEAK_LIMIT`] 超のバッファ）だけを破棄し、レンジ内
+    /// バッファが来たら latch して以後は全て通すこと。
+    #[test]
+    fn transient_guard_drops_priming_then_latches_open() {
+        let frames = 1024;
+        let mut g = TransientGuard::new();
+
+        // 範囲外フルスケール矩形（実測のプライミング過渡相当 peak≈3.3）→ 破棄。
+        assert!(g.should_drop(&make_buf(frames, 3.3)));
+        // 減衰中だがまだ範囲外（peak=1.5 > LIMIT）→ 破棄。
+        assert!(g.should_drop(&make_buf(frames, 1.5)));
+        // レンジ内に戻った正常音声（peak=0.88）→ 通す＝ここで latch。
+        assert!(!g.should_drop(&make_buf(frames, 0.88)));
+        // latch 後は、たとえ範囲外バッファが来ても以後は必ず通す（途中再発を防ぐ）。
+        assert!(!g.should_drop(&make_buf(frames, 3.3)));
+    }
+
+    /// 過渡が全く無い環境（Mac/Win/warm Linux）では先頭からレンジ内音声なので、
+    /// [`TransientGuard`] は 1 バッファも破棄しない（頭出し無音ゼロ）。
+    #[test]
+    fn transient_guard_passes_clean_audio_from_the_start() {
+        let frames = 1024;
+        let mut g = TransientGuard::new();
+        // デジタルフルスケール ±1.0 ちょうどでも誤検知しない（LIMIT が 1.0 直上）。
+        assert!(!g.should_drop(&make_buf(frames, 1.0)));
+        assert!(!g.should_drop(&make_buf(frames, 0.5)));
+        // 無音（全ゼロ）も破棄しない。
+        assert!(!g.should_drop(&vec![0.0f32; frames * 2]));
+    }
+
+    /// 空バッファは破棄せず latch する。
+    #[test]
+    fn transient_guard_handles_empty_buffer() {
+        let mut g = TransientGuard::new();
+        assert!(!g.should_drop(&[]));
+        // 空で latch したので、以後の範囲外バッファも通す。
+        assert!(!g.should_drop(&make_buf(1024, 3.3)));
     }
 
     /// `new` + `native_format` が panic しないこと（入力デバイス有無を問わず）。
