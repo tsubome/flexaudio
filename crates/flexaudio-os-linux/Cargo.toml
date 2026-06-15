@@ -5,4 +5,8 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[dependencies]
+# このクレートは Linux 専用。非 Linux では lib.rs が `#![cfg(target_os = "linux")]`
+# で空コンパイルになり、pipewire 依存も以下の target 限定セクションでのみ引かれる。
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { workspace = true }
+flexaudio-core = { path = "../flexaudio-core" }
