@@ -1,0 +1,18 @@
+[package]
+name = "flexaudio-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "flexaudio-cli"
+path = "src/main.rs"
+
+[dependencies]
+flexaudio = { path = "../flexaudio" }
+flexaudio-mic = { path = "../flexaudio-mic" }
+# WAV 書き出し（純 Rust・システムライブラリ不要・寛容ライセンス Apache-2.0/MIT/Zlib）
+hound = "3.5"
+# 引数解析（純 Rust・寛容ライセンス Apache-2.0/MIT）
+clap = { version = "4", features = ["derive"] }
