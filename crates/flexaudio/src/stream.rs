@@ -25,10 +25,10 @@ use std::time::Duration;
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::chunk_ring::{chunk_ring, ChunkConsumer, ChunkProducer};
 use flexaudio_core::clock::{monotonic_now_ns, ClockNormalizer};
-use flexaudio_core::normalizer::{Normalizer, CHUNK_FRAMES};
+use flexaudio_core::normalizer::Normalizer;
 use flexaudio_core::raw_ring::{raw_ring, RawConsumer};
 use flexaudio_core::types::{
-    AudioChunk, ChunkFlags, Error, Event, Result, StreamConfig, CHANNELS,
+    AudioChunk, ChunkFlags, Error, Event, OutputFormat, Result, StreamConfig,
 };
 
 /// RawRing の容量（f32 サンプル単位）。ネイティブ SR×ch に依存させず、
@@ -125,6 +125,8 @@ impl Stream {
                 "ring_capacity_chunks must be > 0".into(),
             ));
         }
+        // 出力フォーマットが MVP の対応域か検証（非対応は UnsupportedFormat）。
+        config.output.validate()?;
         let native_format = backend.native_format();
         if native_format.0 == 0 || native_format.1 == 0 {
             return Err(Error::InvalidArg(
@@ -183,10 +185,11 @@ impl Stream {
         // 取り込み/加工スレッド。
         let worker_shared = self.shared.clone();
         let native_format = self.shared.native_format;
+        let output = self.config.output;
         let worker = thread::Builder::new()
             .name("flexaudio-intake".into())
             .spawn(move || {
-                run_intake(worker_shared, chunk_producer, native_format);
+                run_intake(worker_shared, chunk_producer, native_format, output);
             })
             .map_err(|e| Error::Backend(format!("spawn intake thread: {e}")))?;
         self.worker = Some(worker);
@@ -231,8 +234,10 @@ impl Stream {
 
     /// 完成済みチャンクを 1 つ取り出す（非ブロッキング）。無ければ `None`。
     ///
-    /// 返るチャンクは固定契約: interleaved `f32` / 48000 Hz / stereo 2ch /
-    /// 960 frames（`data.len() == 1920`）。`seq` は単調増加。
+    /// 返るチャンクは出力フォーマット（`config.output`）の interleaved `f32`。
+    /// チャンクは時間ベース 20ms 固定で `data.len() == frames * output.channels`。
+    /// 既定 `{48000, 2}` なら `frames == 960`（`data.len() == 1920`）。
+    /// `peak`/`rms` は最終 data に対して算出済み。`seq` は単調増加。
     pub fn poll_chunk(&mut self) -> Option<AudioChunk> {
         self.chunk_consumer.try_pop()
     }
@@ -293,16 +298,18 @@ impl Drop for Stream {
 
 /// 取り込み/加工スレッド本体。
 ///
-/// RawConsumer を pop → [`Normalizer`] へ投入 → 完成チャンクへ `seq` 付与 →
-/// ChunkRing へ push。世代変化（再オープン）を検知したら Normalizer/Clock を
-/// 作り直し、次チャンクへ RECOVERED|DISCONTINUITY を立てる。
+/// RawConsumer を pop → [`Normalizer`]（2 段: 内部正規化 → 出力フォーマット再変換）
+/// へ投入 → 完成チャンクへ `seq`・peak/rms 付与 → ChunkRing へ push。世代変化
+/// （再オープン）を検知したら Normalizer/Clock を作り直し、次チャンクへ
+/// RECOVERED|DISCONTINUITY を立てる。
 fn run_intake(
     shared: Arc<SharedState>,
     mut chunk_producer: ChunkProducer,
     native_format: (u32, u16),
+    output: OutputFormat,
 ) {
     let (rate, channels) = native_format;
-    let mut normalizer = Normalizer::new(rate, channels);
+    let mut normalizer = Normalizer::new(rate, channels, output);
     let mut clock = ClockNormalizer::new();
     let mut seq: u64 = 0;
     let mut current_generation = shared.raw_generation.load(Ordering::SeqCst);
@@ -320,7 +327,7 @@ fn run_intake(
         let gen = shared.raw_generation.load(Ordering::SeqCst);
         if gen != current_generation {
             current_generation = gen;
-            normalizer = Normalizer::new(rate, channels);
+            normalizer = Normalizer::new(rate, channels, output);
             clock = ClockNormalizer::new();
             // 次に出すチャンクへ復帰フラグを立てる。
             shared.recovered_pending.store(true, Ordering::SeqCst);
@@ -350,9 +357,16 @@ fn run_intake(
         }
 
         // 完成チャンクを全て取り出して ChunkRing へ。
+        let out_channels = output.channels.max(1) as usize;
         let mut emitted_any = false;
         while let Some((data, pts_ns)) = normalizer.pop_chunk() {
-            debug_assert_eq!(data.len(), CHUNK_FRAMES * CHANNELS as usize);
+            // data は出力フォーマット（output.channels interleaved）。
+            // frames は時間ベース 20ms 固定（48k=960 / 16k=320 / ...）。
+            debug_assert_eq!(data.len() % out_channels, 0);
+            let frames = data.len() / out_channels;
+
+            // 最終 data に対して peak / rms（線形）を算出する（20ms なので極小コスト）。
+            let (peak, rms) = peak_rms(&data);
 
             let mut flags = ChunkFlags::empty();
             // 復帰後の最初のチャンクへ RECOVERED|DISCONTINUITY。
@@ -365,11 +379,13 @@ fn run_intake(
 
             let chunk = AudioChunk {
                 data,
-                frames: CHUNK_FRAMES,
+                frames,
                 pts_ns,
                 seq,
                 flags,
                 dropped_before: 0, // ChunkRing が push 時に上書きする。
+                peak,
+                rms,
             };
             seq += 1;
 
@@ -453,6 +469,28 @@ fn run_watchdog(shared: Arc<SharedState>) {
             backoff = (backoff * 2).min(BACKOFF_MAX);
         }
     }
+}
+
+/// 出力フォーマットの最終 interleaved `data` から peak（全サンプル絶対値の最大）と
+/// rms（二乗平均平方根・線形）を求める。
+///
+/// 20ms チャンク（最大 1920 サンプル）に対する 1 走査なので極小コスト。空 data は
+/// `(0.0, 0.0)`。
+fn peak_rms(data: &[f32]) -> (f32, f32) {
+    if data.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut peak = 0.0f32;
+    let mut sum_sq = 0.0f64;
+    for &x in data {
+        let a = x.abs();
+        if a > peak {
+            peak = a;
+        }
+        sum_sq += (x as f64) * (x as f64);
+    }
+    let rms = (sum_sq / data.len() as f64).sqrt() as f32;
+    (peak, rms)
 }
 
 /// バックオフへ時刻ベースの軽いジッタ（±約 12.5%）を加える（`rand` 不使用）。

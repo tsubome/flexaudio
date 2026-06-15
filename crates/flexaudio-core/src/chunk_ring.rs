@@ -130,6 +130,8 @@ mod tests {
             seq,
             flags: ChunkFlags::empty(),
             dropped_before: 0,
+            peak: 0.0,
+            rms: 0.0,
         }
     }
 

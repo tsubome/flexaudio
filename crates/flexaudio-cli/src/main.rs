@@ -1,11 +1,18 @@
 //! flexaudio-cli — 実機テスト用キャプチャ CLI。
 //!
-//! 既定マイク等から N 秒キャプチャし、固定契約（48000 Hz / stereo 2ch /
+//! 既定マイク等から N 秒キャプチャし、出力フォーマット（既定 48000 Hz / stereo 2ch /
 //! interleaved f32）のチャンクを集めて 16-bit PCM WAV に書き出す。
 //! ピーク / RMS(dBFS) / チャンク数 / ドロップ数などのサマリも表示する。
 //!
+//! 出力フォーマットは `--output-rate <Hz>`（既定 48000）と
+//! `--output-channels <1|2>`（既定 2）で指定する。内部正規形（48k/stereo）から
+//! 第 2 段リサンプラ（rubato・アンチエイリアス込み）で再変換され、WAV ヘッダ・
+//! stdout の rate/ch もこれに追従する。チャンクは時間ベース 20ms 固定なので、
+//! レートに応じて 1 チャンクのフレーム数が変わる（48k=960 / 16k=320）。
+//!
 //! ```text
 //! flexaudio-cli --source mic --seconds 5 --out mic.wav
+//! flexaudio-cli --source system --output-rate 16000 --output-channels 1 --out 16k.wav --seconds 3
 //! ```
 //!
 //! また `--out -` を指定すると、WAV ではなく **ヘッダ無し raw PCM** を
@@ -14,9 +21,11 @@
 //! リアルタイムに音声を受け取れる。`--encoding f32|s16` で標本形式を選ぶ。
 //! このモードでは stdout は PCM バイト専用とし、サマリ等のログは stderr へ出す。
 //! `--seconds 0` で無限ストリーミング（パイプ切れ / Ctrl-C で綺麗に停止）。
+//! raw PCM のレート/ch も出力フォーマットに追従する（受け手の `-r/-c` を合わせること）。
 //!
 //! ```text
 //! flexaudio-cli --source system --out - --encoding s16 --seconds 0 | aplay -f S16_LE -r 48000 -c 2
+//! flexaudio-cli --source system --out - --encoding s16 --output-rate 16000 --output-channels 1 --seconds 0 | aplay -f S16_LE -r 16000 -c 1
 //! ```
 //!
 //! 入力デバイスが無い環境（homelab 等）では実キャプチャはできず、
@@ -33,7 +42,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 
 use flexaudio::core::{
-    AudioChunk, CaptureBackend, Error, SourceKind, StreamConfig, CHANNELS, SAMPLE_RATE,
+    AudioChunk, CaptureBackend, Error, OutputFormat, SourceKind, StreamConfig,
 };
 use flexaudio::Stream;
 use flexaudio_mic::CpalMicBackend;
@@ -81,12 +90,29 @@ struct Cli {
     /// stdout ストリーミング時の標本形式（`--out -` 専用。WAV 出力では無視）。
     #[arg(long, value_enum, default_value_t = EncodingArg::F32)]
     encoding: EncodingArg,
+
+    /// 出力サンプルレート（Hz）。既定 48000。例: `--output-rate 16000` で 16kHz へ
+    /// ダウンサンプル。WAV ヘッダ・stdout の標本レートもこれに追従する。
+    #[arg(long, default_value_t = 48_000)]
+    output_rate: u32,
+
+    /// 出力チャンネル数（1 = mono / 2 = stereo）。既定 2。stereo→mono は L/R 平均。
+    #[arg(long, default_value_t = 2)]
+    output_channels: u16,
 }
 
 impl Cli {
     /// `--out -`（ハイフン 1 文字）かどうか。true なら stdout へ raw PCM ストリーミング。
     fn is_stdout_stream(&self) -> bool {
         self.out == Path::new("-")
+    }
+
+    /// CLI 引数から [`OutputFormat`] を組み立てる。
+    fn output_format(&self) -> OutputFormat {
+        OutputFormat {
+            sample_rate: self.output_rate,
+            channels: self.output_channels,
+        }
     }
 }
 
@@ -157,6 +183,17 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
             }
         };
 
+    // --- 出力フォーマット解決・検証 ---
+    let output = cli.output_format();
+    output.validate().map_err(|e| {
+        format!(
+            "出力フォーマット {}Hz/{}ch は非対応です: {e}",
+            output.sample_rate, output.channels
+        )
+    })?;
+    let out_rate = output.sample_rate;
+    let out_ch = output.channels;
+
     // --- ネイティブフォーマット表示 ---
     let (native_rate, native_ch) = backend.native_format();
     log!("ソース            : {source_label}");
@@ -166,13 +203,9 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
             EncodingArg::F32 => "f32 LE",
             EncodingArg::S16 => "s16 LE",
         };
-        log!(
-            "出力フォーマット   : {SAMPLE_RATE} Hz / {CHANNELS} ch / {enc} raw PCM（stdout・固定契約）"
-        );
+        log!("出力フォーマット   : {out_rate} Hz / {out_ch} ch / {enc} raw PCM（stdout）");
     } else {
-        log!(
-            "出力フォーマット   : {SAMPLE_RATE} Hz / {CHANNELS} ch / 16-bit PCM WAV（固定契約）"
-        );
+        log!("出力フォーマット   : {out_rate} Hz / {out_ch} ch / 16-bit PCM WAV");
     }
     if cli.seconds == 0 {
         log!("キャプチャ秒数     : 無限（Ctrl-C / パイプ切れで停止）");
@@ -189,6 +222,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     // --- ストリームを開いて開始 ---
     let config = StreamConfig {
         kind,
+        output,
         ..Default::default()
     };
     let mut stream = Stream::open(config, backend).map_err(describe_error)?;
@@ -199,12 +233,17 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     if stdout_stream {
         run_stdout_stream(cli, &mut stream)
     } else {
-        run_wav(cli, &mut stream)
+        run_wav(cli, &mut stream, output)
     }
 }
 
 /// WAV 出力経路（従来挙動）。N 秒（>0）収集して 16-bit WAV を書き出し、stdout にサマリ表示。
-fn run_wav(cli: &Cli, stream: &mut Stream) -> std::result::Result<(), String> {
+/// `output` は出力フォーマット（WAV ヘッダの rate/ch・録れた秒数の算出に使う）。
+fn run_wav(
+    cli: &Cli,
+    stream: &mut Stream,
+    output: OutputFormat,
+) -> std::result::Result<(), String> {
     // WAV 経路で --seconds 0 は意味を持たない（無限に貯め続けてしまう）。従来通り拒否。
     if cli.seconds == 0 {
         stream.stop();
@@ -252,10 +291,12 @@ fn run_wav(cli: &Cli, stream: &mut Stream) -> std::result::Result<(), String> {
 
     // --- 解析（ピーク / RMS）と WAV 書き出し ---
     // NOTE: WAV は現状 s16 固定。将来 f32 WAV が必要になれば encoding を WAV にも波及させる余地あり。
+    // ヘッダの rate/ch は出力フォーマット（output）に追従する。
     let total_frames: usize = chunks.iter().map(|c| c.frames).sum();
-    let stats = write_wav(&cli.out, &chunks).map_err(|e| format!("WAV 書き出し失敗: {e}"))?;
+    let stats =
+        write_wav(&cli.out, &chunks, output).map_err(|e| format!("WAV 書き出し失敗: {e}"))?;
 
-    let captured_secs = total_frames as f64 / SAMPLE_RATE as f64;
+    let captured_secs = total_frames as f64 / output.sample_rate as f64;
     let rms_dbfs = if stats.rms > 0.0 {
         20.0 * stats.rms.log10()
     } else {
@@ -446,14 +487,19 @@ struct Stats {
     rms: f64,
 }
 
-/// チャンク列を 48000/2ch/16-bit PCM WAV として `path` へ書き出す。
+/// チャンク列を `output.sample_rate` / `output.channels` / 16-bit PCM WAV として
+/// `path` へ書き出す。
 ///
 /// 各チャンクの interleaved f32 を `(x.clamp(-1,1) * 32767) as i16` で量子化する。
 /// 併せてピーク / RMS（線形）を計算して返す。
-fn write_wav(path: &std::path::Path, chunks: &[AudioChunk]) -> hound::Result<Stats> {
+fn write_wav(
+    path: &std::path::Path,
+    chunks: &[AudioChunk],
+    output: OutputFormat,
+) -> hound::Result<Stats> {
     let spec = hound::WavSpec {
-        channels: CHANNELS,
-        sample_rate: SAMPLE_RATE,
+        channels: output.channels,
+        sample_rate: output.sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };

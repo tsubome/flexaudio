@@ -37,5 +37,6 @@ pub use clock::{monotonic_now_ns, ClockNormalizer};
 pub use normalizer::{Normalizer, CHUNK_FRAMES};
 pub use raw_ring::{raw_ring, RawConsumer, RawProducer};
 pub use types::{
-    AudioChunk, ChunkFlags, Error, Event, Result, SourceKind, StreamConfig, CHANNELS, SAMPLE_RATE,
+    AudioChunk, ChunkFlags, Error, Event, OutputFormat, Result, SourceKind, StreamConfig, CHANNELS,
+    SAMPLE_RATE,
 };
