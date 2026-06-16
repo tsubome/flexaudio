@@ -6,3 +6,22 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# silero-VAD を ONNX でオフライン実行する。`download-binaries` が「ビルド時」に onnxruntime を
+# 取得し静的リンクするため、実行時に別途 .so/.dll を配布する必要はなく実行時ネットワークもゼロ
+# （単一自己完結バイナリ）。CUDA 等の追加 EP は不要。
+# TLS は default の `tls-native` (openssl-sys=システム libssl 依存) を避け純 Rust の `tls-rustls`
+# に差し替える（ビルド時のモデル取得 HTTP のみに使用。homelab に libssl-dev 不要）。
+# 他の default feature (std/ndarray/tracing/download-binaries/copy-dylibs/api-24) は維持。
+ort = { version = "2.0.0-rc.12", default-features = false, features = [
+    "std",
+    "ndarray",
+    "tracing",
+    "download-binaries",
+    "copy-dylibs",
+    "api-24",
+    "tls-rustls",
+] }
+
+[[example]]
+name = "probe"
+path = "examples/probe.rs"
