@@ -27,10 +27,12 @@
 #![warn(missing_docs)]
 
 mod common;
+mod devices;
 mod process;
 mod system;
 mod tap;
 mod version;
 
+pub use devices::list_output_devices;
 pub use process::MacProcessBackend;
 pub use system::MacSystemBackend;

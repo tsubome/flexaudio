@@ -3,9 +3,11 @@
 //!
 //! 2 つの [`CaptureBackend`](flexaudio_core::backend::CaptureBackend) を提供する:
 //!
-//! - [`WasapiSystemBackend`] — 既定 render endpoint の古典 loopback
-//!   （`AUDCLNT_STREAMFLAGS_LOOPBACK`）でシステム音声出力全体（スピーカーへ流れている
-//!   ミックス）を録る。Linux の [`PwSystemBackend`](../flexaudio_os_linux) 相当。
+//! - [`WasapiSystemBackend`] — render endpoint の古典 loopback
+//!   （`AUDCLNT_STREAMFLAGS_LOOPBACK`）でシステム音声出力（そのエンドポイントへ流れている
+//!   ミックス）を録る。`device_id` で出力エンドポイントを選べる（`None` で既定）。Linux の
+//!   [`PwSystemBackend`](../flexaudio_os_linux) 相当。出力エンドポイントの一覧は
+//!   [`list_output_devices`] で取れる。
 //! - [`WasapiProcessBackend`] — `ActivateAudioInterfaceAsync` + プロセスループバック
 //!   （`AUDIOCLIENT_ACTIVATION_PARAMS`）で特定 PID（そのプロセスツリー）の音声を録る。
 //!   `exclude_self` で「対象ツリーを除く全システム音」へ反転する。
@@ -31,4 +33,4 @@ mod process;
 mod system;
 
 pub use process::WasapiProcessBackend;
-pub use system::WasapiSystemBackend;
+pub use system::{list_output_devices, WasapiSystemBackend};

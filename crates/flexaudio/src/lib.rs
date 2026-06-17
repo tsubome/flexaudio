@@ -31,7 +31,9 @@ pub use flexaudio_core::types::{
 ///   [`flexaudio_mic::list_devices`] 経由（cpal, 全 OS）。
 /// - システム音声出力（[`core::SourceKind::SystemLoopback`],
 ///   `is_loopback = true`）— OS 別バックエンド経由（Linux: PipeWire の Audio/Sink。
-///   Linux では PipeWire が Audio/Source（マイク）も列挙するので、cpal 分と重複し得る）。
+///   Linux では PipeWire が Audio/Source（マイク）も列挙するので、cpal 分と重複し得る。
+///   Windows/macOS: 出力エンドポイント列挙）。返った `id` は
+///   `--source system --device-id <ID>` でその出力を選ぶのに使える。
 ///
 /// 各 [`DeviceInfo`] の `id` は取得できる範囲で最も安定なキー（cpal=デバイス名 /
 /// PipeWire=`node.name`）。`is_default` は OS の既定デバイスに付く。
@@ -39,7 +41,7 @@ pub use flexaudio_core::types::{
 /// # OS 分岐
 /// - Linux: cpal（マイク）+ PipeWire（sink + source）を結合。PipeWire セッションが
 ///   無ければ PipeWire 分は空になり、cpal 分のみ返る。
-/// - その他 OS: 現状は cpal（マイク）のみ（システム出力バックエンドは未配線）。
+/// - Windows / macOS: cpal（マイク）+ OS の出力エンドポイントを結合。
 ///
 /// デバイスが無い／列挙に失敗した環境でも panic せず、取得できた範囲のリスト
 /// （しばしば空）を返す。
@@ -49,11 +51,21 @@ pub fn devices() -> Result<Vec<DeviceInfo>> {
     #[allow(unused_mut)]
     let mut all = flexaudio_mic::list_devices()?;
 
-    // システム出力 sink（+ PipeWire 側マイク）は OS 別。
+    // システム出力エンドポイントは OS 別。
     #[cfg(target_os = "linux")]
     {
         let linux = flexaudio_os_linux::list_devices()?;
         all.extend(linux);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let win = flexaudio_os_windows::list_output_devices()?;
+        all.extend(win);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mac = flexaudio_os_macos::list_output_devices()?;
+        all.extend(mac);
     }
 
     Ok(all)
@@ -89,9 +101,10 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// # ソース → バックエンドの分岐
 /// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`]（cpal, 全 OS）。
 /// - [`SourceKind::SystemLoopback`] → Linux / Windows / macOS
-///   （Linux: [`flexaudio_os_linux::PwSystemBackend`]＝既定出力の monitor / PipeWire。
-///   Windows: `flexaudio_os_windows::WasapiSystemBackend`＝既定 render endpoint の
-///   WASAPI loopback）。`config.exclude_self` をそのまま渡す（自ホスト除外）。
+///   （Linux: [`flexaudio_os_linux::PwSystemBackend`]＝出力の monitor / PipeWire。
+///   Windows: `flexaudio_os_windows::WasapiSystemBackend`＝render endpoint の
+///   WASAPI loopback）。`config.exclude_self`（自ホスト除外）と `config.device_id`
+///   （出力エンドポイント選択・`None` で既定出力）をそのまま渡す。
 ///   その他 OS では [`Error::Unsupported`]。
 /// - [`SourceKind::ProcessLoopback`] → Linux / Windows / macOS
 ///   （Linux: [`flexaudio_os_linux::PwProcessBackend`]。Windows:
@@ -154,11 +167,13 @@ pub fn open(config: StreamConfig) -> Result<Stream> {
 /// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`]（全 OS）。
 ///   `config.device_id` を渡して特定入力デバイスを選べる（`None` で既定入力。
 ///   id は [`devices`] が返す安定 ID = デバイス名。不一致は `start` 時に
-///   [`Error::DeviceNotFound`]）。device_id は mic にだけ効く
-///   （system/process は既定 render / target_pid 固定で device_id を見ない）。
+///   [`Error::DeviceNotFound`]）。`config.device_id` は mic（入力デバイス）と system
+///   （出力エンドポイント）の両方に効く（`None` で既定）。process では見ない
+///   （target_pid で対象を決める）。
 /// - [`SourceKind::SystemLoopback`] → Linux/Windows/macOS 対応
 ///   （Linux=[`flexaudio_os_linux::PwSystemBackend`] / Windows=WASAPI loopback /
-///   macOS=CoreAudio Process Tap）。非対応 OS は [`Error::Unsupported`]。
+///   macOS=CoreAudio Process Tap）。`config.device_id` で出力エンドポイントを選べる
+///   （`None` で既定出力）。非対応 OS は [`Error::Unsupported`]。
 /// - [`SourceKind::ProcessLoopback`] → Linux/Windows/macOS 対応
 ///   （Linux=[`flexaudio_os_linux::PwProcessBackend`] / Windows=WASAPI process loopback /
 ///   macOS=CoreAudio Process Tap）。`target_pid` 必須・欠落で [`Error::InvalidArg`]。
@@ -171,27 +186,32 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
     let backend: Box<dyn CaptureBackend> = match config.kind {
         // マイク入力は全 OS 共通（cpal）。device_id で特定入力デバイスを選べる
         // （None=既定入力デバイス。id は devices() が返す安定 ID = デバイス名）。
+        // 同じ device_id は system でも出力エンドポイント選択に効く。
         SourceKind::Mic => Box::new(flexaudio_mic::CpalMicBackend::new(config.device_id.clone())),
 
         // システム出力ループバックは Linux / Windows / macOS 対応。
-        // exclude_self（自ホスト除外）を backend へ渡す。mode は見ない。
+        // exclude_self（自ホスト除外）と device_id（出力エンドポイント選択）を backend へ
+        // 渡す。mode は見ない。device_id=None で既定出力。
         SourceKind::SystemLoopback => {
             #[cfg(target_os = "linux")]
             {
                 Box::new(flexaudio_os_linux::PwSystemBackend::new(
                     config.exclude_self,
+                    config.device_id.clone(),
                 ))
             }
             #[cfg(target_os = "windows")]
             {
                 Box::new(flexaudio_os_windows::WasapiSystemBackend::new(
                     config.exclude_self,
+                    config.device_id.clone(),
                 ))
             }
             #[cfg(target_os = "macos")]
             {
                 Box::new(flexaudio_os_macos::MacSystemBackend::new(
                     config.exclude_self,
+                    config.device_id.clone(),
                 ))
             }
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]

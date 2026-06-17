@@ -216,11 +216,11 @@ impl Default for OutputFormat {
 /// `exclude_self` を、system ソースは `mode` を無視する（mic は両方無関係）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamConfig {
-    /// 入力デバイス（Mic ソースのみ）。`None` なら既定入力デバイス、`Some(id)` なら
-    /// `devices()` が返す安定 ID（デバイス名）に一致する入力デバイス。不一致なら
-    /// `start` 時に [`Error::DeviceNotFound`]。[`SourceKind::SystemLoopback`] /
-    /// [`SourceKind::ProcessLoopback`] では無視される（system は既定 render
-    /// エンドポイント固定、process は `target_pid` で対象を決める）。
+    /// 選ぶデバイス。mic（入力デバイス）と system（出力エンドポイント）の両方に効く。
+    /// `None` なら既定（mic=既定入力 / system=既定出力）、`Some(id)` なら `devices()`
+    /// が返す安定 ID に一致するデバイス。不一致なら `start` 時に
+    /// [`Error::DeviceNotFound`]。[`SourceKind::ProcessLoopback`] では無視される
+    /// （`target_pid` で対象を決める）。
     pub device_id: Option<String>,
     /// ソース種別。
     pub kind: SourceKind,

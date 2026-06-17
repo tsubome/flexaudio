@@ -45,8 +45,16 @@ pub(crate) enum TapKind {
     /// 指定オブジェクト群を含むステレオ mixdown（プロセスループバック INCLUDE）。
     /// 空 vec は不正（呼び出し側が DeviceNotFound を返す）。
     IncludeProcesses(Vec<AudioObjectID>),
-    /// 指定オブジェクト群を除く全システム音。空 vec ならシステム全体。
+    /// 指定オブジェクト群を除く全システム音（既定出力）。空 vec ならシステム全体。
     ExcludeProcesses(Vec<AudioObjectID>),
+    /// 指定オブジェクト群を除く、特定出力デバイス宛の音。`device_uid` はそのデバイスの UID。
+    /// `ExcludeProcesses` の既定出力版に対し、こちらは出力先を 1 デバイスへ絞る。
+    ExcludeProcessesOnDevice {
+        /// 除外するプロセスオブジェクト群（空ならそのデバイス宛の全システム音）。
+        ids: Vec<AudioObjectID>,
+        /// 対象出力デバイスの UID（`kAudioDevicePropertyDeviceUID`）。
+        device_uid: String,
+    },
 }
 
 /// 構築済みの tap チェーン。`Drop` で逆順に破棄する。
@@ -142,7 +150,8 @@ pub(crate) unsafe fn build_tap_chain(
     name: &str,
     sink: RawSink,
 ) -> Result<TapChain, Error> {
-    // 1) CATapDescription（INCLUDE = mixdown / EXCLUDE = global-but-exclude）。
+    // 1) CATapDescription（INCLUDE = mixdown / EXCLUDE = global-but-exclude /
+    //    ExcludeOnDevice = 特定出力デバイス宛を exclude）。
     let desc: Retained<CATapDescription> = match &kind {
         TapKind::IncludeProcesses(ids) => {
             let arr = object_ids_to_nsarray(ids);
@@ -153,6 +162,18 @@ pub(crate) unsafe fn build_tap_chain(
             CATapDescription::initStereoGlobalTapButExcludeProcesses(
                 CATapDescription::alloc(),
                 &arr,
+            )
+        }
+        TapKind::ExcludeProcessesOnDevice { ids, device_uid } => {
+            let arr = object_ids_to_nsarray(ids);
+            let uid = NSString::from_str(device_uid);
+            // stream 0 = デバイスの最初の出力ストリーム。tap のフォーマットはこのストリームに従う。
+            // 出力先を device_uid のデバイスへ絞り、ids を除いたそのデバイス宛の音を mixdown する。
+            CATapDescription::initExcludingProcesses_andDeviceUID_withStream(
+                CATapDescription::alloc(),
+                &arr,
+                &uid,
+                0,
             )
         }
     };

@@ -15,6 +15,18 @@
 //! [`ProcessMode`](flexaudio_core::types::ProcessMode) とは合成しない（system ソースは
 //! `mode` を見ない）。
 //!
+//! # 出力デバイス選択（`device_id`）
+//! [`MacSystemBackend::new`] の `device_id` で対象出力デバイスを選ぶ。
+//! - `None`（既定）→ 既定出力の global tap。
+//! - `Some(name)` → その名前の出力デバイスを対象に
+//!   `initExcludingProcesses:andDeviceUID:withStream:` で tap を作る（名前→UID は
+//!   [`uid_for_device_name`](crate::devices::uid_for_device_name) で解決）。一致デバイスが
+//!   無ければ `start` が [`Error::DeviceNotFound`] を返す。列挙は
+//!   [`list_output_devices`](crate::list_output_devices)。
+//!
+//! `exclude_self == true` のときは `device_id` を無視し、既定出力の自プロセス除外 tap にする
+//! （自分の音の除外を優先）。
+//!
 //! # スレッド / Send
 //! tap/aggregate/ioproc 周りの `!Send` な ObjC オブジェクト（[`TapChain`]）は専用スレッド内に
 //! 閉じ込め、[`MacSystemBackend`] が保持するのは `Send` なものだけ（停止フラグ・[`JoinHandle`]・
@@ -38,13 +50,18 @@ use crate::tap::{build_tap_chain, TapChain, TapKind};
 /// panic せず [`start`](CaptureBackend::start) が [`Error`] を返す。
 ///
 /// `exclude_self` で自ホストプロセスの出力を除外するか切り替える（フィードバック防止）。
+/// `device_id` で対象出力デバイスを選ぶ（`None` = 既定出力）。
 ///
-/// `Send`。保持するのは `exclude_self`・停止フラグ・[`JoinHandle`]・キャッシュ済みフォーマット
-/// だけで、`!Send` な ObjC は専用スレッド内に閉じ込める。
+/// `Send`。保持するのは `exclude_self`・`device_id`・停止フラグ・[`JoinHandle`]・キャッシュ済み
+/// フォーマットだけで、`!Send` な ObjC は専用スレッド内に閉じ込める。
 pub struct MacSystemBackend {
     /// 自ホストプロセス除外フラグ。`true` で自分（[`std::process::id`]）の出力を除外集合に
     /// 加える（`excludeProcesses([self])`）、`false` で除外なしの全システム音。
     exclude_self: bool,
+    /// 対象出力デバイス名（= [`DeviceInfo::id`](flexaudio_core::types::DeviceInfo)）。`None` で
+    /// 既定出力の global tap、`Some(name)` でその出力デバイスを対象にする。`exclude_self == true`
+    /// のときは無視される。
+    device_id: Option<String>,
     /// 起動中フラグ（二重 start ガード / 停止指示 / drop 判定）。`Send`。
     stop_flag: Arc<AtomicBool>,
     /// tap チェーンを所有するスレッドのハンドル（start 後に `Some`）。
@@ -60,13 +77,18 @@ impl MacSystemBackend {
     /// `exclude_self` が `true` のとき、`start` で自ホストプロセス（[`std::process::id`]）を
     /// 除外集合に加える（フィードバック防止）。`false` のときは除外なしの全システム tap。
     ///
+    /// `device_id` が `Some(name)` のとき、その名前の出力デバイスを対象に tap を作る
+    /// （`start` で名前→UID を解決し、無ければ [`Error::DeviceNotFound`]）。`None` で既定出力。
+    /// `exclude_self == true` のときは `device_id` を無視する。
+    ///
     /// ネイティブフォーマットはフォールバック `(48000, 2)` をキャッシュする。実フォーマットは
     /// tap 作成時（`start`）に tap の ASBD から決まるが、`native_format` は構築時に 1 つ返す必要が
     /// あるので、tap 無しで安全に得られるフォールバックを使う。Normalizer は出力 20ms 時間ベース
     /// なので、多少のネイティブ推定差は第 1 段リサンプルで吸収される。
-    pub fn new(exclude_self: bool) -> Self {
+    pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
         Self {
             exclude_self,
+            device_id,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             native: FALLBACK_FORMAT,
@@ -76,7 +98,7 @@ impl MacSystemBackend {
 
 impl Default for MacSystemBackend {
     fn default() -> Self {
-        Self::new(false)
+        Self::new(false, None)
     }
 }
 
@@ -101,11 +123,14 @@ impl CaptureBackend for MacSystemBackend {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         // bool は Copy なのでそのままクロージャへ move できる。
         let exclude_self = self.exclude_self;
+        // device_id（String）はクロージャへ move する。exclude_self のときは使わない。
+        let device_id = self.device_id.clone();
 
         let handle = thread::Builder::new()
             .name("flexaudio-macos-system".into())
             .spawn(move || {
                 let kind = if exclude_self {
+                    // exclude_self は device_id より優先。既定出力で自プロセスを除外する。
                     // PID → AudioObjectID 変換は CoreAudio を叩くので所有スレッド内で行う
                     // （process.rs と同じ）。自ホストプロセスのオブジェクトを除外集合に入れる。
                     match translate_pid_to_object(std::process::id() as i32) {
@@ -121,8 +146,21 @@ impl CaptureBackend for MacSystemBackend {
                             return;
                         }
                     }
+                } else if let Some(name) = device_id {
+                    // 指定出力デバイス。名前→UID を解決して、そのデバイス宛の全音（除外なし）を
+                    // tap する。一致デバイスが無ければ DeviceNotFound。
+                    match crate::devices::uid_for_device_name(&name) {
+                        Some(uid) => TapKind::ExcludeProcessesOnDevice {
+                            ids: Vec::new(),
+                            device_uid: uid,
+                        },
+                        None => {
+                            let _ = ready_tx.send(Err(Error::DeviceNotFound));
+                            return;
+                        }
+                    }
                 } else {
-                    // 除外なしの全システム音。PID 変換不要。
+                    // 既定出力。除外なしの全システム音。PID 変換不要。
                     TapKind::ExcludeProcesses(Vec::new())
                 };
                 run_tap_thread(kind, sink, stop_flag, ready_tx);
@@ -178,6 +216,7 @@ pub(crate) fn run_tap_thread(
     let label = match &kind {
         TapKind::IncludeProcesses(_) => "flexaudio-process-tap",
         TapKind::ExcludeProcesses(_) => "flexaudio-system-tap",
+        TapKind::ExcludeProcessesOnDevice { .. } => "flexaudio-system-device-tap",
     };
     // SAFETY: build_tap_chain は CoreAudio を叩く。sink を block へ move する。
     let chain: TapChain = match unsafe { build_tap_chain(kind, label, sink) } {
@@ -211,7 +250,7 @@ mod tests {
     /// `new` + `native_format` は panic せず妥当な値を返す。
     #[test]
     fn new_and_native_format_do_not_panic() {
-        let backend = MacSystemBackend::new(false);
+        let backend = MacSystemBackend::new(false, None);
         let (rate, channels) = backend.native_format();
         assert!(rate > 0);
         assert!(channels > 0);
@@ -221,7 +260,7 @@ mod tests {
     /// TCC 未承認 / tap 不可環境では `Err` を許容（panic だけ不可）。
     #[test]
     fn start_then_stop_tolerates_failure() {
-        let mut backend = MacSystemBackend::new(false);
+        let mut backend = MacSystemBackend::new(false, None);
         let (rate, channels) = backend.native_format();
         let cap = (rate as usize * channels as usize).max(1);
         let (prod, _cons) = raw_ring(cap);
@@ -240,7 +279,7 @@ mod tests {
     /// しないこと（headless/CI は TCC 無しなので `Err` を許容。自 PID 変換経路を踏ませる）。
     #[test]
     fn new_exclude_self_start_then_stop_tolerates_failure() {
-        let mut backend = MacSystemBackend::new(true);
+        let mut backend = MacSystemBackend::new(true, None);
         let (rate, channels) = backend.native_format();
         assert!(rate > 0);
         assert!(channels > 0);
@@ -254,6 +293,24 @@ mod tests {
                 backend.stop(); // 二重 stop も安全。
             }
             Err(_e) => { /* TCC 未承認 / tap 不可 / 自 PID 変換不可は許容 */ }
+        }
+    }
+
+    /// 存在しない出力デバイス名を指定すると `start` が `DeviceNotFound` を返すこと。
+    /// 名前解決で弾かれるので headless でも決定的に Err になる（14.4 未満は version gate が
+    /// 先に `UnsupportedOsVersion` を返すのでそれも許容）。
+    #[test]
+    fn new_with_unknown_device_id_returns_device_not_found() {
+        let mut backend =
+            MacSystemBackend::new(false, Some("flexaudio-no-such-output-device-xyzzy".into()));
+        let (rate, channels) = backend.native_format();
+        let cap = (rate as usize * channels as usize).max(1);
+        let (prod, _cons) = raw_ring(cap);
+        let sink = RawSink::new(prod, rate, channels);
+
+        match backend.start(sink) {
+            Err(Error::DeviceNotFound) | Err(Error::UnsupportedOsVersion) => {}
+            other => panic!("expected DeviceNotFound or UnsupportedOsVersion, got {other:?}"),
         }
     }
 }

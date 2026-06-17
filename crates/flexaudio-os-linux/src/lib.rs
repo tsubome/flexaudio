@@ -72,13 +72,17 @@ fn pw_init_once() {
     });
 }
 
-/// PipeWire 経由でシステム音声出力（既定 sink の monitor）をキャプチャする
+/// PipeWire 経由でシステム音声出力（sink の monitor）をキャプチャする
 /// [`CaptureBackend`]。
 ///
 /// 専用スレッド上で PipeWire `MainLoop` + 入力 `Stream` を構築し、`process`
 /// コールバックで dequeue した interleaved f32 サンプルを [`RawSink::push`] へ
 /// 非ブロッキングに流す。`stream.capture.sink=true` を指定すると、対象は録音デバイス
 /// ではなく sink（スピーカー）の monitor、つまりシステム音声出力になる。
+///
+/// `device_id` が `None` なら既定 sink の monitor、`Some(node.name)` ならその sink の
+/// monitor を録る（`target.object` で指定）。指定した sink が無ければ
+/// [`start`](CaptureBackend::start) が [`Error::DeviceNotFound`] を返す。
 ///
 /// PipeWire/sink が無い環境（ヘッドレスサーバ等）では panic せず、
 /// [`start`](CaptureBackend::start) が [`Error::Backend`] を返す。
@@ -87,7 +91,7 @@ fn pw_init_once() {
 /// use flexaudio_os_linux::PwSystemBackend;
 /// use flexaudio_core::backend::CaptureBackend;
 ///
-/// let backend = PwSystemBackend::new(false);
+/// let backend = PwSystemBackend::new(false, None);
 /// assert_eq!(backend.native_format(), (48_000, 2));
 /// // let mut backend = backend;
 /// // backend.start(sink)?;   // PipeWire 不在/動作中 sink 無しなら Err(Backend)
@@ -99,8 +103,13 @@ pub struct PwSystemBackend {
     /// [`start`](CaptureBackend::start) はプロセス Exclude 機構を流用し、除外 PID =
     /// `std::process::id()` として自分以外の全アプリ出力（`Stream/Output/Audio`）を
     /// fan-in リンクして録る。sink monitor は混合済みで自分だけ引けないので、これが
-    /// 自分を除く唯一の手段。`false` なら既定 sink の monitor をそのまま録る。
+    /// 自分を除く唯一の手段。`false` なら sink の monitor をそのまま録る。
     exclude_self: bool,
+    /// 録る sink を `node.name` で選ぶ。`None` なら既定 sink の monitor。`Some(id)` なら
+    /// その sink の monitor を target.object で指定して録る（[`list_devices`] が返す
+    /// `DeviceInfo.id` がこの `node.name`）。`exclude_self == true` の fan-in 経路では
+    /// 効かない（特定 sink を狙う経路ではないので無視する）。
+    device_id: Option<String>,
     /// 起動中フラグ（二重 start ガード／drop 判定用）。`Send`。
     running: Arc<AtomicBool>,
     /// ループスレッドへ停止を伝える送信端。`start` で `Some`。送ると、loop に attach
@@ -117,13 +126,18 @@ struct Terminate;
 impl PwSystemBackend {
     /// バックエンドを構築する（この時点では PipeWire へ接続しない）。
     ///
-    /// `exclude_self` が `false`（既定）なら既定 sink の monitor をそのまま録る。`true`
+    /// `exclude_self` が `false`（既定）なら sink の monitor をそのまま録る。`true`
     /// なら自分以外の全アプリ出力を fan-in して録る（プロセス Exclude 機構の流用。
-    /// 除外 PID = `std::process::id()`）。実際の接続・ストリーム作成は
-    /// [`start`](CaptureBackend::start) 内で専用スレッド上で行う。
-    pub fn new(exclude_self: bool) -> Self {
+    /// 除外 PID = `std::process::id()`）。
+    ///
+    /// `device_id` で録る sink を `node.name` で選ぶ。`None` なら既定 sink。
+    /// `exclude_self == true` のときは無視する（fan-in は特定 sink を狙わない）。
+    /// 実際の接続・ストリーム作成は [`start`](CaptureBackend::start) 内で専用
+    /// スレッド上で行う。
+    pub fn new(exclude_self: bool, device_id: Option<String>) -> Self {
         Self {
             exclude_self,
+            device_id,
             running: Arc::new(AtomicBool::new(false)),
             stop_tx: None,
             handle: None,
@@ -138,7 +152,7 @@ impl PwSystemBackend {
 
 impl Default for PwSystemBackend {
     fn default() -> Self {
-        Self::new(false)
+        Self::new(false, None)
     }
 }
 
@@ -151,6 +165,22 @@ impl CaptureBackend for PwSystemBackend {
         // 二重 start に安全（既に動作中なら何もしない）。
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
+        }
+
+        // device_id 指定（かつ通常の monitor 経路）なら、その sink が居るか先に確かめる。
+        // 居なければ DeviceNotFound。enumerate_pw が Err（デーモン不在等）のときは握らず
+        // 通常の setup へ進ませ、接続失敗を Backend として返させる（不在と「sink 無し」を
+        // 取り違えないため）。exclude_self の fan-in 経路は特定 sink を狙わないので見ない。
+        let device_id = self.device_id.clone();
+        if !self.exclude_self {
+            if let Some(id) = device_id.as_deref() {
+                if let Ok(devs) = enumerate_pw() {
+                    let found = devs.iter().any(|d| d.is_loopback && d.id == id);
+                    if !found {
+                        return Err(Error::DeviceNotFound);
+                    }
+                }
+            }
         }
 
         // ループスレッドへの停止チャネル（受信端は loop に attach する）。
@@ -167,6 +197,7 @@ impl CaptureBackend for PwSystemBackend {
         // リンクし、「システム音 − 自プロセスの再生音」を録る。sink monitor は混合済みで、
         // そこから自プロセス分だけ引く OS プリミティブが PipeWire に無いため、自分を除く
         // にはこのアプリ出力 fan-in しかない。exclude_self == false は sink monitor のまま。
+        // exclude_self のときは fan-in なので device_id は使わない。
         let exclude_self = self.exclude_self;
         let handle = thread::Builder::new()
             .name(
@@ -188,7 +219,7 @@ impl CaptureBackend for PwSystemBackend {
                         &ready_tx,
                     );
                 } else {
-                    run_pw_loop(sink, stop_rx, &ready_tx);
+                    run_pw_loop(device_id, sink, stop_rx, &ready_tx);
                 }
             })
             .map_err(|e| Error::Backend(format!("spawn pipewire thread: {e}")))?;
@@ -210,10 +241,9 @@ impl CaptureBackend for PwSystemBackend {
                 // format ネゴ失敗のどれについても、権限拒否（portal/Flatpak/RTKit 不許可）と
                 // 不在（sink/source/session 無し）を型で区別する API を持たない（返るのは
                 // errno/汎用文字列で、PermissionDenied と NotFound を分ける HRESULT/OSStatus
-                // 相当が無い）。なので macOS/Windows のような型分類はできない。backend は
-                // device_id を取らない（system=既定 sink monitor / process=PID 解決）ので、
-                // 「指定デバイス不在 → DeviceNotFound」もこの層には無い（device_id 検証は
-                // facade 層の責務）。
+                // 相当が無い）。なので macOS/Windows のような型分類はできない。指定 sink の
+                // 不在は start の頭で enumerate_pw を見て DeviceNotFound を先に返すので、
+                // ここへは来ない。
                 running.store(false, Ordering::SeqCst);
                 let _ = handle.join();
                 Err(Error::Backend(msg))
@@ -1322,12 +1352,13 @@ fn build_format_pod_bytes() -> std::result::Result<Vec<u8>, String> {
 /// 破棄し、スレッド境界を跨がせない。セットアップ完了/失敗を `ready_tx` で呼び出し元へ返し、
 /// 成功時は `main_loop.run()` で停止指示まで回る。
 fn run_pw_loop(
+    device_id: Option<String>,
     sink: RawSink,
     stop_rx: pw::channel::Receiver<Terminate>,
     ready_tx: &mpsc::Sender<std::result::Result<(), String>>,
 ) {
     // セットアップは別関数。戻り値は run 中ずっと生かす所有物（drop すると停止する）。
-    let (main_loop, _stream, _listener) = match setup_pw(sink) {
+    let (main_loop, _stream, _listener) = match setup_pw(device_id, sink) {
         Ok(t) => t,
         Err(msg) => {
             // セットアップ失敗を通知して終了（panic しない）。
@@ -1359,6 +1390,9 @@ fn run_pw_loop(
 
 /// PipeWire のセットアップ一式。失敗は `Err(String)`（panic しない）。
 ///
+/// `device_id` が `Some(node.name)` ならその sink を `target.object` で狙う（`None` は
+/// 既定 sink）。sink の存在確認は呼び出し前（`start`）で済ませてある。
+///
 /// 返すのは run 中ずっと生かすハンドル群:
 /// - `MainLoopRc`: `run()`/`quit()` の主体
 /// - `StreamRc`: キャプチャストリーム本体
@@ -1369,6 +1403,7 @@ fn run_pw_loop(
 /// ならずに済む。
 #[allow(clippy::type_complexity)]
 fn setup_pw(
+    device_id: Option<String>,
     sink: RawSink,
 ) -> std::result::Result<
     (
@@ -1403,6 +1438,15 @@ fn setup_pw(
     };
     // monitor（sink の出力＝システム音声）を録る指定。
     props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
+    // device_id を指定したら、その sink を target.object（node.name）で狙う。autoconnect は
+    // 残すが、target.object があれば WirePlumber は既定でなくこの sink の monitor へ繋ぐ。
+    // stream.connect の target 引数（下の None）はかつて WirePlumber に無視されたので使わない
+    // ＝こちらの props 指定を使う。sink 不在は start で先に弾いているのでここでは確認しない。
+    // pw::keys::TARGET_OBJECT は crate の v0_3_44 feature 下なので、キー文字列を直接書く
+    // （他の feature gate なキーも同様に文字列指定している）。
+    if let Some(id) = device_id {
+        props.insert("target.object", id);
+    }
 
     let stream = pw::stream::StreamRc::new(core, "flexaudio-system-capture", props)
         .map_err(|e| format!("create pipewire capture stream failed: {e}"))?;
@@ -1423,8 +1467,9 @@ fn setup_pw(
         .ok_or_else(|| "build audio format pod from bytes failed".to_string())?;
     let mut params = [pod];
 
-    // 入力方向で connect。AUTOCONNECT で既定ターゲット（既定 sink の monitor）へ。
-    // MAP_BUFFERS でバッファを直接読めるようにし、RT_PROCESS で process を RT 実行。
+    // 入力方向で connect。AUTOCONNECT で sink の monitor へ繋ぐ（target.object 指定が
+    // あればその sink、無ければ既定 sink）。MAP_BUFFERS でバッファを直接読めるようにし、
+    // RT_PROCESS で process を RT 実行。
     stream
         .connect(
             spa::utils::Direction::Input,
@@ -2273,7 +2318,7 @@ mod tests {
     /// 構築直後にネイティブフォーマットが固定契約どおり (48000, 2) であること。
     #[test]
     fn native_format_is_48k_stereo() {
-        let be = PwSystemBackend::new(false);
+        let be = PwSystemBackend::new(false, None);
         assert_eq!(be.native_format(), (NATIVE_RATE, NATIVE_CHANNELS));
         assert_eq!(be.native_format(), (48_000, 2));
         assert!(!be.exclude_self());
@@ -2282,7 +2327,7 @@ mod tests {
     /// 未 start での stop / 二重 stop が安全（panic しない）。
     #[test]
     fn stop_without_start_is_safe() {
-        let mut be = PwSystemBackend::new(false);
+        let mut be = PwSystemBackend::new(false, None);
         be.stop();
         be.stop();
     }
@@ -2295,7 +2340,7 @@ mod tests {
     fn system_exclude_self_is_graceful() {
         let (prod, _cons) = raw_ring(1 << 16);
         let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
-        let mut be = PwSystemBackend::new(true);
+        let mut be = PwSystemBackend::new(true, None);
         assert!(be.exclude_self());
         match be.start(sink) {
             Ok(()) => {
@@ -2368,7 +2413,7 @@ mod tests {
     fn start_is_graceful_without_pipewire() {
         let (prod, _cons) = raw_ring(1 << 16);
         let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
-        let mut be = PwSystemBackend::new(false);
+        let mut be = PwSystemBackend::new(false, None);
         match be.start(sink) {
             Ok(()) => {
                 // 動作中 PipeWire/sink がある環境。停止まで一巡できること。
@@ -2376,6 +2421,26 @@ mod tests {
             }
             Err(Error::Backend(_)) => {
                 // PipeWire 不在/sink 無し: 想定内。panic していないことが要点。
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    /// 居ない sink を `device_id` で指したときの `start`。PipeWire が動く環境では
+    /// その sink が列挙に出ないので [`Error::DeviceNotFound`]。PipeWire 不在環境では
+    /// enumerate_pw が Err で握られ、通常経路の接続失敗で [`Error::Backend`] になる。
+    /// どちらでも panic しないこと・Ok にはならないことを確認する。
+    #[test]
+    fn start_with_unknown_device_id_is_not_found_or_backend() {
+        let (prod, _cons) = raw_ring(1 << 16);
+        let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
+        let mut be = PwSystemBackend::new(false, Some("flexaudio-no-such-sink-zzz".to_string()));
+        match be.start(sink) {
+            Err(Error::DeviceNotFound) => {}
+            Err(Error::Backend(_)) => {}
+            Ok(()) => {
+                be.stop();
+                panic!("start should not succeed for an unknown device_id");
             }
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
@@ -2396,7 +2461,7 @@ mod tests {
         use std::time::Duration;
         let (prod, mut cons) = raw_ring(1 << 18);
         let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
-        let mut be = PwSystemBackend::new(false);
+        let mut be = PwSystemBackend::new(false, None);
         be.start(sink)
             .expect("start should succeed on a PipeWire desktop");
         // 録音が回るのを少し待つ。

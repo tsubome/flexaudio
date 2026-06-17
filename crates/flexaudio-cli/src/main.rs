@@ -15,9 +15,9 @@
 //! flexaudio-cli --source system --output-rate 16000 --output-channels 1 --out 16k.wav --seconds 3
 //! ```
 //!
-//! `--source mic` では `--device-id <ID>` で入力デバイスを選べる（ID は
-//! `--list-devices` の ID 列＝デバイス名。省略で既定入力デバイス）。device_id は mic
-//! だけで効き、system（既定 render 固定）・process（target_pid 固定）では無視される。
+//! `--device-id <ID>` でデバイスを選べる（ID は `--list-devices` の ID 列）。mic では
+//! 入力デバイス、system では出力エンドポイントを選ぶ。省略で既定（mic=既定入力 /
+//! system=既定出力）。process は `--process-id` で対象を決めるので device_id は無視される。
 //!
 //! process と system の概念は別フラグに分けてある（混ぜない）:
 //! - `--mode include|exclude`（process 専用・既定 include）: include=対象 PID だけ録る /
@@ -135,10 +135,10 @@ struct Cli {
     #[arg(long)]
     process_id: Option<u32>,
 
-    /// `--source mic` で選ぶ入力デバイスの ID（デバイス名）。`--list-devices` の ID 列
-    /// からコピーする。省略すると既定入力デバイス。mic 専用で、system は既定 render、
-    /// process は `--process-id` 固定なのでこの値は無視される（system の render 選択は
-    /// 将来対応）。一致するデバイスが無ければクラッシュせず DeviceNotFound で終了する。
+    /// 選ぶデバイスの ID（`--list-devices` の ID 列からコピーする）。mic では入力デバイス、
+    /// system では出力エンドポイントを選ぶ。省略すると既定（mic=既定入力 / system=既定出力）。
+    /// process は `--process-id` で対象を決めるのでこの値は無視される。一致するデバイスが
+    /// 無ければクラッシュせず DeviceNotFound で終了する。
     #[arg(long)]
     device_id: Option<String>,
 
@@ -280,8 +280,8 @@ fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
         mode: cli.mode.into(),
         // exclude_self は system セグメントでのみ効く（mic/process では無視）。
         exclude_self: cli.exclude_self,
-        // device_id は mic でのみ効く（system/process では facade が無視）。全セグメント
-        // に一様に載せておけば mic セグメントだけが拾う。
+        // device_id は mic（入力）と system（出力エンドポイント）で効く（process では
+        // facade が無視）。全セグメントに一様に載せておけば該当セグメントが拾う。
         device_id: cli.device_id.clone(),
         ..Default::default()
     }
@@ -492,7 +492,8 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         mode: cli.mode.into(),
         // exclude_self は system 専用の自ホスト除外。
         exclude_self: cli.exclude_self,
-        // device_id は mic 選択用（system/process では facade が無視する）。
+        // device_id は mic（入力）と system（出力エンドポイント）の選択用（process では
+        // facade が無視する）。
         device_id: cli.device_id.clone(),
         ..Default::default()
     };
@@ -501,12 +502,12 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     // --- ネイティブフォーマット表示 ---
     let (native_rate, native_ch) = stream.native_format();
     log!("ソース            : {source_label}");
-    // device_id 指定時は選択デバイスを明示（mic のみ有効。system/process では無視）。
+    // device_id 指定時は選択デバイスを明示（mic と system で有効。process では無視）。
     if let Some(id) = &cli.device_id {
-        if kind == SourceKind::Mic {
-            log!("デバイス ID        : {id}");
+        if kind == SourceKind::ProcessLoopback {
+            log!("デバイス ID        : {id}（注: process では無視されます）");
         } else {
-            log!("デバイス ID        : {id}（注: mic 以外では無視されます）");
+            log!("デバイス ID        : {id}");
         }
     }
     log!("ネイティブフォーマット: {native_rate} Hz / {native_ch} ch");
@@ -592,8 +593,8 @@ fn list_devices() -> std::result::Result<(), String> {
     }
     println!();
     println!(
-        "（DEFAULT の * は OS 既定デバイス。ID は `--source mic --device-id <ID>` で\
-         入力デバイスを選ぶのに使える安定キー。system/process では device_id は無視。）"
+        "（DEFAULT の * は OS 既定デバイス。ID は `--device-id <ID>` でデバイスを選ぶのに\
+         使える安定キー。mic は入力デバイス、system は出力エンドポイント。process では無視。）"
     );
     Ok(())
 }
