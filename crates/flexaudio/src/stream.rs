@@ -18,6 +18,7 @@
 //!   最初のチャンクに [`ChunkFlags::RECOVERED`] | [`ChunkFlags::DISCONTINUITY`] を立てる。
 
 use std::collections::VecDeque;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -124,10 +125,38 @@ struct SharedState {
 
 impl SharedState {
     fn push_event(&self, ev: Event) {
-        if let Ok(mut q) = self.events.lock() {
-            q.push_back(ev);
-        }
+        // poison でもイベントは torn しない（VecDeque を回収して継続）。
+        let mut q = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        q.push_back(ev);
     }
+}
+
+/// backend の `start(sink)` を [`catch_unwind`](std::panic::catch_unwind) で包んで
+/// 呼ぶ。backend が panic しても **mutex を poison させる前に** [`Error::Backend`] へ
+/// 変換して返す（呼び出し側はこれを `Event::Error`/`Err` として表に出せる）。
+///
+/// `&mut Box<dyn CaptureBackend>` は `UnwindSafe` ではないため [`AssertUnwindSafe`]
+/// で包む。これが安全な理由: panic を捕捉した場合この関数は `Err` を返すだけで、
+/// 論理的に壊れたかもしれない backend を以降使い続けない（呼び出し側は失敗として
+/// 扱い、stop/再オープン/drop へ進む）。ロックガードは正常に保持・drop され、
+/// poison しない。
+fn start_backend_catching(be: &mut Box<dyn CaptureBackend>, sink: RawSink) -> Result<()> {
+    match std::panic::catch_unwind(AssertUnwindSafe(|| be.start(sink))) {
+        Ok(res) => res,
+        Err(_) => Err(Error::Backend("backend panicked during start()".into())),
+    }
+}
+
+/// backend の `stop()` を [`catch_unwind`](std::panic::catch_unwind) で包んで呼ぶ。
+/// stop は `()` を返すため、panic は握りつぶして継続する（停止経路で再度 panic を
+/// 伝播させても得は無く、mutex poison と連鎖 panic を防ぐのが目的）。`true` を返すと
+/// 正常停止、`false` は panic を捕捉したこと（観測・診断用）を表す。
+///
+/// `AssertUnwindSafe` の安全性は [`start_backend_catching`] と同じ（捕捉後は backend を
+/// 使い続けず、ガードは正常 drop される）。
+#[must_use]
+fn stop_backend_catching(be: &mut Box<dyn CaptureBackend>) -> bool {
+    std::panic::catch_unwind(AssertUnwindSafe(|| be.stop())).is_ok()
 }
 
 impl Stream {
@@ -191,22 +220,24 @@ impl Stream {
         Self::open_backend_once(&self.shared)?;
 
         // 取り込み/加工スレッドへ移すため chunk_producer を取り出す。
+        // poison でも回収して継続する（中の Option を take するだけ）。
         let chunk_producer = self
             .shared
             .chunk_producer
             .lock()
-            .expect("chunk_producer mutex")
+            .unwrap_or_else(|e| e.into_inner())
             .take()
             .ok_or_else(|| Error::InvalidState("chunk producer already taken".into()))?;
 
         // 取り込み/加工スレッド。初期 native_format は shared から読む
         // （以降は世代変化のたびに run_intake が shared を読み直して追従する）。
         let worker_shared = self.shared.clone();
+        // poison でも回収して継続（中の (u32, u16) を読むだけ）。
         let initial_native = *self
             .shared
             .native_format
             .lock()
-            .expect("native_format mutex");
+            .unwrap_or_else(|e| e.into_inner());
         let output = self.config.output;
         let worker = thread::Builder::new()
             .name("flexaudio-intake".into())
@@ -239,8 +270,15 @@ impl Stream {
         self.shared.stopping.store(true, Ordering::SeqCst);
 
         // backend を止めて生成スレッドを終わらせる（RT push を止める）。
-        if let Ok(mut be) = self.shared.backend.lock() {
-            be.stop();
+        // poison でも回収して stop を試みる。stop が panic しても catch_unwind で
+        // 握りつぶし、mutex を再 poison させず join へ進む（無言死させない）。
+        {
+            let mut be = self
+                .shared
+                .backend
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let _ = stop_backend_catching(&mut be);
         }
 
         // スレッド join。
@@ -285,11 +323,12 @@ impl Stream {
     /// [`switch_source`](Self::switch_source) でソースを切り替えると新 backend の
     /// 値に更新される。表示・診断用（出力フォーマットは `config().output`）。
     pub fn native_format(&self) -> (u32, u16) {
+        // poison でも回収して値を読む（連鎖 panic させない）。
         *self
             .shared
             .native_format
             .lock()
-            .expect("native_format mutex")
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     // --- 内部 ---
@@ -313,12 +352,16 @@ impl Stream {
     /// 本関数を再利用する）。
     fn open_backend_once(shared: &Arc<SharedState>) -> Result<()> {
         // 現 backend のネイティブフォーマットを取得して shared へ反映する。
+        // poison でも回収して継続（backend ロックは start を跨ぐため poison しうる）。
         let (rate, channels) = {
-            let be = shared.backend.lock().expect("backend mutex");
+            let be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
             be.native_format()
         };
         {
-            let mut nf = shared.native_format.lock().expect("native_format mutex");
+            let mut nf = shared
+                .native_format
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *nf = (rate, channels);
         }
 
@@ -327,13 +370,20 @@ impl Stream {
         let sink = RawSink::new(producer, rate, channels);
 
         {
-            let mut be = shared.backend.lock().expect("backend mutex");
-            be.start(sink)?;
+            // poison でも回収。backend が start() で panic しても catch_unwind が
+            // mutex poison 前に Error::Backend へ変換して返すので、ここで `?` により
+            // 呼び出し側（start()=呼び元へ Err / watchdog=Event::Error）へ伝わる。
+            let mut be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
+            start_backend_catching(&mut be, sink)?;
         }
 
         // 新しい consumer を共有へ載せ、世代を進める（旧 consumer は drop）。
         {
-            let mut rc = shared.raw_consumer.lock().expect("raw_consumer mutex");
+            // poison でも回収して載せ替える（中の Option を差し替えるだけ）。
+            let mut rc = shared
+                .raw_consumer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *rc = Some(consumer);
         }
         shared.raw_generation.fetch_add(1, Ordering::SeqCst);
@@ -383,11 +433,18 @@ impl Stream {
         self.shared.switching.store(true, Ordering::SeqCst);
 
         // backend ロック下で旧 stop → 新 start を一気に行う。
+        // poison でも回収して継続する（backend ロックは stop/start を跨ぐため poison
+        // しうる。回収できれば差し替え処理はそのまま正しく行える）。
         {
-            let mut be = self.shared.backend.lock().expect("backend mutex");
+            let mut be = self
+                .shared
+                .backend
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
 
-            // 旧 backend を止める（RT push を止める）。
-            be.stop();
+            // 旧 backend を止める（RT push を止める）。panic しても catch_unwind で
+            // 握りつぶし、mutex poison・連鎖 panic を避けて切替を続行する。
+            let _ = stop_backend_catching(&mut be);
 
             // 新 backend のネイティブフォーマット。
             let (rate, channels) = new_backend.native_format();
@@ -396,9 +453,10 @@ impl Stream {
             let (producer, consumer) = raw_ring(RAW_RING_SAMPLES);
             let sink = RawSink::new(producer, rate, channels);
 
-            // 新 backend を start。失敗時は旧ソースへ復帰する。
+            // 新 backend を start。panic は catch_unwind が Error::Backend へ変換する
+            // ので、下の Err 分岐（旧ソース復帰 → Err 返却）に乗る。失敗時は旧ソースへ復帰。
             let mut new_backend = new_backend;
-            match new_backend.start(sink) {
+            match start_backend_catching(&mut new_backend, sink) {
                 Ok(()) => {
                     // --- レース防止の順序が要 ---
                     // 取り込みスレッドは「世代をロック外で load → raw_consumer を
@@ -412,11 +470,12 @@ impl Stream {
                     //
                     // shared.native_format を新ソースの値へ更新。
                     {
+                        // poison でも回収（中の (u32, u16) を更新するだけ）。
                         let mut nf = self
                             .shared
                             .native_format
                             .lock()
-                            .expect("native_format mutex");
+                            .unwrap_or_else(|e| e.into_inner());
                         *nf = (rate, channels);
                     }
                     // 意図的切替なので RECOVERED は付けず DISCONTINUITY のみ。
@@ -435,7 +494,12 @@ impl Stream {
                     *be = new_backend;
                     // 新 consumer を共有へ載せ替え（旧 consumer は drop）。最後に行う。
                     {
-                        let mut rc = self.shared.raw_consumer.lock().expect("raw_consumer mutex");
+                        // poison でも回収（Option を差し替えるだけ）。
+                        let mut rc = self
+                            .shared
+                            .raw_consumer
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         *rc = Some(consumer);
                     }
                 }
@@ -562,7 +626,11 @@ fn run_intake(
         let gen = shared.raw_generation.load(Ordering::SeqCst);
         if gen != current_generation {
             current_generation = gen;
-            let nf = *shared.native_format.lock().expect("native_format mutex");
+            // poison でも回収して継続（取り込みスレッドを無言死させない）。
+            let nf = *shared
+                .native_format
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             rate = nf.0;
             channels = nf.1;
             // 新ソース向け Normalizer 再構築。失敗（rubato 構築失敗等）は無言死せず
@@ -585,7 +653,12 @@ fn run_intake(
         // まま return しないよう、ブロック内では結果だけ控えてブロック後に処理する。
         let mut push_err: Option<Error> = None;
         {
-            let mut rc_guard = shared.raw_consumer.lock().expect("raw_consumer mutex");
+            // poison でも回収して継続する。取り込みループは無言死させず、pop を続ける
+            // （push 経路にヒープ確保・ブロッキングは増やさない＝RT 安全は不変）。
+            let mut rc_guard = shared
+                .raw_consumer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(rc) = rc_guard.as_mut() {
                 let got = rc.pop_slice(&mut scratch);
                 if got > 0 {
@@ -707,10 +780,11 @@ fn run_watchdog(shared: Arc<SharedState>) {
         }
 
         // 失速中: backend を止めて再オープンを試みる。
+        // poison でも回収して stop を試み、stop が panic しても catch_unwind で
+        // 握りつぶす（ウォッチドッグを無言死させず再オープンへ進む）。
         {
-            if let Ok(mut be) = shared.backend.lock() {
-                be.stop();
-            }
+            let mut be = shared.backend.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = stop_backend_catching(&mut be);
         }
 
         if shared.stopping.load(Ordering::SeqCst) {
@@ -794,7 +868,10 @@ fn sleep_interruptible(shared: &Arc<SharedState>, dur: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock::{MockBackend, StallableMockBackend};
+    use crate::mock::{
+        MockBackend, PanicMode, PanickingMockBackend, StallThenPanicOnReopenBackend,
+        StallableMockBackend,
+    };
     use std::time::Instant;
 
     /// 期限まで poll_chunk しながらチャンクを集めるヘルパ。
@@ -1066,5 +1143,112 @@ mod tests {
                 c.flags
             );
         }
+    }
+
+    // --- 堅牢性: backend の panic で無言死しない（poison 連鎖 panic 防止） ---
+    //
+    // これらのテストは「テストプロセス自体が panic で落ちない」こと自体が
+    // 「無言死しない／連鎖 panic しない」ことの証明になる（落ちれば test result が
+    // FAILED になる）。加えて、panic が Err / Event::Error として観測できることを
+    // アサートし、握りつぶし（panic を黙って消すだけ）でないことを確かめる。
+
+    /// backend の `start()` が panic しても **プロセスは落ちず**、`start()` が
+    /// `Err(Error::Backend)` を返す（catch_unwind が mutex poison 前に変換するため、
+    /// 取り込み/ウォッチドッグスレッドは起動すらされず連鎖 panic も起きない）。
+    #[test]
+    fn backend_panic_in_start_returns_err_not_silent_death() {
+        let backend = Box::new(PanickingMockBackend::new(
+            48_000,
+            2,
+            440.0,
+            PanicMode::Start,
+        ));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+
+        // start() は panic を伝播させず Err(Error::Backend) を返さねばならない。
+        let result = stream.start();
+        match result {
+            Ok(()) => panic!("backend が start で panic したのに start() が Ok を返した"),
+            Err(Error::Backend(msg)) => {
+                assert!(
+                    msg.contains("panicked"),
+                    "Error::Backend は panic 由来と分かるメッセージのはず: {msg}"
+                );
+            }
+            Err(other) => panic!("Error::Backend を期待したが別のエラー: {other:?}"),
+        }
+
+        // start 失敗後は未開始状態。stop しても（スレッド未起動でも）panic しない。
+        stream.stop();
+    }
+
+    /// backend の `stop()` が panic しても **プロセスは落ちず**、`stop()` は正常に
+    /// 戻る（catch_unwind が握りつぶし、backend mutex を poison させないので、
+    /// それまで動いていた取り込み/ウォッチドッグスレッドが連鎖 panic しない）。
+    #[test]
+    fn backend_panic_in_stop_does_not_kill_process() {
+        let backend = Box::new(PanickingMockBackend::new(48_000, 2, 440.0, PanicMode::Stop));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        // 少し回して、取り込み/ウォッチドッグスレッドが実際に動いている状態を作る
+        // （チャンクが流れることを確認＝happy path は不変）。
+        let chunks = collect_for(&mut stream, Duration::from_millis(300));
+        assert!(
+            !chunks.is_empty(),
+            "stop 前に通常どおりチャンクが流れるはず（happy path 不変）"
+        );
+
+        // stop() 内で backend.stop() が panic するが、catch_unwind で握りつぶされ
+        // mutex を poison させない。このテストが panic で落ちないこと自体が証明。
+        stream.stop();
+
+        // stop 後も poll は連鎖 panic せず使える（poison していないことの追加確認）。
+        let _ = stream.poll_chunk();
+        let _ = stream.poll_event();
+    }
+
+    /// ウォッチドッグの **再オープン時に backend が panic** しても、ウォッチドッグ
+    /// スレッドは連鎖無言死せず、`Event::Error`（"reopen failed: ..."）として表に
+    /// 出る。プロセスは落ちない（catch_unwind が mutex poison を防ぎ、reopen の
+    /// 失敗を `open_backend_once` の `Err` 経由で Event::Error 化する）。
+    #[test]
+    fn backend_panic_on_watchdog_reopen_surfaces_event_error() {
+        // 300ms 給餌 → 失速 → ウォッチドッグ再オープンで panic。
+        let backend = Box::new(StallThenPanicOnReopenBackend::new(
+            48_000,
+            2,
+            440.0,
+            Duration::from_millis(300),
+        ));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        // 失速検知(>=2s) → 再オープン試行(panic→Event::Error) まで十分待つ（最大 8 秒）。
+        let mut saw_stalled = false;
+        let mut saw_reopen_error = false;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline && !saw_reopen_error {
+            // poll_chunk も回す（リング詰まりで他経路が止まらないように）。
+            while stream.poll_chunk().is_some() {}
+            while let Some(ev) = stream.poll_event() {
+                match ev {
+                    Event::StreamStalled => saw_stalled = true,
+                    Event::Error(msg) if msg.contains("reopen failed") => {
+                        saw_reopen_error = true;
+                    }
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        stream.stop();
+
+        assert!(saw_stalled, "失速は検知されるはず（Event::StreamStalled）");
+        assert!(
+            saw_reopen_error,
+            "再オープンでの backend panic は Event::Error(\"reopen failed: ...\") として\
+             表に出るはず（無言死しない）"
+        );
     }
 }
