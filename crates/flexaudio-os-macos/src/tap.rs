@@ -54,6 +54,10 @@ pub(crate) enum TapKind {
 /// フィールド宣言順は Rust の drop 順（宣言順）と一致させ、`Drop` 実装内で
 /// 明示的に Stop→IOProc→aggregate→tap の順で OS リソースを片付けてから
 /// `RcBlock` / `Retained<CATapDescription>` を drop させる。
+// `_block` の `RcBlock<dyn Fn(...)>` は CoreAudio の IOProc block シグネチャ（5 引数）
+// をそのまま写すため必然的に複雑。型エイリアス化しても可読性は上がらないので、Linux
+// backend と同じく lint を局所許可する（clippy::type_complexity）。
+#[allow(clippy::type_complexity)]
 pub(crate) struct TapChain {
     /// IOProc が回っている aggregate device ID。
     aggregate_id: AudioObjectID,

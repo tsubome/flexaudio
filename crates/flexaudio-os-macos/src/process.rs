@@ -84,6 +84,12 @@ impl CaptureBackend for MacProcessBackend {
         if self.handle.is_some() {
             return Ok(());
         }
+
+        // バージョンゲート（監査 P1-5）: Process Tap は macOS 14.4+ 必須。tap 生成へ進む前に
+        // OS バージョンを確認し、満たさなければ raw OSStatus→Backend に化けさせず型付きの
+        // Error::UnsupportedOsVersion を返す（Windows の process loopback 非対応 OS と対称）。
+        crate::version::ensure_process_tap_supported()?;
+
         self.stop_flag.store(false, Ordering::SeqCst);
 
         let stop_flag = self.stop_flag.clone();

@@ -28,8 +28,48 @@ use windows::Win32::Media::Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FO
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
-/// HRESULT を [`Error::Backend`] へ写す。文脈文字列付き。
+/// アクセス拒否系・デバイス不在系の HRESULT を型付き [`Error`] バリアントへ分類する純関数。
+///
+/// OS 横断のエラー型統一（監査 P1-2 / P1-4）のため、WASAPI/COM の代表的な HRESULT を
+/// 「同じ状況 → 同じ Error 型」へ写す:
+/// - **アクセス拒否** → [`Error::PermissionDenied`]: `E_ACCESSDENIED`（マイク/音声
+///   キャプチャのプライバシー拒否で来る代表コード）・`AUDCLNT_E_DEVICE_IN_USE`
+///   （排他使用中で開けない）・`AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`（排他不可）。
+/// - **デバイス不在/失効** → [`Error::DeviceNotFound`]: `AUDCLNT_E_DEVICE_INVALIDATED`
+///   （対象エンドポイント/デバイスが消えた・失効）・`E_NOTFOUND`（要素/エンドポイント不在）。
+///
+/// それ以外（デーモン/プロトコル/未分類の本質的バックエンド失敗）は分類できないので
+/// `None` を返し、[`map_hr`] が文脈付き [`Error::Backend`] にフォールバックする。HRESULT は
+/// `windows` crate の版差で定数 import が揺れるため、ここでは**生の i32 値**で比較する
+/// （値は Windows SDK 由来で安定。下のコメントに 4cc/16 進を併記）。
+pub(crate) fn classify_hr(code: i32) -> Option<Error> {
+    // --- アクセス拒否系 → PermissionDenied ---
+    const E_ACCESSDENIED: i32 = 0x80070005u32 as i32;
+    const AUDCLNT_E_DEVICE_IN_USE: i32 = 0x8889000Au32 as i32;
+    const AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED: i32 = 0x8889000Eu32 as i32;
+    // --- デバイス不在/失効系 → DeviceNotFound ---
+    const AUDCLNT_E_DEVICE_INVALIDATED: i32 = 0x88890004u32 as i32;
+    // E_NOTFOUND（ERROR_NOT_FOUND を HRESULT 化した 0x80070490）。指定エンドポイント/要素不在。
+    const E_NOTFOUND: i32 = 0x80070490u32 as i32;
+
+    match code {
+        E_ACCESSDENIED | AUDCLNT_E_DEVICE_IN_USE | AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => {
+            Some(Error::PermissionDenied)
+        }
+        AUDCLNT_E_DEVICE_INVALIDATED | E_NOTFOUND => Some(Error::DeviceNotFound),
+        _ => None,
+    }
+}
+
+/// HRESULT を [`Error`] へ写す。文脈文字列付き。
+///
+/// まずアクセス拒否系/デバイス不在系を [`classify_hr`] で型付きバリアント
+/// （[`Error::PermissionDenied`] / [`Error::DeviceNotFound`]）へ寄せ、分類できないものは
+/// 文脈付き [`Error::Backend`] にフォールバックする（監査 P1-2 / P1-4）。
 pub(crate) fn map_hr(ctx: &str, e: windows::core::Error) -> Error {
+    if let Some(mapped) = classify_hr(e.code().0) {
+        return mapped;
+    }
     Error::Backend(format!("{ctx}: {e}"))
 }
 
@@ -271,4 +311,55 @@ pub(crate) unsafe fn init_loopback_capture(
 pub(crate) fn wait_event_signaled(handle: HANDLE, timeout_ms: u32) -> bool {
     let r = unsafe { WaitForSingleObject(handle, timeout_ms) };
     r == WAIT_OBJECT_0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// アクセス拒否系の HRESULT は PermissionDenied に分類される（監査 P1-2）。
+    #[test]
+    fn classify_hr_maps_access_denied_to_permission_denied() {
+        // E_ACCESSDENIED
+        assert!(matches!(
+            classify_hr(0x80070005u32 as i32),
+            Some(Error::PermissionDenied)
+        ));
+        // AUDCLNT_E_DEVICE_IN_USE
+        assert!(matches!(
+            classify_hr(0x8889000Au32 as i32),
+            Some(Error::PermissionDenied)
+        ));
+        // AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED
+        assert!(matches!(
+            classify_hr(0x8889000Eu32 as i32),
+            Some(Error::PermissionDenied)
+        ));
+    }
+
+    /// デバイス不在/失効系の HRESULT は DeviceNotFound に分類される（監査 P1-4）。
+    #[test]
+    fn classify_hr_maps_device_codes_to_device_not_found() {
+        // AUDCLNT_E_DEVICE_INVALIDATED
+        assert!(matches!(
+            classify_hr(0x88890004u32 as i32),
+            Some(Error::DeviceNotFound)
+        ));
+        // E_NOTFOUND
+        assert!(matches!(
+            classify_hr(0x80070490u32 as i32),
+            Some(Error::DeviceNotFound)
+        ));
+    }
+
+    /// 分類できない HRESULT は None（map_hr が Backend にフォールバックする）。
+    #[test]
+    fn classify_hr_unknown_is_none() {
+        // E_FAIL（汎用失敗）は分類対象外。
+        assert!(classify_hr(0x80004005u32 as i32).is_none());
+        // S_OK は失敗ですらないので当然 None。
+        assert!(classify_hr(0).is_none());
+        // AUDCLNT_E_UNSUPPORTED_FORMAT は本質的 Backend（フォーマット非対応）。
+        assert!(classify_hr(0x88890008u32 as i32).is_none());
+    }
 }

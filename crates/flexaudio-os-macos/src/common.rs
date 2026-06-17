@@ -36,9 +36,11 @@ pub(crate) fn now_ns() -> i64 {
 /// `OSStatus` を [`Error`] へ写す。文脈文字列付き。
 ///
 /// 権限拒否系（`kAudioHardwareIllegalOperationError` 等、TCC で tap 作成が弾かれる
-/// 場合に来る代表的なコード）を [`Error::PermissionDenied`] へ寄せる。確実な権限判定は
-/// 初回キャプチャの OS プロンプト挙動に委ねる方針なので（private TCC SPI 不使用）、
-/// ここでは「拒否らしき」コードを最善努力でマップするに留め、それ以外は
+/// 場合に来る代表的なコード）を [`Error::PermissionDenied`] へ、デバイス不在系
+/// （`kAudioHardwareBadDeviceError`）を [`Error::DeviceNotFound`] へ寄せる（3 OS で
+/// 「指定デバイス/エンドポイント不在 → `DeviceNotFound`」を揃える。監査 P1-4）。確実な
+/// 権限判定は初回キャプチャの OS プロンプト挙動に委ねる方針なので（private TCC SPI
+/// 不使用）、ここでは「拒否らしき」コードを最善努力でマップするに留め、それ以外は
 /// [`Error::Backend`] にする。
 pub(crate) fn map_os_status(ctx: &str, status: i32) -> Error {
     // CoreAudio の代表的 OSStatus（4cc）。
@@ -48,11 +50,15 @@ pub(crate) fn map_os_status(ctx: &str, status: i32) -> Error {
     const ILLEGAL_OPERATION: i32 = 0x6e6f7065; // 'nope' — TCC 不許可時に来やすい
     const NOT_RUNNING: i32 = 0x73746f70; // 'stop'
     const BAD_OBJECT: i32 = 0x216f626a; // '!obj'
+    const BAD_DEVICE: i32 = 0x21646576; // '!dev' — 指定デバイス不在/不正
 
     match status {
         // 'nope'（不正操作）は権限未許可で tap/aggregate 生成が拒否されたケースを含むため
         // PermissionDenied に寄せる（OS プロンプト未承認時の典型）。
         ILLEGAL_OPERATION => Error::PermissionDenied,
+        // '!dev'（不正デバイス）は指定デバイス/エンドポイント不在に相当するため
+        // DeviceNotFound に寄せる（Win system=DeviceNotFound・Mac process=DeviceNotFound と一貫）。
+        BAD_DEVICE => Error::DeviceNotFound,
         NOT_RUNNING => Error::Backend(format!("{ctx}: CoreAudio not running (OSStatus 'stop')")),
         BAD_OBJECT => Error::Backend(format!("{ctx}: bad audio object (OSStatus '!obj')")),
         other => {
@@ -181,6 +187,11 @@ mod tests {
         assert!(matches!(
             map_os_status("x", 0x6e6f7065),
             Error::PermissionDenied
+        ));
+        // '!dev'（不正デバイス）は DeviceNotFound に揃える（監査 P1-4）。
+        assert!(matches!(
+            map_os_status("x", 0x21646576),
+            Error::DeviceNotFound
         ));
         assert!(matches!(map_os_status("x", 0x73746f70), Error::Backend(_)));
         // 4cc 可読化（印字可能 ASCII）。

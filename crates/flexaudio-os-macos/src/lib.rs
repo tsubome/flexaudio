@@ -31,6 +31,7 @@ mod common;
 mod process;
 mod system;
 mod tap;
+mod version;
 
 pub use process::MacProcessBackend;
 pub use system::MacSystemBackend;

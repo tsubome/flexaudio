@@ -117,6 +117,10 @@ const _: () = {
 /// # Safety
 /// `params` は有効な `AUDIOCLIENT_ACTIVATION_PARAMS` を指し、戻り値の `PROPVARIANT` の
 /// 生存期間を通じて生きていること。
+// `transmute` の宛先型 `windows_core::imp::bindings::PROPVARIANT` は **private** で
+// 型名を書けないため `_` 推論にせざるを得ず、clippy::missing_transmute_annotations を
+// 満たせない（レイアウト一致は上の const assert で担保済み）。局所許可する。
+#[allow(clippy::missing_transmute_annotations)]
 unsafe fn make_blob_propvariant(
     params: *mut AUDIOCLIENT_ACTIVATION_PARAMS,
 ) -> core::mem::ManuallyDrop<PROPVARIANT> {

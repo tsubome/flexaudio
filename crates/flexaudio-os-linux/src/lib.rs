@@ -218,6 +218,18 @@ impl CaptureBackend for PwSystemBackend {
             Ok(Err(msg)) => {
                 // セットアップ失敗（pipewire 不在・sink 無し・connect 失敗等）。
                 // スレッドは既に return しているので join して片付ける。
+                //
+                // 【エラー型の OS 横断統一（監査 P1-3）について】ここは一律 Error::Backend。
+                // PipeWire/WirePlumber の失敗は本質的に「デーモン/プロトコル」層であり、
+                // 接続失敗（connect_rc）・stream 生成失敗・format ネゴ失敗のいずれも
+                // **権限拒否（portal/Flatpak/RTKit 不許可）と不在（sink/source/session 無し）を
+                // 型で判別する API を PipeWire が持たない**（返るのは errno/汎用文字列で、
+                // PermissionDenied と NotFound を区別する HRESULT/OSStatus 相当が無い）。
+                // よって macOS/Windows のような型分類はできず、判別不能なものは Backend のまま
+                // 据え置く（過剰実装しない）。なお backend は device_id 指定を取らない
+                // （system=既定 sink monitor / process=PID 解決）ため、「指定デバイス不在 →
+                // DeviceNotFound」に相当する写経対象はこの層には存在しない（device_id 検証は
+                // facade 層の責務）。
                 running.store(false, Ordering::SeqCst);
                 let _ = handle.join();
                 Err(Error::Backend(msg))
@@ -430,6 +442,11 @@ impl CaptureBackend for PwProcessBackend {
             }
             Ok(Err(msg)) => {
                 // セットアップ失敗（pipewire 不在・connect/registry 失敗等）。
+                // 一律 Error::Backend。理由は PwSystemBackend::start の同箇所コメント参照
+                // （監査 P1-3: PipeWire は権限拒否/不在を型で判別する API を持たないため、
+                // 判別不能なものは Backend のまま。過剰実装しない）。対象 PID の不在は
+                // 「正常系の待機」であってエラーではない（registry 出現待ち）ので、ここで
+                // DeviceNotFound にはしない（spec の待機許容方針）。
                 running.store(false, Ordering::SeqCst);
                 let _ = handle.join();
                 Err(Error::Backend(msg))
