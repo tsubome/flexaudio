@@ -82,6 +82,17 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = SourceArg::Mic)]
     source: SourceArg,
 
+    /// 録音中にソースをシームレスにホットスワップするスケジュール。
+    /// `<src>:<secs>` をカンマ区切りで並べる（例: `mic:2,system:2,process:2`）。
+    /// 各セグメントを指定秒だけ録ってから次ソースへ `switch_source` で切り替える。
+    /// **出力先（ファイル/パイプ）は 1 本のまま**＝単一の連続チャンクストリーム。
+    /// 指定すると `--source` / `--seconds` を上書きする（先頭セグメントが初期ソース、
+    /// 各 secs の総和が総録音時間）。`process` を含む場合は `--process-id` が必須。
+    /// 切替境界では `[switch] -> <kind>` を stderr に出す。切替失敗時は警告を出して
+    /// 録音は継続する（旧ソースのまま）。WAV 出力では各 secs は 1 以上であること。
+    #[arg(long)]
+    sources: Option<String>,
+
     /// `--source process` の対象プロセス PID（Linux のみ・process では必須）。
     /// 対象 PID のアプリ出力ノードへ fan-out リンクして複製で録る（非侵襲：
     /// ユーザーのスピーカーは鳴ったまま）。対象が後から鳴り始めるのは正常系。
@@ -132,6 +143,169 @@ impl Cli {
     }
 }
 
+/// `--sources` の 1 セグメント: 切り替え先ソースとその継続秒数。
+#[derive(Debug, Clone, Copy)]
+struct Segment {
+    kind: SourceKind,
+    secs: u32,
+}
+
+/// `--sources "mic:2,system:2,process:2"` を `Vec<Segment>` へパースする。
+///
+/// 各要素は `<src>:<secs>`。`<src>` は `mic|system|process`、`<secs>` は正の整数
+/// （秒）。空・不正な要素・非対応 OS のソースはエラー（人間向け `String`）。
+/// 非 Linux で system/process を含む場合もここで弾く。
+fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
+    let mut segments = Vec::new();
+    for (idx, raw) in spec.split(',').enumerate() {
+        let item = raw.trim();
+        if item.is_empty() {
+            return Err(format!(
+                "--sources の {} 番目が空です（形式: <src>:<secs>、例 mic:2）",
+                idx + 1
+            ));
+        }
+        let (src, secs_str) = item.split_once(':').ok_or_else(|| {
+            format!(
+                "--sources の要素 {item:?} は <src>:<secs> 形式である必要があります（例 mic:2）"
+            )
+        })?;
+        let kind = match src.trim() {
+            "mic" => SourceKind::Mic,
+            "system" => {
+                #[cfg(target_os = "linux")]
+                {
+                    SourceKind::SystemLoopback
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(
+                        "--sources の system（システム出力ループバック）は現在 Linux のみ対応です。"
+                            .into(),
+                    );
+                }
+            }
+            "process" => {
+                #[cfg(target_os = "linux")]
+                {
+                    SourceKind::ProcessLoopback
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err(
+                        "--sources の process（プロセス出力ループバック）は現在 Linux のみ対応です。"
+                            .into(),
+                    );
+                }
+            }
+            other => {
+                return Err(format!(
+                    "--sources の未知のソース {other:?}（mic|system|process のいずれか）"
+                ))
+            }
+        };
+        let secs: u32 = secs_str.trim().parse().map_err(|_| {
+            format!("--sources の秒数 {secs_str:?} は正の整数である必要があります（例 mic:2）")
+        })?;
+        if secs == 0 {
+            return Err(format!(
+                "--sources の秒数は 1 以上である必要があります（要素 {item:?}）"
+            ));
+        }
+        segments.push(Segment { kind, secs });
+    }
+    if segments.is_empty() {
+        return Err("--sources が空です（例: mic:2,system:2）".into());
+    }
+    Ok(segments)
+}
+
+/// 指定 [`SourceKind`] と CLI の共有設定（output / pid / exclude_self）から
+/// [`StreamConfig`] を組み立てる。`--sources` の各セグメント config 生成に使う。
+fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
+    StreamConfig {
+        kind,
+        output: cli.output_format(),
+        target_pid: cli.process_id,
+        exclude_self: cli.exclude_self,
+        ..Default::default()
+    }
+}
+
+/// `--sources` のホットスワップスケジューラ。
+///
+/// 先頭セグメントは初期ソース（既に open/start 済み）。以降のセグメント境界
+/// （秒の累積）に達したら `stream.switch_source()` で次ソースへ差し替える。
+/// 出力先（ファイル/パイプ）は呼び出し側が 1 本に保つので、切替は単一の連続
+/// チャンクストリームへ透過的に反映される（seq/PTS 連続は Stream 層が保証）。
+///
+/// 収集ループから毎周回 [`tick`](Self::tick) を呼ぶと、境界時刻を過ぎた切替を
+/// まとめて実行する。切替失敗は `eprintln!` で警告し、録音は継続する（旧ソース
+/// のまま）。境界で `[switch] -> <kind>` を stderr に出す。
+struct SwitchScheduler {
+    /// 次に切り替えるセグメント索引（1 始まり。先頭は初期ソースで切替対象外）。
+    next: usize,
+    /// 各境界の絶対時刻（`deadlines[i]` = セグメント `i+1` へ切り替える時刻）。
+    deadlines: Vec<Instant>,
+    /// 切替先 config（`configs[i]` = `deadlines[i]` で切り替える config）。
+    configs: Vec<StreamConfig>,
+    /// 表示ラベル（`labels[i]` = `configs[i]` の kind ラベル）。
+    labels: Vec<&'static str>,
+}
+
+impl SwitchScheduler {
+    /// セグメント計画から、`start` を基準にスケジューラを構築する。
+    /// 先頭セグメントは初期ソースなので切替対象に含めない。
+    fn new(cli: &Cli, segments: &[Segment], start: Instant) -> Self {
+        let mut deadlines = Vec::new();
+        let mut configs = Vec::new();
+        let mut labels = Vec::new();
+        let mut cumulative = 0u64;
+        for (i, seg) in segments.iter().enumerate() {
+            cumulative += seg.secs as u64;
+            // 最後のセグメントの終端は「総録音時間」であり切替境界ではない。
+            // セグメント i の終端 = セグメント i+1 への切替時刻（i+1 が存在する場合のみ）。
+            if i + 1 < segments.len() {
+                deadlines.push(start + Duration::from_secs(cumulative));
+                let next_seg = segments[i + 1];
+                configs.push(config_for_kind(cli, next_seg.kind));
+                labels.push(source_kind_label(next_seg.kind));
+            }
+        }
+        Self {
+            next: 0,
+            deadlines,
+            configs,
+            labels,
+        }
+    }
+
+    /// 総録音時間（全セグメント秒の総和）。収集ループの deadline に使う。
+    fn total_duration(segments: &[Segment]) -> Duration {
+        let total: u64 = segments.iter().map(|s| s.secs as u64).sum();
+        Duration::from_secs(total)
+    }
+
+    /// `now` までに到達した境界の切替を全て実行する。失敗は警告し継続。
+    fn tick(&mut self, stream: &mut Stream, now: Instant) {
+        while self.next < self.deadlines.len() && now >= self.deadlines[self.next] {
+            let label = self.labels[self.next];
+            let config = self.configs[self.next].clone();
+            match stream.switch_source(config) {
+                Ok(()) => {
+                    eprintln!("[switch] -> {label}");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[switch] 警告: {label} への切替に失敗しました（録音は継続）: {e}"
+                    );
+                }
+            }
+            self.next += 1;
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     // stdout ストリーミング時はエラーも stdout を汚さないよう stderr へ。
@@ -175,12 +349,40 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         };
     }
 
+    // --- --sources（ホットスワップスケジュール）の解決 ---
+    // 指定時は --source / --seconds を上書きし、先頭セグメントを初期ソースにする。
+    // process を含むなら --process-id 必須（switch_source 経由の build_backend が
+    // PID 欠落で失敗するため、人間向け文言で先に弾く）。
+    let segments: Option<Vec<Segment>> = match &cli.sources {
+        None => None,
+        Some(spec) => {
+            let segs = parse_sources(spec)?;
+            let needs_pid = segs.iter().any(|s| s.kind == SourceKind::ProcessLoopback);
+            if needs_pid && cli.process_id.is_none() {
+                return Err(
+                    "--sources に process を含む場合は --process-id <PID> が必要です。".into(),
+                );
+            }
+            Some(segs)
+        }
+    };
+
     // --- ソース種別から SourceKind / 表示ラベルを解決 ---
     // バックエンドの構築・選択は facade `flexaudio::open` に一元化されている
     // （DRY）。CLI 側では SourceKind・表示ラベルの決定と、人間向けの事前チェック
     // （process の PID 必須・非 Linux の system/process 拒否）だけを担う。
     // open は Box<dyn CaptureBackend> を内部で選んで Stream を返す。
-    let (kind, source_label): (SourceKind, &str) = match cli.source {
+    // --sources 指定時は先頭セグメントの kind を初期ソースに使う。
+    let (kind, source_label): (SourceKind, &str) = if let Some(segs) = &segments {
+        let first = segs[0].kind;
+        let label = match first {
+            SourceKind::Mic => "mic（既定入力デバイス）",
+            SourceKind::SystemLoopback => "system（既定出力の monitor / PipeWire）",
+            SourceKind::ProcessLoopback => "process（特定 PID 出力の fan-out / PipeWire）",
+        };
+        (first, label)
+    } else {
+        match cli.source {
         SourceArg::Mic => (SourceKind::Mic, "mic（既定入力デバイス）"),
         SourceArg::System => {
             #[cfg(target_os = "linux")]
@@ -224,6 +426,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
                 );
             }
         }
+        }
     };
 
     // --- 出力フォーマット解決・検証 ---
@@ -262,7 +465,14 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     } else {
         log!("出力フォーマット   : {out_rate} Hz / {out_ch} ch / 16-bit PCM WAV");
     }
-    if cli.seconds == 0 {
+    if let Some(segs) = &segments {
+        let plan: Vec<String> = segs
+            .iter()
+            .map(|s| format!("{}:{}s", source_kind_label(s.kind), s.secs))
+            .collect();
+        let total: u32 = segs.iter().map(|s| s.secs).sum();
+        log!("スケジュール       : {}（計 {total} 秒・1 本の連続ストリーム）", plan.join(" -> "));
+    } else if cli.seconds == 0 {
         log!("キャプチャ秒数     : 無限（Ctrl-C / パイプ切れで停止）");
     } else {
         log!("キャプチャ秒数     : {} 秒", cli.seconds);
@@ -280,9 +490,9 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     log!("キャプチャ中 ...");
 
     if stdout_stream {
-        run_stdout_stream(cli, &mut stream)
+        run_stdout_stream(cli, &mut stream, segments.as_deref())
     } else {
-        run_wav(cli, &mut stream, output)
+        run_wav(cli, &mut stream, output, segments.as_deref())
     }
 }
 
@@ -421,9 +631,12 @@ fn run_wav(
     cli: &Cli,
     stream: &mut Stream,
     output: OutputFormat,
+    segments: Option<&[Segment]>,
 ) -> std::result::Result<(), String> {
+    // 総録音時間: --sources 指定時はセグメント総和、無ければ --seconds。
     // WAV 経路で --seconds 0 は意味を持たない（無限に貯め続けてしまう）。従来通り拒否。
-    if cli.seconds == 0 {
+    // （--sources の各 secs は parse_sources で 1 以上を強制済みなので 0 にはならない。）
+    if segments.is_none() && cli.seconds == 0 {
         stream.stop();
         return Err(
             "--seconds 0（無限）は raw PCM ストリーミング（--out -）専用です。\
@@ -432,10 +645,23 @@ fn run_wav(
         );
     }
 
-    // --- N 秒間 poll_chunk をループして全チャンクを収集 ---
+    let start = Instant::now();
+    let total = match segments {
+        Some(segs) => SwitchScheduler::total_duration(segs),
+        None => Duration::from_secs(cli.seconds),
+    };
+    // ホットスワップスケジューラ（--sources 指定時のみ・出力先は 1 本のまま）。
+    let mut scheduler = segments.map(|segs| SwitchScheduler::new(cli, segs, start));
+
+    // --- 総録音時間ぶん poll_chunk をループして全チャンクを収集 ---
     let mut chunks: Vec<AudioChunk> = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(cli.seconds);
+    let deadline = start + total;
     while Instant::now() < deadline {
+        // セグメント境界に達していればソースを切り替える（貯める先は同一＝1 ファイル）。
+        if let Some(sch) = scheduler.as_mut() {
+            sch.tick(stream, Instant::now());
+        }
+
         let mut got_any = false;
         while let Some(chunk) = stream.poll_chunk() {
             chunks.push(chunk);
@@ -512,8 +738,13 @@ fn run_wav(
 /// チャンク到着次第すぐ stdout へ書き、各回 flush して溜め込まない（低レイテンシ）。
 /// `--seconds 0` なら無限（Ctrl-C / パイプ切れ[BrokenPipe] で正常停止）、
 /// `--seconds N>0` なら N 秒で停止。どちらも stop 後にリング残チャンクを出し切る。
-fn run_stdout_stream(cli: &Cli, stream: &mut Stream) -> std::result::Result<(), String> {
-    let infinite = cli.seconds == 0;
+fn run_stdout_stream(
+    cli: &Cli,
+    stream: &mut Stream,
+    segments: Option<&[Segment]>,
+) -> std::result::Result<(), String> {
+    // --sources 指定時はセグメント総和ぶんの有限録音（--seconds は上書き）。
+    let infinite = segments.is_none() && cli.seconds == 0;
 
     // Ctrl-C(SIGINT) フラグ。無限時に押されたら綺麗に停止する。
     // ctrlc は重複登録すると Err を返すので、無限時のみ登録する。
@@ -530,7 +761,19 @@ fn run_stdout_stream(cli: &Cli, stream: &mut Stream) -> std::result::Result<(), 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
-    let deadline = (!infinite).then(|| Instant::now() + Duration::from_secs(cli.seconds));
+    let start = Instant::now();
+    // 有限録音の deadline: --sources 指定時はセグメント総和、無ければ --seconds。
+    let deadline = if infinite {
+        None
+    } else {
+        let dur = match segments {
+            Some(segs) => SwitchScheduler::total_duration(segs),
+            None => Duration::from_secs(cli.seconds),
+        };
+        Some(start + dur)
+    };
+    // ホットスワップスケジューラ（--sources 指定時のみ・stdout は 1 パイプのまま）。
+    let mut scheduler = segments.map(|segs| SwitchScheduler::new(cli, segs, start));
 
     let mut wrote_any = false;
     let mut broken_pipe = false;
@@ -546,6 +789,11 @@ fn run_stdout_stream(cli: &Cli, stream: &mut Stream) -> std::result::Result<(), 
             if Instant::now() >= dl {
                 break;
             }
+        }
+
+        // セグメント境界に達していればソースを切り替える（出力先は同一＝1 パイプ）。
+        if let Some(sch) = scheduler.as_mut() {
+            sch.tick(stream, Instant::now());
         }
 
         let mut got_any = false;

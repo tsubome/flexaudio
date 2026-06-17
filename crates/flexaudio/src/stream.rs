@@ -101,8 +101,24 @@ struct SharedState {
     /// ChunkRing の producer（取り込みスレッドが使用）。
     chunk_producer: Mutex<Option<ChunkProducer>>,
 
-    /// ネイティブフォーマット `(sample_rate, channels)`（再オープン後も不変前提）。
-    native_format: (u32, u16),
+    /// 現在の `backend` のネイティブフォーマット `(sample_rate, channels)`。
+    ///
+    /// ウォッチドッグ復帰（同一 backend 再オープン）では不変だが、
+    /// [`Stream::switch_source`] でソースを差し替えると **新 backend の値へ更新**
+    /// される（mic↔system/process でネイティブ SR/ch が変わるのが普通）。
+    /// 取り込みスレッドは世代変化を検知してここを読み直し、第 1 段
+    /// （native 依存）の [`Normalizer`] を作り直す。
+    native_format: Mutex<(u32, u16)>,
+
+    /// ソース切替中フラグ。[`Stream::switch_backend`] が切替中 true にする。
+    /// 切替中はウォッチドッグが並行再オープンしないよう失速処理をスキップする
+    /// （切替の旧 backend stop で一時的に idle になっても誤って再オープンしない）。
+    switching: AtomicBool,
+
+    /// 意図的な不連続フラグ。[`Stream::switch_backend`] がソース切替成功時に
+    /// true にし、取り込みスレッドが次チャンクへ DISCONTINUITY（RECOVERED は
+    /// 付けない＝自動復帰ではなく意図的切替）を立てて false に戻す。
+    discontinuity_pending: AtomicBool,
 }
 
 impl SharedState {
@@ -146,7 +162,9 @@ impl Stream {
             recovered_pending: AtomicBool::new(false),
             events: events.clone(),
             chunk_producer: Mutex::new(Some(chunk_producer)),
-            native_format,
+            native_format: Mutex::new(native_format),
+            switching: AtomicBool::new(false),
+            discontinuity_pending: AtomicBool::new(false),
         });
 
         Ok(Stream {
@@ -182,14 +200,15 @@ impl Stream {
             .take()
             .ok_or_else(|| Error::InvalidState("chunk producer already taken".into()))?;
 
-        // 取り込み/加工スレッド。
+        // 取り込み/加工スレッド。初期 native_format は shared から読む
+        // （以降は世代変化のたびに run_intake が shared を読み直して追従する）。
         let worker_shared = self.shared.clone();
-        let native_format = self.shared.native_format;
+        let initial_native = *self.shared.native_format.lock().expect("native_format mutex");
         let output = self.config.output;
         let worker = thread::Builder::new()
             .name("flexaudio-intake".into())
             .spawn(move || {
-                run_intake(worker_shared, chunk_producer, native_format, output);
+                run_intake(worker_shared, chunk_producer, initial_native, output);
             })
             .map_err(|e| Error::Backend(format!("spawn intake thread: {e}")))?;
         self.worker = Some(worker);
@@ -257,22 +276,46 @@ impl Stream {
         &self.config
     }
 
-    /// backend のネイティブフォーマット `(sample_rate, channels)`。
+    /// 現在の backend のネイティブフォーマット `(sample_rate, channels)`。
     ///
-    /// open 時に backend から取得して保持した値（再オープン後も不変前提）。
-    /// 表示・診断用（出力フォーマットは `config().output`）。
+    /// open 時に backend から取得した値。ウォッチドッグ復帰では不変だが、
+    /// [`switch_source`](Self::switch_source) でソースを切り替えると新 backend の
+    /// 値に更新される。表示・診断用（出力フォーマットは `config().output`）。
     pub fn native_format(&self) -> (u32, u16) {
-        self.shared.native_format
+        *self.shared.native_format.lock().expect("native_format mutex")
     }
 
     // --- 内部 ---
 
-    /// RawRing を新規作成して backend を start し、RawConsumer を共有へ載せる。
+    /// 現 `shared.backend` を（再）start し、新しい RawRing/RawConsumer を共有へ
+    /// 載せて世代を進める。初回起動・ウォッチドッグ再オープンの双方で使う。
     ///
-    /// 初回起動・再オープンの双方で使う。世代カウンタを進めて取り込みスレッドへ
-    /// 「ソースが切り替わった」ことを伝える。
+    /// 手順:
+    /// 1. 現 backend の [`native_format`](CaptureBackend::native_format) を取得し
+    ///    `shared.native_format` を更新（同一 backend の再オープンでは不変、
+    ///    将来ここを別 backend で呼んでも追従する）。
+    /// 2. その rate/ch で新しい RawRing を作る（旧 RawRing の format 残骸を持ち込ま
+    ///    ない＝位相破壊を避ける）。
+    /// 3. backend を start。
+    /// 4. 新 RawConsumer を共有へ載せ替え（旧 consumer は drop）、世代を ++。
+    /// 5. `last_sample_ns` を now にして即失速判定を避ける。
+    ///
+    /// backend ロックは start 時のみ取る（呼び出し側がロックを保持していない
+    /// 前提）。低レベルな切替（[`switch_backend`](Self::switch_backend)）は
+    /// backend を直接差し替えるため本関数を経由しない（旧ソース復帰の局面でのみ
+    /// 本関数を再利用する）。
     fn open_backend_once(shared: &Arc<SharedState>) -> Result<()> {
-        let (rate, channels) = shared.native_format;
+        // 現 backend のネイティブフォーマットを取得して shared へ反映する。
+        let (rate, channels) = {
+            let be = shared.backend.lock().expect("backend mutex");
+            be.native_format()
+        };
+        {
+            let mut nf = shared.native_format.lock().expect("native_format mutex");
+            *nf = (rate, channels);
+        }
+
+        // 新しい RawRing（旧 format の残骸を持ち込まない）。
         let (producer, consumer) = raw_ring(RAW_RING_SAMPLES);
         let sink = RawSink::new(producer, rate, channels);
 
@@ -281,7 +324,7 @@ impl Stream {
             be.start(sink)?;
         }
 
-        // 新しい consumer を共有へ載せ、世代を進める。
+        // 新しい consumer を共有へ載せ、世代を進める（旧 consumer は drop）。
         {
             let mut rc = shared.raw_consumer.lock().expect("raw_consumer mutex");
             *rc = Some(consumer);
@@ -292,6 +335,169 @@ impl Stream {
         shared
             .last_sample_ns
             .store(monotonic_now_ns(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// 低レベルなソース切替: 現在の backend を **新しい backend へ差し替え**、
+    /// チャンクストリーム（seq・PTS）の連続性を保ったまま入力ソースを変える。
+    ///
+    /// `seq` は取り込みスレッドのローカル変数で backend にも `SharedState` にも
+    /// 無いため、**ここで触らなければ差し替え前後で連続**する。PTS は取り込み
+    /// スレッドが世代変化を検知して `Normalizer`/`ClockNormalizer` を作り直し、
+    /// 新ソース初回サンプルの実時刻で再アンカーするので単調を保つ。
+    ///
+    /// 手順（**generation++ は最後に 1 回だけ**・全 Atomic は SeqCst）:
+    /// - 未 start なら [`Error::InvalidState`]。
+    /// - `switching = true`（ウォッチドッグの並行再オープンを止める）。
+    /// - backend ロック下で旧 backend を `stop()` → 新 backend の native を取得して
+    ///   `shared.native_format` 更新 → 新 RawRing → `new_backend.start(sink)`。
+    ///   - 成功: backend を新へ差し替え、新 consumer を載せ替え（旧 drop）。
+    ///   - 失敗: 旧 backend を [`open_backend_once`](Self::open_backend_once) で
+    ///     再 start して旧ソースを継続（連続性を壊さない）。`discontinuity_pending`
+    ///     を立て世代を ++、`switching=false` にして `Err` を返す。
+    /// - 成功時: `discontinuity_pending = true`（RECOVERED は付けない＝意図的切替）
+    ///   → `generation += 1`（**最後に 1 回だけ**）→ `last_sample_ns = now` →
+    ///   `switching = false` → `Ok`。
+    ///
+    /// テスト容易性のため [`Box<dyn CaptureBackend>`] を直接受け取る（mock backend
+    /// で切替挙動を検証できる）。高レベル入口は [`switch_source`](Self::switch_source)。
+    ///
+    /// `#[doc(hidden)] pub`: 公開 API ではない（ドキュメントに出さない）が、別クレートの
+    /// 統合テスト（`tests/integration.rs`）から MockBackend を渡して呼べるようにする。
+    #[doc(hidden)]
+    pub fn switch_backend(&mut self, new_backend: Box<dyn CaptureBackend>) -> Result<()> {
+        if !self.started {
+            return Err(Error::InvalidState(
+                "switch_backend は start 済みのストリームでのみ可能".into(),
+            ));
+        }
+
+        // 切替開始: ウォッチドッグの失速→再オープンと衝突しないよう先に止める。
+        self.shared.switching.store(true, Ordering::SeqCst);
+
+        // backend ロック下で旧 stop → 新 start を一気に行う。
+        {
+            let mut be = self.shared.backend.lock().expect("backend mutex");
+
+            // 旧 backend を止める（RT push を止める）。
+            be.stop();
+
+            // 新 backend のネイティブフォーマット。
+            let (rate, channels) = new_backend.native_format();
+
+            // 新 RawRing（旧 format 残骸を持ち込まない）。
+            let (producer, consumer) = raw_ring(RAW_RING_SAMPLES);
+            let sink = RawSink::new(producer, rate, channels);
+
+            // 新 backend を start。失敗時は旧ソースへ復帰する。
+            let mut new_backend = new_backend;
+            match new_backend.start(sink) {
+                Ok(()) => {
+                    // --- レース防止の順序が要 ---
+                    // 取り込みスレッドは「世代をロック外で load → raw_consumer を
+                    // lock して pop」する。新 consumer を先に載せると、世代を ++ する
+                    // 前に新ソースの native サンプルを旧 normalizer へ流し込み得る
+                    // （旧 native 形でない＝位相破壊）。これを避けるため、
+                    //   native_format 更新 → 世代 ++（+ DISCONTINUITY 等）→ 最後に
+                    //   consumer/backend を差し替える
+                    // 順にする。こうすれば取り込み側が新 consumer を観測する時には
+                    // 必ず新世代が見えており、normalizer を作り直してから pop する。
+                    //
+                    // shared.native_format を新ソースの値へ更新。
+                    {
+                        let mut nf =
+                            self.shared.native_format.lock().expect("native_format mutex");
+                        *nf = (rate, channels);
+                    }
+                    // 意図的切替なので RECOVERED は付けず DISCONTINUITY のみ。
+                    self.shared
+                        .discontinuity_pending
+                        .store(true, Ordering::SeqCst);
+                    // 起動直後を最終到着時刻に（即失速判定を避ける）。
+                    self.shared
+                        .last_sample_ns
+                        .store(monotonic_now_ns(), Ordering::SeqCst);
+                    // 世代を進める（最後に 1 回だけ）。consumer 差し替えより前に行い、
+                    // 新 consumer 観測時には必ず新世代が見えるようにする。
+                    self.shared.raw_generation.fetch_add(1, Ordering::SeqCst);
+
+                    // backend を新へ差し替え（旧 backend は drop）。
+                    *be = new_backend;
+                    // 新 consumer を共有へ載せ替え（旧 consumer は drop）。最後に行う。
+                    {
+                        let mut rc =
+                            self.shared.raw_consumer.lock().expect("raw_consumer mutex");
+                        *rc = Some(consumer);
+                    }
+                }
+                Err(e) => {
+                    // 新ソース起動失敗 → 旧 backend（`*be` のまま）を再 start して継続。
+                    // backend ロックを保持したままだと open_backend_once が再ロックで
+                    // デッドロックするため、ここで一旦解放してから復帰させる。
+                    drop(be);
+                    // 旧 backend を再オープン（native_format は旧 backend の値へ戻る）。
+                    let _ = Self::open_backend_once(&self.shared);
+                    // 旧ソース再開も「不連続」扱いにする（一瞬途切れたため）。
+                    self.shared
+                        .discontinuity_pending
+                        .store(true, Ordering::SeqCst);
+                    // open_backend_once が generation を ++ 済み。switching を戻して Err。
+                    self.shared.switching.store(false, Ordering::SeqCst);
+                    return Err(e);
+                }
+            }
+        }
+
+        // --- 切替成功 ---
+        // generation++・native_format 更新・各フラグは backend ロック下で実施済み
+        // （新 consumer 観測前に新世代が見えるよう順序付け）。ここでは switching を
+        // 戻すだけ。
+        self.shared.switching.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// 録音を止めずに入力ソース（mic/system/process）を切り替える高レベル入口。
+    ///
+    /// `new_config` からソース別バックエンドを [`build_backend`](crate::build_backend)
+    /// で構築し（失敗時は旧ソース無傷のまま `Err`）、[`switch_backend`](Self::switch_backend)
+    /// で差し替える。出力フォーマット（`output`）は **切替不可**（チャンク
+    /// frames/data.len が変わると連続ストリームが壊れるため）。変更要求は
+    /// [`Error::InvalidArg`] で弾く。
+    ///
+    /// 成功時、`config` の **可変項目のみ**（`kind` / `device_id` / `target_pid`
+    /// / `exclude_self`）を新しい値へ更新する。`output` / `chunk_ms`
+    /// / `ring_capacity_chunks` は据え置く。
+    ///
+    /// # エラー
+    /// - 未 start → [`Error::InvalidState`]。
+    /// - `output` 変更要求 → [`Error::InvalidArg`]。
+    /// - 新ソースの backend 構築失敗（process の PID 欠落・非対応 OS 等）→
+    ///   [`build_backend`](crate::build_backend) 由来のエラー（旧ソースは無傷）。
+    /// - 新 backend の start 失敗 → [`switch_backend`](Self::switch_backend) が
+    ///   旧ソースへ復帰したうえで当該エラーを返す。
+    pub fn switch_source(&mut self, new_config: StreamConfig) -> Result<()> {
+        if !self.started {
+            return Err(Error::InvalidState(
+                "switch_source は start 済みのストリームでのみ可能".into(),
+            ));
+        }
+        if new_config.output != self.config.output {
+            return Err(Error::InvalidArg(
+                "output format cannot change during switch_source".into(),
+            ));
+        }
+        // 新ソースの backend を構築（失敗時は旧ソース無傷のまま早期 return）。
+        let backend = crate::build_backend(&new_config)?;
+        // 差し替え（連続性は switch_backend が保証）。
+        self.switch_backend(backend)?;
+        // 成功時のみ config の可変項目を更新（output 等は据え置き）。
+        self.config = StreamConfig {
+            kind: new_config.kind,
+            device_id: new_config.device_id,
+            target_pid: new_config.target_pid,
+            exclude_self: new_config.exclude_self,
+            ..self.config.clone()
+        };
         Ok(())
     }
 }
@@ -313,10 +519,10 @@ impl Drop for Stream {
 fn run_intake(
     shared: Arc<SharedState>,
     mut chunk_producer: ChunkProducer,
-    native_format: (u32, u16),
+    initial_native: (u32, u16),
     output: OutputFormat,
 ) {
-    let (rate, channels) = native_format;
+    let (mut rate, mut channels) = initial_native;
     let mut normalizer = Normalizer::new(rate, channels, output);
     let mut clock = ClockNormalizer::new();
     let mut seq: u64 = 0;
@@ -331,14 +537,18 @@ fn run_intake(
             break;
         }
 
-        // 世代変化（再オープン）検知 → 新しいソースへリセット。
+        // 世代変化（再オープン / ソース切替）検知 → 新しいソースへリセット。
+        // ソース切替では native_format が変わり得るので shared を読み直し、
+        // 第 1 段（native 依存）の Normalizer を作り直す（ウォッチドッグ復帰では
+        // 同じ値が読めるため挙動は従来どおり）。
         let gen = shared.raw_generation.load(Ordering::SeqCst);
         if gen != current_generation {
             current_generation = gen;
+            let nf = *shared.native_format.lock().expect("native_format mutex");
+            rate = nf.0;
+            channels = nf.1;
             normalizer = Normalizer::new(rate, channels, output);
             clock = ClockNormalizer::new();
-            // 次に出すチャンクへ復帰フラグを立てる。
-            shared.recovered_pending.store(true, Ordering::SeqCst);
         }
 
         // RawRing から取り出して Normalizer へ。
@@ -376,13 +586,17 @@ fn run_intake(
             // 最終 data に対して peak / rms（線形）を算出する（20ms なので極小コスト）。
             let (peak, rms) = peak_rms(&data);
 
+            // フラグは二系統:
+            //  - recovered_pending: ウォッチドッグ自動復帰 → RECOVERED|DISCONTINUITY。
+            //  - discontinuity_pending: 意図的なソース切替 → DISCONTINUITY のみ。
+            // 両方が同時に立つことは設計上無い（切替中は switching でウォッチドッグを
+            // 止める）が、立っても OR で合成され安全（RECOVERED|DISCONTINUITY）。
             let mut flags = ChunkFlags::empty();
-            // 復帰後の最初のチャンクへ RECOVERED|DISCONTINUITY。
-            if shared
-                .recovered_pending
-                .swap(false, Ordering::SeqCst)
-            {
+            if shared.recovered_pending.swap(false, Ordering::SeqCst) {
                 flags |= ChunkFlags::RECOVERED | ChunkFlags::DISCONTINUITY;
+            }
+            if shared.discontinuity_pending.swap(false, Ordering::SeqCst) {
+                flags |= ChunkFlags::DISCONTINUITY;
             }
 
             let chunk = AudioChunk {
@@ -429,6 +643,13 @@ fn run_watchdog(shared: Arc<SharedState>) {
             break;
         }
 
+        // ソース切替中は失速判定・再オープンをしない（switch_backend が旧 backend を
+        // 一時的に stop して idle になるため、誤って並行再オープンするのを防ぐ）。
+        // 切替は last_sample_ns を now に更新して終わるので、次 tick から通常監視へ戻る。
+        if shared.switching.load(Ordering::SeqCst) {
+            continue;
+        }
+
         let now = monotonic_now_ns();
         let last = shared.last_sample_ns.load(Ordering::SeqCst);
         let idle_ns = now.saturating_sub(last);
@@ -464,9 +685,11 @@ fn run_watchdog(shared: Arc<SharedState>) {
         };
 
         if reopened {
-            // open_backend_once が last_sample_ns を now に更新済み。復帰が本物かは
-            // 次の tick で idle を見て確認する。ここでは「再オープン成功 →
-            // 復帰」とみなして即通知（取り込みスレッドは世代変化でフラグを立てる）。
+            // open_backend_once が last_sample_ns を now に更新・世代を ++ 済み。
+            // 復帰後の最初のチャンクへ RECOVERED|DISCONTINUITY を立てるよう
+            // recovered_pending を倒す（取り込みスレッドが次チャンクで消費する）。
+            // 復帰が本物かは次の tick で idle を見て確認する。
+            shared.recovered_pending.store(true, Ordering::SeqCst);
             stalled = false;
             shared.push_event(Event::StreamRecovered);
             backoff = BACKOFF_MIN;

@@ -13,6 +13,7 @@
 //! 実行時はネットワーク通信を一切行わない（napi は N-API ブリッジのみ）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -239,12 +240,25 @@ fn build_config(options: &OpenOptions) -> NapiResult<StreamConfig> {
 // FlexStream（class）。bridge スレッドの所有・停止を担う。
 // ---------------------------------------------------------------------------
 
+/// bridge スレッドへ「ソース切替」を依頼するコマンド。
+///
+/// Stream は bridge スレッドが所有しているため、`switch_source` を直接呼べない。
+/// JS から来た切替要求をこのコマンドで bridge スレッドへ送り、`result_tx` で結果を
+/// 同期的に受け取る（JS 側は同期返却を期待する）。
+struct SwitchCmd {
+    config: StreamConfig,
+    result_tx: mpsc::Sender<std::result::Result<(), String>>,
+}
+
 /// 録音ストリームのハンドル。内部で bridge スレッドが `flexaudio::Stream` を
 /// 所有・ポーリングし、チャンク/イベントを TSFN 経由で JS へ送る。
 #[napi]
 pub struct FlexStream {
     stop_flag: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    /// bridge スレッドへ切替コマンドを送るチャネル。`shutdown` で drop してスレッド
+    /// 側の `try_recv` を打ち切る（停止は stop_flag が担うので必須ではないが明示）。
+    cmd_tx: Option<mpsc::Sender<SwitchCmd>>,
 }
 
 impl FlexStream {
@@ -257,11 +271,18 @@ impl FlexStream {
     ) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let thread_stop = stop_flag.clone();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SwitchCmd>();
 
         let handle = thread::spawn(move || {
             loop {
                 if thread_stop.load(Ordering::SeqCst) {
                     break;
+                }
+                // 切替コマンドを poll と同じ周回で処理（到着分をまとめて）。
+                while let Ok(cmd) = cmd_rx.try_recv() {
+                    let r = stream.switch_source(cmd.config).map_err(|e| e.to_string());
+                    // 受け手（switch_source 呼び出し元）が drop していても無視。
+                    let _ = cmd.result_tx.send(r);
                 }
                 // チャンクは到着し次第すべて吐く。
                 while let Some(chunk) = stream.poll_chunk() {
@@ -285,11 +306,14 @@ impl FlexStream {
         Self {
             stop_flag,
             handle: Some(handle),
+            cmd_tx: Some(cmd_tx),
         }
     }
 
     fn shutdown(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        // 切替チャネルを閉じる（bridge スレッドの try_recv を Disconnected にする）。
+        self.cmd_tx = None;
         if let Some(h) = self.handle.take() {
             // 二重 stop / Drop でも安全（handle は take 済みなら何もしない）。
             let _ = h.join();
@@ -303,6 +327,48 @@ impl FlexStream {
     #[napi]
     pub fn stop(&mut self) {
         self.shutdown();
+    }
+
+    /// 録音を止めずに入力ソース（mic/system/process）をホットスワップする。
+    ///
+    /// `options` から構築した `StreamConfig` への切替を bridge スレッドへ依頼し、
+    /// 結果を**同期的に**返す（成功で `Ok`、失敗で例外）。出力フォーマット
+    /// （`outputRate`/`outputChannels`）は切替で変更不可（連続ストリームの frames が
+    /// 変わるため）。変更を要求すると `switch_source` が InvalidArg を返し、ここで
+    /// 例外になる。切替前後でチャンクの `seq` は連続し、切替後最初のチャンクには
+    /// DISCONTINUITY フラグが立つ。
+    ///
+    /// 既に `stop()` 済み（bridge スレッド停止後）なら例外を返す。
+    #[napi]
+    pub fn switch_source(&self, options: OpenOptions) -> NapiResult<()> {
+        // openStream と同じく build_config で options → StreamConfig（DRY）。
+        let config = build_config(&options)?;
+
+        // bridge スレッドへコマンドを送り、結果を同期受信する。
+        let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
+            NapiError::new(
+                Status::GenericFailure,
+                "stream already stopped".to_string(),
+            )
+        })?;
+        let (result_tx, result_rx) = mpsc::channel();
+        cmd_tx
+            .send(SwitchCmd { config, result_tx })
+            .map_err(|_| {
+                NapiError::new(
+                    Status::GenericFailure,
+                    "bridge thread is not running".to_string(),
+                )
+            })?;
+        // bridge スレッドが switch_source を実行して結果を返すのを待つ（同期）。
+        match result_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(msg)) => Err(NapiError::new(Status::GenericFailure, msg)),
+            Err(_) => Err(NapiError::new(
+                Status::GenericFailure,
+                "bridge thread dropped before responding".to_string(),
+            )),
+        }
     }
 }
 

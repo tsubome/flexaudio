@@ -120,13 +120,35 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// # Ok::<(), flexaudio::Error>(())
 /// ```
 pub fn open(config: StreamConfig) -> Result<Stream> {
-    use flexaudio_core::types::Error;
-
     // 出力フォーマットを早期に検証して分かりやすく弾く（Stream::open でも
     // 再検証されるが、backend を構築する前に返したい）。
     config.output.validate()?;
 
     // config.kind でソース別にバックエンドを構築する（選択の一元化）。
+    let backend = build_backend(&config)?;
+
+    // 低レベル入口へ委譲（Normalizer 構成・スレッド配線はここが担う）。
+    Stream::open(config, backend)
+}
+
+/// [`StreamConfig`] から **ソース種別 / OS に応じてバックエンドを 1 つ構築**する。
+///
+/// バックエンド選択（[`open`] の `match`）を **この 1 箇所へ抽出**したもの。
+/// [`open`] は出力フォーマット検証後にこれを呼ぶだけで、挙動は不変。
+/// [`Stream::switch_source`](crate::stream::Stream::switch_source) も切替先の
+/// backend を作るのに同じロジックを使う（ソース選択の DRY を保つ）。
+///
+/// 分岐・エラーは [`open`] のドキュメントと同一:
+/// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`]（全 OS）。
+/// - [`SourceKind::SystemLoopback`] → Linux のみ
+///   [`flexaudio_os_linux::PwSystemBackend`]。非 Linux は [`Error::Unsupported`]。
+/// - [`SourceKind::ProcessLoopback`] → Linux のみ
+///   [`flexaudio_os_linux::PwProcessBackend`]（`target_pid` 必須・欠落で
+///   [`Error::InvalidArg`]）。非 Linux は [`Error::Unsupported`]。
+pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBackend>> {
+    #[cfg(not(target_os = "linux"))]
+    use flexaudio_core::types::Error;
+
     let backend: Box<dyn CaptureBackend> = match config.kind {
         // マイク入力は全 OS 共通（cpal）。
         SourceKind::Mic => Box::new(flexaudio_mic::CpalMicBackend::new()),
@@ -148,7 +170,9 @@ pub fn open(config: StreamConfig) -> Result<Stream> {
             #[cfg(target_os = "linux")]
             {
                 let pid = config.target_pid.ok_or_else(|| {
-                    Error::InvalidArg("ProcessLoopback には target_pid が必要".into())
+                    flexaudio_core::types::Error::InvalidArg(
+                        "ProcessLoopback には target_pid が必要".into(),
+                    )
                 })?;
                 Box::new(flexaudio_os_linux::PwProcessBackend::new(
                     pid,
@@ -162,6 +186,5 @@ pub fn open(config: StreamConfig) -> Result<Stream> {
         }
     };
 
-    // 低レベル入口へ委譲（Normalizer 構成・スレッド配線はここが担う）。
-    Stream::open(config, backend)
+    Ok(backend)
 }
