@@ -3,7 +3,16 @@ name = "flexaudio-vad"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+# ort / ONNX Runtime のツールチェインが rustc 1.88 を要求するため、workspace の
+# 1.85 を個別に上書きする（虚偽 MSRV 宣言の是正）。
+rust-version = "1.88"
+authors.workspace = true
+repository.workspace = true
+description = "Offline Voice Activity Detection (Silero VAD on ONNX Runtime, model embedded) for flexaudio."
+keywords = ["vad", "voice", "silero", "onnx", "audio"]
+categories = ["multimedia::audio", "science"]
+readme = "README.md"
+documentation = "https://docs.rs/flexaudio-vad"
 
 [dependencies]
 # silero-VAD を ONNX でオフライン実行する。`download-binaries` が「ビルド時」に onnxruntime を

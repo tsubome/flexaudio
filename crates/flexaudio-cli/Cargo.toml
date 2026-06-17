@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Reference command-line capture tool for flexaudio (WAV output and raw-PCM streaming)."
+# バイナリ。当面 crates.io へは公開しない。
+publish = false
 
 [[bin]]
 name = "flexaudio-cli"

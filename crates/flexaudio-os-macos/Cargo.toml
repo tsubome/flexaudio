@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "macOS system and per-process audio capture backend (Core Audio process taps) for flexaudio."
+keywords = ["audio", "coreaudio", "loopback", "capture", "macos"]
+categories = ["multimedia::audio", "os::macos-apis"]
+documentation = "https://docs.rs/flexaudio-os-macos"
 
 # このクレートは macOS 専用。非 macOS では lib.rs が
 # `#![cfg(target_os = "macos")]` で空コンパイルになり、objc2 系依存も以下の
@@ -12,7 +18,7 @@ rust-version.workspace = true
 # 版は Cargo.lock の既存ピン（cpal が引く objc2 系）に正確一致させ、重複
 # コンパイルを避ける。
 [target.'cfg(target_os = "macos")'.dependencies]
-flexaudio-core = { path = "../flexaudio-core" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
 objc2 = "=0.6.4"
 objc2-foundation = { version = "=0.3.2", features = [
     "NSArray",

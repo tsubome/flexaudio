@@ -1,458 +1,212 @@
-[🇯🇵 日本語](README.ja.md) | **🇺🇸 English**
+# flexaudio
 
-# pyflexaudio
+**Flexible, cross-platform audio capture for Rust.**
 
-**Flexible cross-platform audio capture library for Python**
+`flexaudio` provides one unified API for capturing audio from **microphones**,
+**system output (loopback)**, and **individual processes** — across **Linux**,
+**Windows**, and **macOS**. It normalizes every source to an interleaved
+`f32` stream at an output format you choose, and hands you chunks plus
+device/stream events through a simple poll loop.
 
-pyflexaudio provides a single, unified API for capturing audio from microphones, system audio (loopback), and individual processes — across Windows, macOS, and Linux.
+```rust
+use flexaudio::{open, StreamConfig, SourceKind};
 
-```python
-from pyflexaudio import FlexAudioSession, SourceType
-from pyflexaudio.sinks.file import FileSink
-from pyflexaudio.types import LevelEvent
-
-with FlexAudioSession() as session:
-    session.on(LevelEvent, lambda e: print(f"Level: {e.db:.1f} dB"))
-    session.add_sink(FileSink("output.wav"))
-    session.set_source(SourceType.MICROPHONE)
-    session.start()
-    input("Recording… press Enter to stop.\n")
+let mut stream = open(StreamConfig {
+    kind: SourceKind::Mic,
+    ..Default::default()
+})?;
+stream.start()?;
+while let Some(chunk) = stream.poll_chunk() {
+    // chunk.data is interleaved f32 in your chosen OutputFormat
+    let _ = (chunk.frames, chunk.peak, chunk.rms);
+}
+stream.stop();
+# Ok::<(), flexaudio::Error>(())
 ```
 
 ---
 
-## Features
+## Capability matrix (the "9 cells")
 
-### Audio Sources
+Three capture sources × three operating systems. ✅ = implemented and verified,
+— = not available on that platform.
 
-| Source | Description |
-|--------|-------------|
-| **Microphone** | Via `sounddevice` (PortAudio) with `miniaudio` fallback |
-| **System audio** | WASAPI Loopback (Windows), ScreenCaptureKit (macOS) |
-| **Per-process audio** | ProcessAudioCapture DLL (Windows 11), ScreenCaptureKit filter (macOS) |
-| **Hot-swappable** | Call `set_source()` while running to switch sources on-the-fly |
+| Source              | Linux            | Windows           | macOS                       |
+|---------------------|------------------|-------------------|-----------------------------|
+| **Microphone**      | ✅ (cpal/ALSA)   | ✅ (cpal/WASAPI)  | ✅ (cpal/CoreAudio)         |
+| **System output**   | ✅ (PipeWire)    | ✅ (WASAPI loopback) | ✅ (CoreAudio process taps) |
+| **Per-process**     | ✅ (PipeWire)    | ✅ (WASAPI process loopback) | ✅ (CoreAudio process taps) |
 
-### Processing Pipeline
-
-- **Source → Processor → Sink** fan-out architecture
-- **`LevelMeterProcessor`** — Real-time RMS → dB level calculation attached to every chunk
-- **`ResampleProcessor`** — High-quality streaming resampling via soxr
-- **`ChannelConvertProcessor`** — Stereo ↔ Mono conversion
-- **Silero VAD** — Voice Activity Detection with `SpeechStartEvent` / `SpeechEndEvent`
-- **`ProcessorChain`** — Compose multiple processors sequentially
-
-### Output Sinks
-
-| Sink | Description |
-|------|-------------|
-| **`FileSink`** | WAV int16 output; crash-safe header updates every 30 s; automatic file splitting |
-| **`CallbackSink`** | Real-time `AudioChunk` delivery to any Python callable |
-| **`LevelMeterSink`** | Continuous `LevelEvent` emission — active even during pause |
-
-### Event System
-
-Type-safe `EventBus` with the following built-in events:
-
-`LevelEvent` · `SpeechStartEvent` · `SpeechEndEvent` · `DeviceDisconnectedEvent` · `StateChangedEvent` · `ErrorEvent` · `ChunkDroppedEvent` · `SourceSwitchedEvent` · `PermissionDeniedEvent`
-
-### Resilience
-
-- **Partial failure tolerance** — one sink failure does not affect the others
-- **Crash-safe WAV** — headers flushed to disk every 30 seconds via `fsync`
-- **Automatic file splitting** — triggered on source format change or WAV 4 GB limit
-- **Graceful device disconnection** — emits `DeviceDisconnectedEvent` and keeps running
-- **Idempotent controls** — calling `start()` / `stop()` / `pause()` / `resume()` multiple times is always safe
+- **Microphone** works on all platforms via [`cpal`].
+- **System / per-process** capture uses the native OS backend selected at
+  compile time; calling an unsupported source on a given OS returns
+  `Error::Unsupported`.
+- Per-process capture requires a `target_pid` in `StreamConfig`.
 
 ---
 
-## Platform Support
+## Install
 
-| Feature | Windows | macOS | Linux |
-|---------|:-------:|:-----:|:-----:|
-| Microphone capture | ✓ | ✓ | ✓ |
-| System audio (loopback) | ✓ (WASAPI) | ✓ (ScreenCaptureKit) | — |
-| Per-process audio | ✓ (Win 11, DLL) | ✓ (ScreenCaptureKit) | — |
-| Microphone fallback (miniaudio) | ✓ | ✓ | ✓ |
-
----
-
-## Requirements
-
-- Python ≥ 3.10
-- [numpy](https://numpy.org/) ≥ 1.24
-- [sounddevice](https://python-sounddevice.readthedocs.io/) ≥ 0.5
-- [soxr](https://github.com/dofuuz/python-soxr) ≥ 0.5
-
----
-
-## Installation
-
-**Basic (microphone only)**
-
-```bash
-pip install pyflexaudio
+```toml
+[dependencies]
+flexaudio = "0.2"
 ```
 
-**With VAD (Silero Voice Activity Detection)**
+or:
 
-```bash
-pip install "pyflexaudio[vad]"
+```sh
+cargo add flexaudio
 ```
 
-**macOS (system / process audio)**
+The Voice Activity Detection add-on is a separate crate:
 
-```bash
-pip install "pyflexaudio[mac]"
-```
-
-**Windows system audio**
-
-```bash
-pip install "pyflexaudio[win-system]"
-```
-
-**Windows per-process audio**
-
-```bash
-pip install "pyflexaudio[win-process]"
-```
-
-**Everything**
-
-```bash
-pip install "pyflexaudio[full]"
+```sh
+cargo add flexaudio-vad
 ```
 
 ---
 
-## Quick Start
+## Minimal example
 
-### 1. Microphone Recording
+```rust
+use flexaudio::{open, StreamConfig, SourceKind, OutputFormat};
 
-```python
-import time
-from pyflexaudio import FlexAudioSession, SourceType
-from pyflexaudio.sinks.file import FileSink
-from pyflexaudio.types import LevelEvent
+let config = StreamConfig {
+    kind: SourceKind::Mic,
+    output: OutputFormat { sample_rate: 16_000, channels: 1 },
+    ..Default::default()
+};
+let mut stream = open(config)?;
+stream.start()?;
 
-with FlexAudioSession() as session:
-    session.on(LevelEvent, lambda e: print(f"  {e.db:+.1f} dB", end="\r"))
-
-    sink_id = session.add_sink(FileSink("recording.wav"))
-    session.set_source(SourceType.MICROPHONE)
-    session.start()
-
-    time.sleep(10)  # record for 10 seconds
-# WAV file is safely closed on __exit__
-```
-
-### 2. Voice Activity Detection
-
-```python
-from pyflexaudio import FlexAudioSession, SourceType
-from pyflexaudio.types import SpeechStartEvent, SpeechEndEvent
-
-with FlexAudioSession(vad_enabled=True) as session:
-    session.on(SpeechStartEvent, lambda e: print("Speech started"))
-
-    def on_speech_end(e: SpeechEndEvent):
-        print(f"Speech ended — {e.duration_sec:.2f} s, {len(e.audio_data)} frames")
-
-    session.on(SpeechEndEvent, on_speech_end)
-    session.set_source(SourceType.MICROPHONE)
-    session.start()
-
-    input("Listening for speech… press Enter to stop.\n")
-```
-
-### 3. System Audio Capture
-
-```python
-from pyflexaudio import FlexAudioSession, SourceType
-from pyflexaudio.sinks.file import FileSink
-
-with FlexAudioSession() as session:
-    session.add_sink(FileSink("system_audio.wav"))
-    session.set_source(SourceType.SYSTEM_AUDIO)
-    session.start()
-
-    input("Capturing system audio… press Enter to stop.\n")
-```
-
-### 4. Per-Process Audio Capture
-
-```python
-from pyflexaudio import FlexAudioSession, SourceType
-from pyflexaudio.sinks.file import FileSink
-from pyflexaudio.sinks.callback import CallbackSink
-from pyflexaudio.types import AudioChunk
-
-TARGET_PID = 12345  # replace with the target process PID
-
-def on_chunk(chunk: AudioChunk) -> None:
-    print(f"Received {len(chunk.data)} frames from {chunk.source_id}")
-
-with FlexAudioSession() as session:
-    session.add_sink(FileSink("process_audio.wav"))
-    session.add_sink(CallbackSink(on_chunk))
-    session.set_source(SourceType.PROCESS_AUDIO, pid=TARGET_PID)
-    session.start()
-
-    input("Capturing process audio… press Enter to stop.\n")
-```
-
-### 5. Live Source Switching
-
-```python
-import time
-from pyflexaudio import FlexAudioSession, SourceType
-from pyflexaudio.sinks.file import FileSink
-from pyflexaudio.types import SourceSwitchedEvent
-
-with FlexAudioSession() as session:
-    session.on(
-        SourceSwitchedEvent,
-        lambda e: print(f"Switched: {e.old_source_id} → {e.new_source_id}"),
-    )
-    session.add_sink(FileSink("mixed.wav"))
-    session.set_source(SourceType.MICROPHONE)
-    session.start()
-
-    time.sleep(5)
-    print("Switching to system audio…")
-    session.set_source(SourceType.SYSTEM_AUDIO)  # hot-swap while running
-
-    time.sleep(5)
-# Both segments are written to the same WAV file (auto-split on format change)
-```
-
-### 6. Pause / Resume
-
-```python
-import time
-from pyflexaudio import FlexAudioSession, SourceType
-from pyflexaudio.sinks.file import FileSink
-from pyflexaudio.types import LevelEvent
-
-with FlexAudioSession() as session:
-    # LevelEvent keeps firing during pause — useful for VU meters in UI
-    session.on(LevelEvent, lambda e: print(f"Level: {e.db:+.1f} dB", end="\r"))
-
-    session.add_sink(FileSink("output.wav"))
-    session.set_source(SourceType.MICROPHONE)
-    session.start()
-
-    time.sleep(3)
-    print("\nPausing…")
-    session.pause()         # FileSink stops writing; LevelMeterSink stays active
-
-    time.sleep(2)
-    print("Resuming…")
-    session.resume()        # FileSink resumes writing
-
-    time.sleep(3)
+// Pull chunks (interleaved f32) and stream-level events.
+while let Some(chunk) = stream.poll_chunk() {
+    let _ = chunk; // chunk.data, chunk.frames, chunk.peak, chunk.rms, chunk.seq, ...
+}
+while let Some(event) = stream.poll_event() {
+    let _ = event; // ChunkDropped / StreamStalled / PermissionDenied / DeviceLost / Error / ...
+}
+stream.stop();
+# Ok::<(), flexaudio::Error>(())
 ```
 
 ---
 
-## API Reference
+## Public API at a glance
 
-### `FlexAudioSession`
+The facade crate `flexaudio` re-exports everything you need:
 
-```python
-FlexAudioSession(
-    vad_enabled: bool = False,
-    vad_sample_rate: int = 16000,
-    vad_channels: int = 1,
-    source_timeout_sec: float = 10.0,
-    queue_policy: QueuePolicy = QueuePolicy.DROP_OLDEST,
-    queue_size: int = 200,
-)
-```
+- `flexaudio::open(StreamConfig) -> Result<Stream>` — pick a backend by source +
+  OS and build a (not-yet-started) capture stream.
+- `Stream::start` / `Stream::stop` — control capture.
+- `Stream::poll_chunk` / `Stream::poll_event` — pull `AudioChunk`s and `Event`s.
+- `Stream::switch_source` — hot-swap the input source without stopping the
+  stream (chunk `seq` stays continuous; the first chunk after a switch carries a
+  discontinuity flag).
+- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — enumerate available
+  microphones and system sinks in one list.
+- `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style hotplug
+  (added / removed / default-changed) notifications.
+- Re-exported types: `StreamConfig`, `SourceKind`, `OutputFormat`, `AudioChunk`,
+  `ChunkFlags`, `DeviceInfo`, `DeviceEvent`, `Event`, `Error`, `Result`.
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `vad_enabled` | `bool` | `False` | Enable Silero VAD analysis chain |
-| `vad_sample_rate` | `int` | `16000` | Target sample rate for VAD processing |
-| `vad_channels` | `int` | `1` | Target channel count for VAD processing |
-| `source_timeout_sec` | `float` | `10.0` | Timeout waiting for first audio frame |
-| `queue_policy` | `QueuePolicy` | `DROP_OLDEST` | Overflow behaviour (`DROP_OLDEST` or `BACKPRESSURE`) |
-| `queue_size` | `int` | `200` | Internal audio chunk queue depth |
-
-**Methods**
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `set_source` | `(source_type, *, device_index=None, pid=None, mode="include") → None` | Set or hot-swap the audio source |
-| `add_sink` | `(sink) → str` | Add a sink; returns its `sink_id` |
-| `remove_sink` | `(sink_id: str) → None` | Remove a sink by ID |
-| `enable_sink` | `(sink_id: str) → None` | Enable a previously disabled sink |
-| `disable_sink` | `(sink_id: str) → None` | Disable a sink without removing it |
-| `start` | `() → None` | Start the session (idempotent) |
-| `stop` | `() → None` | Stop the session and flush all sinks (idempotent) |
-| `pause` | `() → None` | Pause sink delivery (idempotent) |
-| `resume` | `() → None` | Resume sink delivery (idempotent) |
-| `on` | `(event_type: type, handler) → None` | Register an event handler |
-| `off` | `(event_type: type, handler) → None` | Unregister an event handler |
-
-**Properties**
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `is_running` | `bool` | `True` if state is `RUNNING` or `PAUSED` |
-| `is_paused` | `bool` | `True` if state is `PAUSED` |
-| `current_source_type` | `SourceType \| None` | The currently configured source type |
-| `level_db` | `float \| None` | Latest level (use `LevelEvent` handler for real-time updates) |
-
-Implements the context manager protocol — `stop()` is called automatically on `__exit__`.
+Voice activity detection (`flexaudio-vad`): `Vad::new` / `Vad::process` for
+streaming `SpeechStart` / `SpeechEnd` events, and `get_speech_timestamps` for
+batch segmentation. The Silero VAD model is embedded in the binary, so VAD runs
+fully offline with no runtime model file or network access.
 
 ---
 
-### Sinks
+## OS-specific permission requirements
 
-#### `FileSink`
+flexaudio captures audio; every platform gates this behind user permission. Your
+application is responsible for triggering the relevant prompt / declaring the
+required entitlements.
 
-```python
-FileSink(
-    path: str,
-    sample_rate: int | None = None,
-    channels: int | None = None,
-    *,
-    enabled: bool = True,
-)
-```
+### macOS
 
-| Parameter | Description |
-|-----------|-------------|
-| `path` | Output file path (`.wav`) |
-| `sample_rate` | Target sample rate; `None` uses the source rate |
-| `channels` | Target channel count; `None` uses the source count |
-| `enabled` | Set `False` to skip writing without removing the sink |
+System and per-process audio capture use Core Audio process taps, which are
+gated by the **TCC** privacy subsystem under `kTCCServiceAudioCapture`.
 
-- Output format: WAV PCM int16
-- WAV header is updated every 30 seconds and on `close()` — crash-safe
-- File is split automatically on source format change or when the 4 GB WAV limit is reached (suffix `_002.wav`, `_003.wav`, …)
+- Add a usage-description string to your app's `Info.plist`:
+  ```xml
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>This app records system and application audio.</string>
+  ```
+  (Microphone-only capture additionally requires `NSMicrophoneUsageDescription`.)
+- The OS shows a one-time consent prompt; until the user approves, capture
+  surfaces as a `PermissionDenied` event / error.
+- Process taps require a recent macOS release (Core Audio process-tap API).
 
-#### `CallbackSink`
+### Windows
 
-```python
-CallbackSink(
-    callback: Callable[[AudioChunk], None],
-    *,
-    enabled: bool = True,
-)
-```
+- Microphone capture is gated by the **Microphone** privacy setting
+  (Settings → Privacy & security → Microphone); a denied app yields
+  `PermissionDenied`.
+- System (WASAPI loopback) and per-process loopback capture use the standard
+  WASAPI render-endpoint loopback / process-loopback APIs (Windows 10/11). No
+  special manifest capability is required for a desktop app, but the microphone
+  privacy gate still applies to mic capture.
 
-Calls `callback(chunk)` synchronously on the pipeline thread for every `AudioChunk`. Keep the callback fast; offload heavy work to another thread if needed.
+### Linux
 
-#### `LevelMeterSink`
-
-```python
-LevelMeterSink(event_bus: EventBus)
-```
-
-Managed internally by `FlexAudioSession`. Emits a `LevelEvent` for every chunk, even while the session is paused (`pause_exempt = True`). You do not need to add this sink manually.
+- Microphone capture goes through ALSA/PipeWire via `cpal`; the user must have
+  access to the audio device (typically the `audio` group / a running PipeWire
+  or PulseAudio session).
+- System and per-process capture require a running **PipeWire** session. If
+  PipeWire is absent, `devices()` returns an empty list and `watch_devices()`
+  degrades to a no-op rather than failing. Under a portal-based desktop, the
+  user may be prompted to grant capture access.
 
 ---
 
-### Events
+## Supported Rust version (MSRV)
 
-| Event | Fields | Description |
-|-------|--------|-------------|
-| `LevelEvent` | `db: float`, `source_id: str` | RMS level in dBFS for each chunk |
-| `SpeechStartEvent` | `timestamp: float`, `source_id: str` | VAD detected speech onset |
-| `SpeechEndEvent` | `timestamp: float`, `duration_sec: float`, `audio_data: ndarray`, `source_id: str` | VAD detected speech end; includes raw float32 16 kHz mono audio |
-| `SourceSwitchedEvent` | `old_source_id: str`, `new_source_id: str` | Source hot-swap completed |
-| `DeviceDisconnectedEvent` | `device_info: DeviceInfo` | Capture device was unplugged |
-| `StateChangedEvent` | `old_state: str`, `new_state: str` | Session state machine transition |
-| `ErrorEvent` | `error: FlexAudioError`, `source_id: str` | Non-fatal error in source or sink |
-| `ChunkDroppedEvent` | `drop_count: int`, `queue_size: int`, `source_id: str` | Queue overflow; chunks were dropped |
-| `PermissionDeniedEvent` | `permission_type: str`, `platform: str`, `message: str` | OS permission denied (e.g. microphone access) |
+- **Core / facade / OS backends / mic:** Rust **1.85**.
+- **`flexaudio-vad` and `flexaudio-napi`:** Rust **1.88** (required by their
+  `ort` / `napi-build` toolchain dependencies).
+
+The workspace pins MSRV via `rust-version` in each crate.
 
 ---
 
-### Data Types
+## Versioning policy (SemVer / 0.x)
 
-#### `AudioChunk`
-
-```python
-@dataclass
-class AudioChunk:
-    data: numpy.ndarray   # float32, shape=(frames, channels)
-    timestamp: float      # Unix timestamp of the first frame
-    sample_rate: int
-    channels: int
-    source_id: str        # "{source_type}:{device_index_or_pid}"
-    level_db: float | None
-```
-
-#### `DeviceInfo`
-
-```python
-@dataclass(frozen=True)
-class DeviceInfo:
-    index: int
-    name: str
-    host_api: str
-    max_input_channels: int
-    default_sample_rate: int
-    is_loopback: bool
-```
-
-#### `AudioProcess`
-
-```python
-@dataclass(frozen=True)
-class AudioProcess:
-    pid: int
-    name: str
-    window_title: str
-```
+flexaudio follows [Semantic Versioning](https://semver.org/). While the crate is
+in the **0.x** series, the public API is **not yet stable**: per SemVer, a bump
+of the **minor** version (`0.2 → 0.3`) may contain breaking changes, while
+**patch** bumps (`0.2.0 → 0.2.1`) are backward-compatible. Pin to `0.2` to opt
+into compatible updates only. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
-## Architecture
+## Workspace layout
 
-```
-[Source]                  [Processors]              [Fan-out Sinks]
-MicrophoneSource    ─┐
-SystemAudioSource   ─┼─►  ProcessorChain  ─────────►  FileSink
-ProcessAudioSource  ─┘     (LevelMeter)              ├─► CallbackSink
-                                │                    ├─► LevelMeterSink  (pause_exempt)
-                                └─► Analysis Chain   └─► [custom sinks…]
-                                     (vad_enabled)
-                                      Resample → 16 kHz
-                                      ChannelConvert → Mono
-                                      SileroVAD
-                                       ├─► SpeechStartEvent
-                                       └─► SpeechEndEvent
-```
+| Crate | crates.io | Description |
+|-------|-----------|-------------|
+| `flexaudio` | ✅ | Facade: unified `open()` / `devices()` / `watch_devices()`. |
+| `flexaudio-core` | ✅ | Source-agnostic stream engine, types, resampling/normalizer. |
+| `flexaudio-mic` | ✅ | Microphone backend (cpal), all platforms. |
+| `flexaudio-os-linux` | ✅ | PipeWire system / per-process backend (Linux). |
+| `flexaudio-os-windows` | ✅ | WASAPI loopback / process backend (Windows). |
+| `flexaudio-os-macos` | ✅ | Core Audio process-tap backend (macOS). |
+| `flexaudio-vad` | ✅ | Silero VAD add-on (offline, embedded model). |
+| `flexaudio-cli` | — | Reference CLI / streaming capture tool. |
+| `flexaudio-napi` | — (npm) | Node.js N-API addon (published to npm, not crates.io). |
+| `flexaudio-ffi` | — | C FFI scaffold (placeholder). |
+| `bindings/pyflexaudio` | — | PyO3 Python binding scaffold (placeholder). |
 
-**Key design points**
-
-- **Internal format** — All audio is carried as `float32` 2-D arrays `(frames, channels)` throughout the pipeline.
-- **One device = one stream** — Each source opens exactly one OS-level audio stream.
-- **Pipeline thread** — A dedicated non-daemon thread drains the chunk queue and dispatches to sinks, keeping the capture callback free.
-- **Partial failure isolation** — Each sink is wrapped in a try/except; one failing sink does not interrupt the others.
-
----
-
-## CLI
-
-List available audio devices:
-
-```bash
-pyflexaudio devices
-```
-
-Check platform capabilities and optional dependency status:
-
-```bash
-pyflexaudio check
-```
+> The previous pure-Python `pyflexaudio` package documentation has moved to
+> [`README.python.md`](README.python.md) / [`README.python.ja.md`](README.python.ja.md).
+> This repository is now the Rust workspace; the Python package is being
+> re-implemented on top of these crates.
 
 ---
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) © 2026 tsubome / Aratech.
+
+This project bundles / links third-party software (Silero VAD model, ONNX
+Runtime, PipeWire, and permissively-licensed Rust crates). See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the required notices.

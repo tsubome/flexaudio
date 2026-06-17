@@ -3,7 +3,14 @@ name = "flexaudio-napi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
+# napi-build / napi-derive のツールチェインが rustc 1.88 を要求するため、workspace
+# の 1.85 を個別に上書きする（虚偽 MSRV 宣言の是正）。
+rust-version = "1.88"
+authors.workspace = true
+repository.workspace = true
+description = "Node.js (N-API) addon for flexaudio. Distributed via npm, not crates.io."
+# cdylib は crates.io ではライブラリとして消費できない（npm 配布）。
+publish = false
 
 # Node.js (N-API) addon。WhisperApp(TS/Electron) が flexaudio をインプロセスで
 # 叩く第二経路（第一は CLI パイプ）。cdylib として .node にリネームして読み込む。

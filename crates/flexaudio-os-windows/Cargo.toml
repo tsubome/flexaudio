@@ -4,12 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Windows system and per-process audio capture backend (WASAPI loopback) for flexaudio."
+keywords = ["audio", "wasapi", "loopback", "capture", "windows"]
+categories = ["multimedia::audio", "os::windows-apis"]
+documentation = "https://docs.rs/flexaudio-os-windows"
 
 # このクレートは Windows 専用。非 Windows では lib.rs が
 # `#![cfg(target_os = "windows")]` で空コンパイルになり、windows 依存も以下の
 # target 限定セクションでのみ引かれる（Linux/macOS ビルドは無傷）。
 [target.'cfg(target_os = "windows")'.dependencies]
-flexaudio-core = { path = "../flexaudio-core" }
+flexaudio-core = { path = "../flexaudio-core", version = "0.2.0" }
 
 # windows は cpal（flexaudio-mic 経由）と同一解決を保証するため =0.54.0 にピン。
 # feature は自前列挙（cargo は union するので過不足なく WASAPI / process loopback /
