@@ -26,6 +26,7 @@
 //! でのみ引かれる（Linux/Windows ビルドは無傷）。
 
 #![cfg(target_os = "macos")]
+#![warn(missing_docs)]
 
 mod common;
 mod process;

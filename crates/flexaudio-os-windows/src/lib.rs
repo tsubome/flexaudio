@@ -24,6 +24,7 @@
 //! `windows` 依存も `Cargo.toml` の `target.'cfg(...windows)'` セクションでのみ引かれる。
 
 #![cfg(target_os = "windows")]
+#![warn(missing_docs)]
 
 mod common;
 mod process;

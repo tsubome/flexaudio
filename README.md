@@ -103,12 +103,15 @@ The facade crate `flexaudio` re-exports everything you need:
 - `Stream::switch_source` — hot-swap the input source without stopping the
   stream (chunk `seq` stays continuous; the first chunk after a switch carries a
   discontinuity flag).
-- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — enumerate available
-  microphones and system sinks in one list.
+- `flexaudio::devices() -> Result<Vec<DeviceInfo>>` — enumerate available audio
+  devices in one list (Linux: also lists system sinks; Windows/macOS: input
+  devices only for now).
 - `flexaudio::watch_devices() -> Result<DeviceWatcher>` — pull-style hotplug
-  (added / removed / default-changed) notifications.
-- Re-exported types: `StreamConfig`, `SourceKind`, `OutputFormat`, `AudioChunk`,
-  `ChunkFlags`, `DeviceInfo`, `DeviceEvent`, `Event`, `Error`, `Result`.
+  (added / removed / default-changed) notifications (Linux only; Windows/macOS
+  return a no-op watcher).
+- Re-exported types: `StreamConfig`, `SourceKind`, `ProcessMode`, `OutputFormat`,
+  `AudioChunk`, `ChunkFlags`, `DeviceInfo`, `DeviceEvent`, `Event`, `Error`,
+  `Result`.
 
 Voice activity detection (`flexaudio-vad`): `Vad::new` / `Vad::process` for
 streaming `SpeechStart` / `SpeechEnd` events, and `get_speech_timestamps` for
@@ -136,7 +139,7 @@ gated by the **TCC** privacy subsystem under `kTCCServiceAudioCapture`.
   (Microphone-only capture additionally requires `NSMicrophoneUsageDescription`.)
 - The OS shows a one-time consent prompt; until the user approves, capture
   surfaces as a `PermissionDenied` event / error.
-- Process taps require a recent macOS release (Core Audio process-tap API).
+- Process taps require macOS 14.4 or later.
 
 ### Windows
 

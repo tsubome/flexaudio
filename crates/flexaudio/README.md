@@ -49,6 +49,9 @@ Audio capture requires user consent: macOS TCC (`kTCCServiceAudioCapture`, add
 setting, and a running PipeWire session on Linux for system/process capture. See
 the [workspace README](https://github.com/tsubome/pyflexaudio#os-specific-permission-requirements).
 
+On macOS, system/process loopback (Core Audio process taps) requires macOS 14.4
+or later.
+
 ## MSRV
 
 Rust **1.85**.

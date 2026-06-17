@@ -67,6 +67,9 @@ Audio capture requires OS-level consent: macOS TCC
 session on Linux for system / per-process capture. See the
 [workspace README](https://github.com/tsubome/pyflexaudio#os-specific-permission-requirements).
 
+On macOS, system / per-process loopback (Core Audio process taps) requires
+macOS 14.4 or later.
+
 ## License
 
 [MIT](LICENSE) © 2026 tsubome / Aratech. This package redistributes native code

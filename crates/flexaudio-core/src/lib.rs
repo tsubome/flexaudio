@@ -6,8 +6,11 @@
 //! 実装する別 crate（`flexaudio-os-*`）が担い、facade 層が両者を配線する。
 //!
 //! # 固定契約（逸脱不可）
-//! - 出力 [`AudioChunk`]: **interleaved `f32` / 48000 Hz / ステレオ 2ch /
-//!   20ms = 960 frames/chunk**。
+//! - **内部正規形**: [`AudioChunk`] は **interleaved `f32` / 48000 Hz /
+//!   ステレオ 2ch / 20ms = 960 frames/chunk**。これは内部処理の正規形であり、
+//!   外部出力のレート/チャンネルは [`OutputFormat`] で変更
+//!   できる（Normalizer 第 2 段が再変換。例 16k/1ch は 320 frames/chunk）。
+//!   出力チャンクは常に時間ベース 20ms 固定。
 //! - **プル型**: 公開 API にコールバックを置かない。RT スレッドは push のみ、
 //!   消費側は poll。
 //! - RT 経路は非ブロッキング（DROP_OLDEST / overflow ドロップ）、デバイス由来 PTS +

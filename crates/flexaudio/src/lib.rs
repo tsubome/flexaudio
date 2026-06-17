@@ -115,10 +115,13 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 /// - ProcessLoopback で `target_pid` 欠落 → [`Error::InvalidArg`]
 ///   （[`ProcessMode::Exclude`] でも `target_pid` 必須）。
 /// - 当該 OS で非対応のソース（Linux/Windows/macOS 以外の system/process）→ [`Error::Unsupported`]。
-/// - **Linux** で process [`ProcessMode::Exclude`] / system `exclude_self=true` を要求すると
-///   `start` 時に [`Error::Unsupported`]（黙殺でなく明示エラー。Wave F で実装予定。
-///   Include / `exclude_self=false` は無変更で回帰ゼロ）。
 /// - その他は [`Stream::open`] 由来（`ring_capacity_chunks == 0` 等）。
+///
+/// # 除外（Exclude / exclude_self）
+/// process [`ProcessMode::Exclude`]（対象 PID 以外の全システム音）/ system
+/// `exclude_self=true`（自プロセスを除外）は **Linux / Windows / macOS の 3 OS とも対応**。
+/// Linux は PipeWire の対象外ノード fan-in、Windows/macOS は各 OS のネイティブ PID 除外で
+/// 実現する。Include / `exclude_self=false` は除外せず対象そのものを録る。
 ///
 /// # 例
 /// ```no_run

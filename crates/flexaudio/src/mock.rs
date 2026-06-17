@@ -149,6 +149,7 @@ impl Drop for MockBackend {
 ///
 /// `start()` 呼び出し回数を共有 [`AtomicU32`] で数え、世代 0（初回）でのみ stall する。
 /// テスト用途のみ（公開 API ではない）。
+#[doc(hidden)]
 pub struct StallableMockBackend {
     sample_rate: u32,
     channels: u16,

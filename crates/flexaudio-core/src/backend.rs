@@ -38,6 +38,13 @@ impl RawSink {
     /// ここでは生フレームのみを渡す。`pts_ns` は将来の配線でフレームに対応付ける
     /// ため、バックエンドが用意できる場合に渡す（現状の生リングはサンプルのみを
     /// 運ぶため、PTS は配線層が別途取り回す）。
+    ///
+    /// # 実装者の契約
+    /// `push` は backend の **RT（リアルタイム）コールバックから呼ばれる**ことを
+    /// 想定する。独自 backend を実装する場合、push を呼ぶ経路は
+    /// **ヒープ確保・ロック・ブロッキング・システムコールを行わない**こと（RT 安全）。
+    /// flexaudio 同梱の backend が守っている不変条件であり、独自 backend 実装者も
+    /// 同様に守る必要がある。
     pub fn push(&mut self, interleaved: &[f32], pts_ns: i64) -> usize {
         let _ = pts_ns;
         self.producer.push_slice(interleaved)
@@ -65,6 +72,20 @@ impl RawSink {
 /// 取得して [`Normalizer`](crate::normalizer) を構成し、[`start`](Self::start) に
 /// [`RawSink`] を渡してキャプチャを開始する。バックエンドは自身の RT コールバック
 /// 内で `sink.push(...)` を呼ぶ。
+///
+/// facade の `Stream::open` に `Box<dyn CaptureBackend>` を渡せば、独自 backend を
+/// 差し込める公開拡張点である。
+///
+/// # 実装者の契約
+/// 独自 backend を実装する場合、以下を守ること（flexaudio 同梱 backend が守っている
+/// 不変条件であり、独自実装も同様に守る必要がある）:
+/// - **キャプチャスレッド / RT コールバックで panic させない**（panic するとキャプチャが
+///   静かに停止しうる）。
+/// - RT コールバックからの [`RawSink::push`] は RT 安全に呼ぶ
+///   （ヒープ確保・ロック・ブロッキング・システムコールなし。詳細は
+///   [`RawSink::push`] の契約を参照）。
+/// - `start` / `stop` は **冪等**にする（既に動作中での二重 `start` は no-op で `Ok`、
+///   未起動での `stop` も no-op。同梱 backend の規約）。
 pub trait CaptureBackend: Send {
     /// バックエンドのネイティブフォーマット `(sample_rate, channels)`。
     fn native_format(&self) -> (u32, u16);

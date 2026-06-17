@@ -57,5 +57,8 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
