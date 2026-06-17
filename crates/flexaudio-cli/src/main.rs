@@ -59,9 +59,9 @@ use flexaudio::Stream;
 enum SourceArg {
     /// 既定マイク入力。
     Mic,
-    /// システム出力ループバック（Linux / Windows）。
+    /// システム出力ループバック（Linux / Windows / macOS）。
     System,
-    /// プロセス出力ループバック（Linux / Windows・`--process-id <PID>` 必須）。
+    /// プロセス出力ループバック（Linux / Windows / macOS・`--process-id <PID>` 必須）。
     Process,
 }
 
@@ -103,7 +103,7 @@ struct Cli {
     #[arg(long)]
     sources: Option<String>,
 
-    /// `--source process` の対象プロセス PID（Linux / Windows・process では必須）。
+    /// `--source process` の対象プロセス PID（Linux / Windows / macOS・process では必須）。
     /// 対象 PID のアプリ出力ノードへ fan-out リンクして複製で録る（非侵襲：
     /// ユーザーのスピーカーは鳴ったまま）。対象が後から鳴り始めるのは正常系。
     #[arg(long)]
@@ -191,27 +191,27 @@ fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
         let kind = match src.trim() {
             "mic" => SourceKind::Mic,
             "system" => {
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                 {
                     SourceKind::SystemLoopback
                 }
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
                 {
                     return Err(
-                        "--sources の system（システム出力ループバック）は現在 Linux / Windows のみ対応です。"
+                        "--sources の system（システム出力ループバック）は現在 Linux / Windows / macOS のみ対応です。"
                             .into(),
                     );
                 }
             }
             "process" => {
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                 {
                     SourceKind::ProcessLoopback
                 }
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
                 {
                     return Err(
-                        "--sources の process（プロセス出力ループバック）は現在 Linux / Windows のみ対応です。"
+                        "--sources の process（プロセス出力ループバック）は現在 Linux / Windows / macOS のみ対応です。"
                             .into(),
                     );
                 }
@@ -406,17 +406,17 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         match cli.source {
         SourceArg::Mic => (SourceKind::Mic, "mic（既定入力デバイス）"),
         SourceArg::System => {
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             {
                 (
                     SourceKind::SystemLoopback,
                     "system（既定出力の monitor / PipeWire）",
                 )
             }
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
                 return Err(
-                    "--source system（システム出力ループバック）は現在 Linux / Windows のみ対応です。"
+                    "--source system（システム出力ループバック）は現在 Linux / Windows / macOS のみ対応です。"
                         .into(),
                 );
             }
@@ -433,17 +433,17 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
                         .into(),
                 );
             }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             {
                 (
                     SourceKind::ProcessLoopback,
                     "process（特定 PID 出力の fan-out / PipeWire）",
                 )
             }
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
                 return Err(
-                    "--source process（プロセス出力ループバック）は現在 Linux / Windows のみ対応です。"
+                    "--source process（プロセス出力ループバック）は現在 Linux / Windows / macOS のみ対応です。"
                         .into(),
                 );
             }

@@ -17,3 +17,7 @@ flexaudio-os-linux = { path = "../flexaudio-os-linux" }
 # システム/プロセスループバック（WASAPI）を束ねる（Windows のみ）。
 [target.'cfg(target_os = "windows")'.dependencies]
 flexaudio-os-windows = { path = "../flexaudio-os-windows" }
+
+# システム/プロセスループバック（CoreAudio Process Taps）を束ねる（macOS のみ）。
+[target.'cfg(target_os = "macos")'.dependencies]
+flexaudio-os-macos = { path = "../flexaudio-os-macos" }

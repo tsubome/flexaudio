@@ -150,11 +150,13 @@ pub fn open(config: StreamConfig) -> Result<Stream> {
 ///   id は [`devices`] が返す安定 ID = デバイス名。不一致は `start` 時に
 ///   [`Error::DeviceNotFound`]）。device_id は **mic のみ**に効く
 ///   （system/process は既定 render / target_pid 固定で device_id を見ない）。
-/// - [`SourceKind::SystemLoopback`] → Linux のみ
-///   [`flexaudio_os_linux::PwSystemBackend`]。非 Linux は [`Error::Unsupported`]。
-/// - [`SourceKind::ProcessLoopback`] → Linux のみ
-///   [`flexaudio_os_linux::PwProcessBackend`]（`target_pid` 必須・欠落で
-///   [`Error::InvalidArg`]）。非 Linux は [`Error::Unsupported`]。
+/// - [`SourceKind::SystemLoopback`] → Linux/Windows/macOS 対応
+///   （Linux=[`flexaudio_os_linux::PwSystemBackend`] / Windows=WASAPI loopback /
+///   macOS=CoreAudio Process Tap）。非対応 OS は [`Error::Unsupported`]。
+/// - [`SourceKind::ProcessLoopback`] → Linux/Windows/macOS 対応
+///   （Linux=[`flexaudio_os_linux::PwProcessBackend`] / Windows=WASAPI process loopback /
+///   macOS=CoreAudio Process Tap）。`target_pid` 必須・欠落で [`Error::InvalidArg`]。
+///   非対応 OS は [`Error::Unsupported`]。
 pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBackend>> {
     // Error は全 OS の分岐で使う（Linux/Windows は InvalidArg、その他は Unsupported）。
     // どの cfg でも参照されるため、関数頭で素直に use する（unused 警告は出ない）。
@@ -165,7 +167,7 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
         // （None=既定入力デバイス。id は devices() が返す安定 ID = デバイス名）。
         SourceKind::Mic => Box::new(flexaudio_mic::CpalMicBackend::new(config.device_id.clone())),
 
-        // システム出力ループバックは Linux / Windows 対応。
+        // システム出力ループバックは Linux / Windows / macOS 対応。
         SourceKind::SystemLoopback => {
             #[cfg(target_os = "linux")]
             {
@@ -175,15 +177,19 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
             {
                 Box::new(flexaudio_os_windows::WasapiSystemBackend::new())
             }
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(target_os = "macos")]
+            {
+                Box::new(flexaudio_os_macos::MacSystemBackend::new())
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
                 return Err(Error::Unsupported);
             }
         }
 
-        // プロセス出力ループバックは Linux / Windows 対応・target_pid 必須。
+        // プロセス出力ループバックは Linux / Windows / macOS 対応・target_pid 必須。
         SourceKind::ProcessLoopback => {
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             {
                 let pid = config.target_pid.ok_or_else(|| {
                     Error::InvalidArg("ProcessLoopback には target_pid が必要".into())
@@ -202,8 +208,15 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
                         config.exclude_self,
                     ))
                 }
+                #[cfg(target_os = "macos")]
+                {
+                    Box::new(flexaudio_os_macos::MacProcessBackend::new(
+                        pid,
+                        config.exclude_self,
+                    ))
+                }
             }
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
                 return Err(Error::Unsupported);
             }

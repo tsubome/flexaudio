@@ -5,4 +5,30 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[dependencies]
+# このクレートは macOS 専用。非 macOS では lib.rs が
+# `#![cfg(target_os = "macos")]` で空コンパイルになり、objc2 系依存も以下の
+# target 限定セクションでのみ引かれる（Linux/Windows ビルドは無傷）。
+#
+# 版は Cargo.lock の既存ピン（cpal が引く objc2 系）に正確一致させ、重複
+# コンパイルを避ける。
+[target.'cfg(target_os = "macos")'.dependencies]
+flexaudio-core = { path = "../flexaudio-core" }
+objc2 = "=0.6.4"
+objc2-foundation = { version = "=0.3.2", features = [
+    "NSArray",
+    "NSValue",
+    "NSString",
+    "NSUUID",
+    "NSDictionary",
+] }
+# default features に AudioHardware / objc2-core-audio-types 等を含む。
+objc2-core-audio = "=0.3.2"
+objc2-core-audio-types = "=0.3.2"
+objc2-core-foundation = { version = "=0.3.2", features = [
+    "CFDictionary",
+    "CFString",
+    "CFNumber",
+    "CFArray",
+    "CFBase",
+] }
+block2 = "=0.6.2"
