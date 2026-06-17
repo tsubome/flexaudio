@@ -19,7 +19,7 @@ use objc2_core_audio::{
     kAudioObjectPropertyScopeGlobal, kAudioObjectSystemObject, kAudioTapPropertyFormat,
     AudioObjectGetPropertyData, AudioObjectID, AudioObjectPropertyAddress,
 };
-use objc2_core_audio_types::AudioStreamBasicDescription;
+use objc2_core_audio_types::{kAudioFormatFlagIsFloat, AudioStreamBasicDescription};
 
 /// CoreAudio の `OSStatus` 成功値（= `noErr`）。0 が成功。
 pub(crate) const NO_ERR: i32 = 0;
@@ -111,10 +111,11 @@ pub(crate) fn translate_pid_to_object(pid: i32) -> Result<AudioObjectID, Error> 
     Ok(out_object)
 }
 
-/// tap の `kAudioTapPropertyFormat`（ASBD）から `(sample_rate, channels)` を読む。
+/// tap の `kAudioTapPropertyFormat`（ASBD）を読む共通ヘルパ。
 ///
 /// 取得できなければ `None`（呼び出し側がフォールバックを使う・panic しない）。
-pub(crate) fn tap_native_format(tap_id: AudioObjectID) -> Option<(u32, u16)> {
+/// rate/channels と `mFormatFlags`（float 判定）の双方を読む元として使う。
+fn read_tap_asbd(tap_id: AudioObjectID) -> Option<AudioStreamBasicDescription> {
     let address = global_address(kAudioTapPropertyFormat);
     // ASBD は plain-old-data。ゼロ初期化してから OS に埋めさせる（Default 未実装）。
     // SAFETY: AudioStreamBasicDescription は数値フィールドのみの `#[repr(C)]` POD。
@@ -135,12 +136,37 @@ pub(crate) fn tap_native_format(tap_id: AudioObjectID) -> Option<(u32, u16)> {
     if status != NO_ERR {
         return None;
     }
+    Some(asbd)
+}
+
+/// tap の `kAudioTapPropertyFormat`（ASBD）から `(sample_rate, channels)` を読む。
+///
+/// 取得できなければ `None`（呼び出し側がフォールバックを使う・panic しない）。
+pub(crate) fn tap_native_format(tap_id: AudioObjectID) -> Option<(u32, u16)> {
+    let asbd = read_tap_asbd(tap_id)?;
     let rate = asbd.mSampleRate as u32;
     let channels = asbd.mChannelsPerFrame as u16;
     if rate == 0 || channels == 0 {
         return None;
     }
     Some((rate, channels))
+}
+
+/// tap の ASBD が **float サンプル**（`kAudioFormatFlagIsFloat`）であることを検証する。
+///
+/// IOProc では `mData as *const f32` でサンプルをそのまま f32 として読むため、tap が
+/// 非 float（int PCM 等）だと UB になり得る。そこで build 時にこの判定を行い、
+/// **float でないと確定した場合のみ** `Some(false)` を返す。ASBD を取得できなかった
+/// （`None`）場合は「検証できない」を表し、呼び出し側はフォールバック挙動（従来どおり
+/// float 決め打ち）を続ける（実機の tap は float 常態のため、取得不能で弾かない）。
+///
+/// 返り値:
+/// - `Some(true)`  : ASBD を読めて float ビットが立っている（安全）。
+/// - `Some(false)` : ASBD を読めたが float ビットが無い（非 float = 危険、弾くべき）。
+/// - `None`        : ASBD を取得できなかった（判定不能 = 従来挙動を継続）。
+pub(crate) fn tap_format_is_float(tap_id: AudioObjectID) -> Option<bool> {
+    let asbd = read_tap_asbd(tap_id)?;
+    Some((asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0)
 }
 
 #[cfg(test)]

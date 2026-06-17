@@ -16,6 +16,7 @@
 //! [`RawPropVariant`] を自前定義し、`transmute` で `from_raw` へ渡す
 //! （C-bis 第 2 候補）。
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -81,6 +82,12 @@ const VT_BLOB_U16: u16 = 65;
 // コンパイル時にレイアウト（24 バイト / 8 バイトアライン）を SDK PROPVARIANT と
 // 一致させていることを保証する。`PROPVARIANT` 自体のサイズとも突き合わせる
 // （生 imp::PROPVARIANT の薄ラッパなので同サイズのはず）。
+//
+// 【x64 / aarch64 専用】このミラーは 64bit ポインタ前提の **24 バイト** レイアウト
+// （value union が「u32 カウント + ポインタ」型で 16 バイト）。32bit ターゲットでは
+// ポインタが 4 バイトとなり PROPVARIANT のサイズ/アライン/パディングが相違するため、
+// 以下の const assert が **意図的にコンパイル不可（=ビルド時に検出）** にする。
+// pyflexaudio の Windows サポートは 64bit のみ（x86_64 / aarch64）。
 const _: () = {
     assert!(core::mem::size_of::<RawPropVariant>() == 24);
     assert!(core::mem::align_of::<RawPropVariant>() == 8);
@@ -144,9 +151,12 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler {
         &self,
         _operation: Option<&IActivateAudioInterfaceAsyncOperation>,
     ) -> windows::core::Result<()> {
-        unsafe {
+        // これは **OS（WASAPI の activation 基盤）が呼ぶ FFI 境界コールバック**。境界を
+        // 越える panic は UB なので本体を catch_unwind で包む（defense-in-depth。現状
+        // SetEvent のみで panic-free だが将来の変更に対する堅牢化）。
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
             let _ = SetEvent(self.done);
-        }
+        }));
         Ok(())
     }
 }

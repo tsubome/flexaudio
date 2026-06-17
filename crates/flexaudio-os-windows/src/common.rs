@@ -8,6 +8,7 @@
 //! 「フォーマットの決め方（`GetMixFormat` vs 固定 WAVEFORMATEX）」だけで、
 //! Initialize〜GetService〜Start〜キャプチャ〜Stop は共通化できる。
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -141,7 +142,17 @@ pub(crate) unsafe fn capture_loop(
 ) {
     let channels = channels.max(1) as usize;
     // 無音フラグ時に 0 を流すための再利用バッファ（RT 経路でのアロケート回避）。
+    // **キャプチャループ前（= Start 前・非 RT 相当のセットアップ局面）に最大想定長で
+    // 事前確保**する。1 パケットが返し得る最大フレーム数はエンジンのバッファサイズ
+    // （`GetBufferSize`）が上限なので、`buffer_frames * channels` ぶん確保しておけば
+    // ループ内の `resize` は容量内 no-op になり、初回/拡大ヒープアロケートが起きない
+    // （`GetBufferSize` 取得失敗時のみ空のまま＝従来どおりループ内初回 resize にフォール
+    // バックするが、これは異常系のみ）。
     let mut silence: Vec<f32> = Vec::new();
+    if let Ok(buffer_frames) = client.GetBufferSize() {
+        let max_silence = (buffer_frames as usize).saturating_mul(channels);
+        silence.resize(max_silence, 0.0);
+    }
 
     if client.Start().is_err() {
         // Start に失敗したら何もせず戻る（setup 側で既に Start 済みのため通常来ない）。
@@ -182,18 +193,24 @@ pub(crate) unsafe fn capture_loop(
             }
 
             let n = frames as usize * channels;
-            if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
-                // 無音: 0 を n 個 push（下流のギャップ判定/DC 化防止のため）。
-                if silence.len() < n {
-                    silence.resize(n, 0.0);
+            // push 経路を catch_unwind で包む（このループは自前スレッドで FFI 境界では
+            // ないが、万一 `RawSink::push` 等が panic しても unwind でループを抜けて
+            // `ReleaseBuffer` / `client.Stop()` / `CloseHandle` のクリーンアップを飛ばさない
+            // ための defense-in-depth）。捕捉しても処理は続行する。
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
+                    // 無音: 0 を n 個 push（下流のギャップ判定/DC 化防止のため）。
+                    if silence.len() < n {
+                        silence.resize(n, 0.0);
+                    }
+                    if n > 0 {
+                        sink.push(&silence[..n], now_ns());
+                    }
+                } else if !pdata.is_null() && n > 0 {
+                    let slice = std::slice::from_raw_parts(pdata as *const f32, n);
+                    sink.push(slice, now_ns());
                 }
-                if n > 0 {
-                    sink.push(&silence[..n], now_ns());
-                }
-            } else if !pdata.is_null() && n > 0 {
-                let slice = std::slice::from_raw_parts(pdata as *const f32, n);
-                sink.push(slice, now_ns());
-            }
+            }));
 
             // 取得した frames を必ず解放する（成功/失敗を問わず frames を渡す）。
             let _ = capture.ReleaseBuffer(frames);
