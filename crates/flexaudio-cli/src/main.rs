@@ -22,10 +22,9 @@
 //! process と system の概念は別フラグに分けてある（混ぜない）:
 //! - `--mode include|exclude`（process 専用・既定 include）: include=対象 PID だけ録る /
 //!   exclude=対象 PID 以外の全システム音を録る（`--process-id` 必須）。
-//! - `--exclude-self`（system 専用）: システム音から自ホスト（自プロセス）の音を除く
+//! - `--exclude-self`（system 専用）: システム音から自プロセスの再生音を除く
 //!   （フィードバック防止）。
 //!   process ソースは `--exclude-self` を、system ソースは `--mode` を無視する。
-//!   Linux では `--mode exclude` / `--exclude-self` はどちらも未実装で `Error::Unsupported`。
 //!
 //! ```text
 //! flexaudio-cli --list-devices
@@ -101,10 +100,7 @@ enum EncodingArg {
 
 /// flexaudio キャプチャ CLI。
 #[derive(Debug, Parser)]
-#[command(
-    name = "flexaudio-cli",
-    about = "flexaudio キャプチャ CLI（実機テスト用）"
-)]
+#[command(name = "flexaudio-cli", about = "flexaudio キャプチャ CLI")]
 struct Cli {
     /// 録音せず、利用可能なオーディオデバイスを一覧表示して終了する
     /// （`devices()` の統合列挙。`--source` 等とは独立に動く）。
@@ -116,7 +112,7 @@ struct Cli {
     #[arg(long)]
     watch_devices: bool,
 
-    /// キャプチャするソース（mic / system\[Linux\] / process\[Linux\]）。
+    /// キャプチャするソース（mic / system / process）。
     #[arg(long, value_enum, default_value_t = SourceArg::Mic)]
     source: SourceArg,
 
@@ -148,16 +144,14 @@ struct Cli {
 
     /// `--source process` の対象 PID の扱い（process 専用・既定 include）。
     /// `include`=対象 PID だけ録る / `exclude`=対象 PID 以外の全システム音を録る
-    /// （`--process-id` 必須）。mic / system では無視される。対象を除外したい用途は
-    /// `--mode exclude` を使う（旧 `--exclude-self` の対象除外用途ではない）。Linux では
-    /// `exclude` は未実装で `Error::Unsupported`。
+    /// （`--process-id` 必須・Linux / Windows / macOS 対応）。mic / system では無視される。
+    /// 対象を除外したい用途は `--mode exclude` を使う（自プロセス除外用途ではない）。
     #[arg(long, value_enum, default_value_t = ModeArg::Include)]
     mode: ModeArg,
 
-    /// システム音から自ホスト（自プロセス）の再生音を除く（system 専用・フィードバック
-    /// ループ防止）。`--source system` でのみ効き、mic / process では無視。対象 PID の
-    /// 除外用途は `--mode exclude` へ移したので、このフラグは自ホスト除外専用。Linux では
-    /// 未実装で `Error::Unsupported`（Windows/macOS は OS プリミティブで対応）。
+    /// システム音から自プロセスの再生音を除く（system 専用・フィードバック
+    /// ループ防止・Linux / Windows / macOS 対応）。`--source system` でのみ効き、
+    /// mic / process では無視。対象 PID の除外用途は `--mode exclude` を使う。
     #[arg(long, default_value_t = false)]
     exclude_self: bool,
 
@@ -429,8 +423,8 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         let first = segs[0].kind;
         let label = match first {
             SourceKind::Mic => "mic（既定入力デバイス）",
-            SourceKind::SystemLoopback => "system（既定出力の monitor / PipeWire）",
-            SourceKind::ProcessLoopback => "process（特定 PID 出力の fan-out / PipeWire）",
+            SourceKind::SystemLoopback => "system（既定出力のループバック）",
+            SourceKind::ProcessLoopback => "process（指定 PID の出力）",
         };
         (first, label)
     } else {
@@ -441,7 +435,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
                 {
                     (
                         SourceKind::SystemLoopback,
-                        "system（既定出力の monitor / PipeWire）",
+                        "system（既定出力のループバック）",
                     )
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
@@ -464,10 +458,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
                 }
                 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
                 {
-                    (
-                        SourceKind::ProcessLoopback,
-                        "process（特定 PID 出力の fan-out / PipeWire）",
-                    )
+                    (SourceKind::ProcessLoopback, "process（指定 PID の出力）")
                 }
                 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
                 {
@@ -573,8 +564,8 @@ fn list_devices() -> std::result::Result<(), String> {
     if devices.is_empty() {
         println!("利用可能なオーディオデバイスが見つかりませんでした。");
         println!(
-            "（PipeWire/オーディオデバイスのある実機で実行してください。\
-             Linux は system 列挙に PipeWire セッションが必要です。）"
+            "（オーディオデバイスのある環境で実行してください。\
+             Linux で system を列挙するには PipeWire セッションが必要です。）"
         );
         return Ok(());
     }
