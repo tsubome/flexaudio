@@ -790,3 +790,281 @@ fn sleep_interruptible(shared: &Arc<SharedState>, dur: Duration) {
         remaining = remaining.saturating_sub(s);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mock::{MockBackend, StallableMockBackend};
+    use std::time::Instant;
+
+    /// 期限まで poll_chunk しながらチャンクを集めるヘルパ。
+    fn collect_for(stream: &mut Stream, dur: Duration) -> Vec<AudioChunk> {
+        let mut chunks = Vec::new();
+        let start = Instant::now();
+        while start.elapsed() < dur {
+            while let Some(c) = stream.poll_chunk() {
+                chunks.push(c);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        chunks
+    }
+
+    /// `条件 cond` が真になるまで（最大 `timeout`）待つ。真になれば true。
+    fn wait_until<F: FnMut() -> bool>(mut cond: F, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    /// `Stream::open` の結果から Err を取り出す（`Stream` は `Debug` 非実装のため
+    /// `expect_err` が使えない）。Ok だった場合はメッセージ付きで panic する。
+    fn open_err(result: Result<Stream>, ctx: &str) -> Error {
+        match result {
+            Ok(_) => panic!("{ctx}: エラーを期待したが Ok だった"),
+            Err(e) => e,
+        }
+    }
+
+    // --- 入力検証（Stream::open のエラー経路） ---
+
+    /// `ring_capacity_chunks == 0` は InvalidArg で弾かれる（リング容量 0 は不正）。
+    #[test]
+    fn open_rejects_zero_ring_capacity() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let config = StreamConfig {
+            ring_capacity_chunks: 0,
+            ..Default::default()
+        };
+        let err = open_err(Stream::open(config, backend), "容量 0");
+        assert!(
+            matches!(err, Error::InvalidArg(_)),
+            "InvalidArg のはず: {err:?}"
+        );
+    }
+
+    /// 非対応の出力フォーマット（channels=3）は validate 失敗で UnsupportedFormat。
+    #[test]
+    fn open_rejects_invalid_output_channels() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let config = StreamConfig {
+            output: OutputFormat {
+                sample_rate: 48_000,
+                channels: 3,
+            },
+            ..Default::default()
+        };
+        let err = open_err(Stream::open(config, backend), "ch=3");
+        assert!(
+            matches!(err, Error::UnsupportedFormat(_)),
+            "UnsupportedFormat のはず: {err:?}"
+        );
+    }
+
+    /// 極端な出力レート（範囲外）も UnsupportedFormat で弾かれる。
+    #[test]
+    fn open_rejects_out_of_range_output_rate() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let config = StreamConfig {
+            output: OutputFormat {
+                sample_rate: 1_000_000,
+                channels: 2,
+            },
+            ..Default::default()
+        };
+        let err = open_err(Stream::open(config, backend), "極端なレート");
+        assert!(
+            matches!(err, Error::UnsupportedFormat(_)),
+            "UnsupportedFormat のはず: {err:?}"
+        );
+    }
+
+    /// backend の native_format が 0（rate=0 / ch=0）なら InvalidArg で弾かれる。
+    #[test]
+    fn open_rejects_zero_native_format() {
+        // MockBackend::new は内部で max(1) するため 0 を作れない。テスト専用の
+        // ゼロ native_format バックエンドを定義して検証する。
+        struct ZeroFormatBackend;
+        impl CaptureBackend for ZeroFormatBackend {
+            fn native_format(&self) -> (u32, u16) {
+                (0, 0)
+            }
+            fn start(&mut self, _sink: RawSink) -> Result<()> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+        }
+        let backend = Box::new(ZeroFormatBackend);
+        let err = open_err(
+            Stream::open(StreamConfig::default(), backend),
+            "native_format 0",
+        );
+        assert!(
+            matches!(err, Error::InvalidArg(_)),
+            "InvalidArg のはず: {err:?}"
+        );
+    }
+
+    // --- poll_event（pull 型イベント取得） ---
+
+    /// `poll_event` でイベントが pull 型で取れる。ChunkRing 容量を極小にして
+    /// DROP_OLDEST を強制し、`Event::ChunkDropped` が poll_event で観測できることを確認。
+    #[test]
+    fn poll_event_yields_chunk_dropped() {
+        // 容量 1 + ほとんど poll しない → 速やかに DROP_OLDEST が起きる。
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let config = StreamConfig {
+            ring_capacity_chunks: 1,
+            ..Default::default()
+        };
+        let mut stream = Stream::open(config, backend).expect("open");
+        stream.start().expect("start");
+
+        // poll_chunk せずに待つことでチャンクリングを溢れさせる。
+        let got_drop = wait_until(
+            || {
+                // poll_event だけを回す（poll_chunk しない＝リングを詰まらせる）。
+                while let Some(ev) = stream.poll_event() {
+                    if matches!(ev, Event::ChunkDropped { .. }) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Duration::from_secs(3),
+        );
+        stream.stop();
+        assert!(got_drop, "poll_event で ChunkDropped を取得できるはず");
+    }
+
+    /// イベントが無ければ `poll_event` は None を返す（非ブロッキング・空キュー）。
+    #[test]
+    fn poll_event_is_none_when_empty() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        // start 前はイベントキューが空。
+        assert!(stream.poll_event().is_none());
+    }
+
+    // --- ウォッチドッグ: stall 検知 → 自動復帰 → RECOVERED ---
+
+    /// StallableMockBackend で「初回セッションが途中で給餌停止 → ウォッチドッグが
+    /// STALL_THRESHOLD 後に失速検知 → backend を再オープン → 復帰後の最初のチャンクへ
+    /// RECOVERED|DISCONTINUITY」を end-to-end で検証する。
+    ///
+    /// 観測:
+    /// 1. `Event::StreamStalled` が発火する（失速判定）。
+    /// 2. `Event::StreamRecovered` が発火する（再オープン成功）。
+    /// 3. 復帰後の最初のチャンクに ChunkFlags::RECOVERED が立つ（DISCONTINUITY も伴う）。
+    /// 4. seq は通して単調増加（復帰でリセットされない）。
+    #[test]
+    fn watchdog_detects_stall_and_flags_recovered() {
+        // 300ms 給餌してから初回セッションを stall させる。
+        let backend = Box::new(StallableMockBackend::new(
+            48_000,
+            2,
+            440.0,
+            Duration::from_millis(300),
+        ));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        let mut chunks: Vec<AudioChunk> = Vec::new();
+        let mut saw_stalled = false;
+        let mut saw_recovered = false;
+
+        // 失速検知(>=2s) → 再オープン → 復帰チャンクまで十分待つ（最大 8 秒）。
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut recovered_chunk_seen = false;
+        while Instant::now() < deadline && !recovered_chunk_seen {
+            while let Some(c) = stream.poll_chunk() {
+                if c.flags.contains(ChunkFlags::RECOVERED) {
+                    recovered_chunk_seen = true;
+                }
+                chunks.push(c);
+            }
+            while let Some(ev) = stream.poll_event() {
+                match ev {
+                    Event::StreamStalled => saw_stalled = true,
+                    Event::StreamRecovered => saw_recovered = true,
+                    _ => {}
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        stream.stop();
+        // stop 後の残りも取り切る。
+        while let Some(c) = stream.poll_chunk() {
+            if c.flags.contains(ChunkFlags::RECOVERED) {
+                recovered_chunk_seen = true;
+            }
+            chunks.push(c);
+        }
+
+        assert!(saw_stalled, "Event::StreamStalled が発火するはず");
+        assert!(saw_recovered, "Event::StreamRecovered が発火するはず");
+        assert!(
+            recovered_chunk_seen,
+            "復帰後の最初のチャンクに RECOVERED が立つはず"
+        );
+
+        // RECOVERED が立ったチャンクには DISCONTINUITY も伴う（設計どおり）。
+        let recovered: Vec<&AudioChunk> = chunks
+            .iter()
+            .filter(|c| c.flags.contains(ChunkFlags::RECOVERED))
+            .collect();
+        assert!(!recovered.is_empty());
+        for c in &recovered {
+            assert!(
+                c.flags.contains(ChunkFlags::DISCONTINUITY),
+                "RECOVERED には DISCONTINUITY が伴うはず: flags={:?}",
+                c.flags
+            );
+        }
+
+        // seq は通して単調増加（復帰でリセットされない）。
+        for w in chunks.windows(2) {
+            assert!(
+                w[1].seq > w[0].seq,
+                "seq は復帰をまたいでも単調増加: {} -> {}",
+                w[0].seq,
+                w[1].seq
+            );
+        }
+    }
+
+    /// 安定給餌（stall しない）なら RECOVERED は一切立たず、StreamStalled も来ない
+    /// （回帰: ウォッチドッグが誤検知しない）。StallableMockBackend を十分小さい
+    /// stall を起こさない値で使うのではなく、通常 MockBackend で短時間確認する。
+    #[test]
+    fn no_recovered_flag_under_steady_feed() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+
+        // STALL_THRESHOLD 未満の短時間でフラグ・イベントを確認する。
+        let chunks = collect_for(&mut stream, Duration::from_millis(500));
+        let mut saw_stalled = false;
+        while let Some(ev) = stream.poll_event() {
+            if matches!(ev, Event::StreamStalled) {
+                saw_stalled = true;
+            }
+        }
+        stream.stop();
+
+        assert!(!chunks.is_empty(), "安定給餌でチャンクが来るはず");
+        assert!(!saw_stalled, "安定給餌では失速判定されないはず");
+        for c in &chunks {
+            assert!(
+                !c.flags.contains(ChunkFlags::RECOVERED),
+                "安定給餌では RECOVERED は立たない: flags={:?}",
+                c.flags
+            );
+        }
+    }
+}

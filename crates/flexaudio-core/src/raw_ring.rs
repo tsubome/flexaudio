@@ -167,4 +167,103 @@ mod tests {
         assert_eq!(got, 4);
         assert_eq!(out2, [3.0, 4.0, 5.0, 6.0]);
     }
+
+    /// 空 slice の push は 0 を返し overflow を増やさない（早期 return 経路）。
+    #[test]
+    fn push_empty_is_noop() {
+        let (mut p, _c) = raw_ring(4);
+        assert_eq!(p.push_slice(&[]), 0);
+        assert_eq!(p.overflow_count(), 0);
+    }
+
+    /// 満杯のリングへさらに push すると全量ドロップ（writable=0）し、
+    /// overflow がそのサンプル数ぶん増える。RT 経路がブロックしないことの裏取り。
+    #[test]
+    fn full_ring_drops_entire_push() {
+        let (mut p, _c) = raw_ring(4);
+        assert_eq!(p.push_slice(&[1.0, 2.0, 3.0, 4.0]), 4); // 満杯。
+                                                            // もう入らない → 5 サンプル全ドロップ。
+        let w = p.push_slice(&[5.0; 5]);
+        assert_eq!(w, 0, "満杯なら 1 つも書けない");
+        assert_eq!(
+            p.overflow_count(),
+            5,
+            "全 5 サンプルが overflow に計上される"
+        );
+    }
+
+    /// `pop_slice` は dst が available より大きくても available 個だけ取り出す（off-by-one 防止）。
+    /// 残量より大きい dst・空リングからの pop=0 を確認。
+    #[test]
+    fn pop_slice_respects_available_and_dst_len() {
+        let (mut p, mut c) = raw_ring(8);
+        p.push_slice(&[1.0, 2.0, 3.0]);
+        assert_eq!(c.available(), 3);
+        // dst が大きくても available(3) だけ取れる。
+        let mut big = [0.0f32; 16];
+        assert_eq!(c.pop_slice(&mut big), 3);
+        assert_eq!(&big[..3], &[1.0, 2.0, 3.0]);
+        // 空になったので次は 0。
+        assert_eq!(c.available(), 0);
+        assert_eq!(c.pop_slice(&mut big), 0);
+    }
+
+    /// 連続ドロップで overflow カウンタが u32::MAX を超えても飽和せず u64 で増え続ける
+    /// （overflow は AtomicU64・dropped_before の u32 飽和とは別経路）。
+    #[test]
+    fn overflow_counter_exceeds_u32_max() {
+        let (mut p, _c) = raw_ring(1);
+        // 1 サンプルだけ書いて満杯にし、以降は全ドロップにする。
+        assert_eq!(p.push_slice(&[0.0]), 1);
+        // u32::MAX を跨ぐ量をドロップさせる。大 slice を 1 回 push すれば一気に積める。
+        let big = vec![0.0f32; 1000];
+        let over_u32 = u64::from(u32::MAX) + 2_000;
+        let mut total_dropped = 0u64;
+        while total_dropped < over_u32 {
+            let w = p.push_slice(&big);
+            assert_eq!(w, 0, "満杯なので 1 つも書けない");
+            total_dropped += big.len() as u64;
+        }
+        assert!(
+            p.overflow_count() > u64::from(u32::MAX),
+            "overflow は u32::MAX を超えて積み上がる: {}",
+            p.overflow_count()
+        );
+    }
+
+    /// 単発 `pop()` は 1 サンプルずつ FIFO で返し、空なら None。
+    #[test]
+    fn single_pop_is_fifo_then_none() {
+        let (mut p, mut c) = raw_ring(4);
+        p.push_slice(&[10.0, 20.0]);
+        assert_eq!(c.pop(), Some(10.0));
+        assert_eq!(c.pop(), Some(20.0));
+        assert_eq!(c.pop(), None);
+    }
+
+    /// 容量 0 指定でも `max(1)` で最低 1 を確保し、push/pop が成立する（panic しない）。
+    #[test]
+    fn zero_capacity_is_clamped_to_one() {
+        let (mut p, mut c) = raw_ring(0);
+        assert_eq!(
+            p.push_slice(&[7.0, 8.0]),
+            1,
+            "容量 1 に丸められ 1 サンプルだけ入る"
+        );
+        assert_eq!(p.overflow_count(), 1);
+        assert_eq!(c.pop(), Some(7.0));
+    }
+
+    /// producer/consumer は overflow カウンタを共有する（同じ Arc）。
+    #[test]
+    fn overflow_count_is_shared_between_ends() {
+        let (mut p, c) = raw_ring(2);
+        p.push_slice(&[1.0, 2.0, 3.0, 4.0]); // 2 書けて 2 ドロップ。
+        assert_eq!(p.overflow_count(), 2);
+        assert_eq!(
+            c.overflow_count(),
+            2,
+            "consumer 側も同じ overflow を観測する"
+        );
+    }
 }

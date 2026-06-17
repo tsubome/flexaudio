@@ -730,4 +730,198 @@ mod tests {
             assert!(s.abs() < 1e-6, "逆相の平均は 0 付近のはず: {s}");
         }
     }
+
+    // --- 値検証ヘルパ（振幅・周波数の保存を確認する） ---
+
+    /// サンプル列の RMS（線形）。正弦波なら振幅 A に対し A/√2 になる。
+    fn rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let sum_sq: f64 = samples.iter().map(|&x| (x as f64) * (x as f64)).sum();
+        (sum_sq / samples.len() as f64).sqrt() as f32
+    }
+
+    /// 正→負 / 負→正 のゼロ交差回数を数える。1 周期で 2 回交差するので、
+    /// 推定周波数 = (交差数 / 2) / 秒数。先頭/末尾の過渡を避けて中央を渡すこと。
+    fn zero_crossings(samples: &[f32]) -> usize {
+        let mut crossings = 0;
+        for w in samples.windows(2) {
+            // 厳密な符号反転のみ（0 ちょうどは無視）。
+            if (w[0] < 0.0 && w[1] >= 0.0) || (w[0] >= 0.0 && w[1] < 0.0) {
+                crossings += 1;
+            }
+        }
+        crossings
+    }
+
+    /// 44.1kHz/mono 440Hz 正弦を 48kHz/stereo へリサンプルしても、振幅（RMS）と
+    /// 周波数（ゼロ交差推定）が保存される。リサンプラのリンギングを避けるため
+    /// 1 秒ぶん流して中央のチャンク群だけで測る。
+    #[test]
+    fn resample_44100_to_48000_preserves_amplitude_and_frequency() {
+        let mut n = Normalizer::new(44_100, 1, default_out()).expect("normalizer");
+        let freq = 440.0_f32;
+        let amp = 0.5_f32;
+        let in_rate = 44_100usize;
+        // 2 秒ぶん流して十分なチャンクを得る（過渡を捨てる余裕を持つ）。
+        let total_frames = in_rate * 2;
+        let mut pts = 0i64;
+        for blk in 0..(total_frames / 441) {
+            let mut block = Vec::with_capacity(441);
+            for j in 0..441 {
+                let i = blk * 441 + j;
+                block.push((2.0 * PI * freq * (i as f32) / in_rate as f32).sin() * amp);
+            }
+            n.push(&block, pts).expect("push");
+            pts += 441 * 1_000_000_000 / in_rate as i64;
+        }
+
+        // 全チャンクを連結（出力は 48k/stereo/960frame）。
+        let mut left: Vec<f32> = Vec::new();
+        while let Some((c, _)) = n.pop_chunk() {
+            assert_eq!(c.len(), CHUNK_FRAMES * 2);
+            // L チャンネルだけ取り出す（mono→stereo 複製なので L==R）。
+            for f in 0..CHUNK_FRAMES {
+                assert_eq!(c[f * 2], c[f * 2 + 1], "mono 入力なので L==R");
+                left.push(c[f * 2]);
+            }
+        }
+        assert!(left.len() >= 48_000, "1 秒以上の出力が必要: {}", left.len());
+
+        // 過渡（先頭・末尾各 0.25 秒 = 12000 sample）を捨てて中央 1 秒で測る。
+        let start = 12_000;
+        let mid = &left[start..start + 48_000];
+
+        // 振幅: 正弦の RMS は amp/√2 ≈ 0.3536。リサンプラ通過で ±5% 以内。
+        let got_rms = rms(mid);
+        let expect_rms = amp / std::f32::consts::SQRT_2;
+        let rms_err = ((got_rms - expect_rms) / expect_rms).abs();
+        assert!(
+            rms_err < 0.05,
+            "RMS 保存誤差が大きい: got={got_rms} expect={expect_rms} err={rms_err}"
+        );
+
+        // 周波数: 中央 1 秒（48000 sample）のゼロ交差 ≈ 2*440 = 880。±2% 以内。
+        let crossings = zero_crossings(mid);
+        let est_freq = crossings as f32 / 2.0; // 1 秒なので交差数/2 = Hz。
+        let freq_err = ((est_freq - freq) / freq).abs();
+        assert!(
+            freq_err < 0.02,
+            "周波数 保存誤差が大きい: 交差={crossings} 推定={est_freq}Hz err={freq_err}"
+        );
+    }
+
+    /// 16k/mono 出力の実チャンネル数とサンプル値: 48k/stereo 440Hz 入力を
+    /// 16k/mono へ落としても 1ch・320sample で振幅/周波数が保存される。
+    #[test]
+    fn output_16k_mono_preserves_values() {
+        let out = OutputFormat {
+            sample_rate: 16_000,
+            channels: 1,
+        };
+        let mut n = Normalizer::new(48_000, 2, out).expect("normalizer");
+        let freq = 440.0_f32;
+        let amp = 0.5_f32;
+        let in_rate = 48_000usize;
+        let total_frames = in_rate * 2;
+        let mut pts = 0i64;
+        for blk in 0..(total_frames / 480) {
+            let mut block = Vec::with_capacity(480 * 2);
+            for j in 0..480 {
+                let i = blk * 480 + j;
+                let s = (2.0 * PI * freq * (i as f32) / in_rate as f32).sin() * amp;
+                block.push(s); // L
+                block.push(s); // R
+            }
+            n.push(&block, pts).expect("push");
+            pts += 480 * 1_000_000_000 / in_rate as i64;
+        }
+
+        let mut mono: Vec<f32> = Vec::new();
+        while let Some((c, _)) = n.pop_chunk() {
+            assert_eq!(c.len(), 320, "16k/mono 20ms = 320 sample（1ch）");
+            mono.extend_from_slice(&c);
+        }
+        assert!(mono.len() >= 16_000, "1 秒以上必要: {}", mono.len());
+
+        // 過渡を捨てて中央 1 秒（16000 sample）で測る。
+        let start = 4_000;
+        let mid = &mono[start..start + 16_000];
+
+        // L==R の同相信号を平均してもレベル不変 → RMS ≈ amp/√2。
+        let got_rms = rms(mid);
+        let expect_rms = amp / std::f32::consts::SQRT_2;
+        let rms_err = ((got_rms - expect_rms) / expect_rms).abs();
+        assert!(
+            rms_err < 0.05,
+            "16k/mono RMS 保存誤差: got={got_rms} expect={expect_rms} err={rms_err}"
+        );
+
+        // 周波数: 16000 sample の中央 1 秒で交差 ≈ 880。±2% 以内。
+        let est_freq = zero_crossings(mid) as f32 / 2.0;
+        let freq_err = ((est_freq - freq) / freq).abs();
+        assert!(
+            freq_err < 0.02,
+            "16k/mono 周波数 保存誤差: 推定={est_freq}Hz err={freq_err}"
+        );
+    }
+
+    /// PTS は単調増加し、隣接チャンク間の delta が ~20ms（1e7 ns ±許容）になる。
+    /// 48k パススルー経路で PTS アンカーが正しく外挿されることを値で確認する。
+    #[test]
+    fn pts_delta_is_about_20ms_between_chunks() {
+        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
+        // 480 frame（10ms）ずつ pts 付きで push（実機の小バッファ到着を模す）。
+        let mut device_pts = 1_000_000_000i64; // 任意の原点。
+        let block_frames = 480usize;
+        for _ in 0..20 {
+            let stereo = vec![0.1f32; block_frames * 2];
+            n.push(&stereo, device_pts).expect("push");
+            device_pts += block_frames as i64 * 1_000_000_000 / 48_000;
+        }
+
+        let mut pts_list = Vec::new();
+        while let Some((_, pts)) = n.pop_chunk() {
+            pts_list.push(pts);
+        }
+        assert!(
+            pts_list.len() >= 5,
+            "十分なチャンク数が必要: {}",
+            pts_list.len()
+        );
+
+        // 20ms = 20_000_000 ns。許容 ±5%（1e6 ns）。
+        for w in pts_list.windows(2) {
+            let delta = w[1] - w[0];
+            assert!(delta > 0, "PTS は厳密に増加: {} -> {}", w[0], w[1]);
+            assert!(
+                (delta - 20_000_000).abs() <= 1_000_000,
+                "隣接 PTS delta が ~20ms でない: {delta} ns"
+            );
+        }
+    }
+
+    /// 入力サンプルが空 / 端数（in_channels の倍数未満）でも panic せず Ok を返し、
+    /// チャンクは生成されない（境界・防御）。
+    #[test]
+    fn push_empty_and_subframe_are_noops() {
+        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
+        // 空。
+        n.push(&[], 0).expect("empty push ok");
+        // stereo(2ch) なのに 1 サンプルだけ → in_frames=0 で早期 return。
+        n.push(&[0.5], 0).expect("subframe push ok");
+        assert!(n.pop_chunk().is_none(), "端数だけでは 1 チャンクも出ない");
+        assert_eq!(n.buffered_out_frames(), 0);
+    }
+
+    /// 周波数 0（無音 DC）入力は出力も全 0（peak/rms 0 経路の裏取り）。
+    #[test]
+    fn silence_input_yields_zero_output() {
+        let mut n = Normalizer::new(48_000, 2, default_out()).expect("normalizer");
+        let stereo = vec![0.0f32; CHUNK_FRAMES * 2];
+        n.push(&stereo, 0).expect("push");
+        let (chunk, _) = n.pop_chunk().expect("one chunk");
+        assert!(chunk.iter().all(|&s| s == 0.0), "無音入力は無音出力");
+    }
 }

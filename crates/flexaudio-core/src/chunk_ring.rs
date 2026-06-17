@@ -203,4 +203,53 @@ mod tests {
         assert_eq!(got.dropped_before, 1);
         assert_eq!(p.dropped_count(), 1);
     }
+
+    /// 容量 0 は `max(1)` へ丸められ、容量 1 のリングとして機能する（panic しない）。
+    #[test]
+    fn zero_capacity_is_clamped_to_one() {
+        let (mut p, mut c) = chunk_ring(0);
+        assert!(c.is_empty());
+        assert_eq!(p.push(chunk(0)), None); // 1 件入る。
+        assert_eq!(c.len(), 1);
+        // 満杯 → 次は最古を捨てる。
+        assert_eq!(p.push(chunk(1)), Some(1));
+        let got = c.try_pop().unwrap();
+        assert_eq!(got.seq, 1);
+    }
+
+    /// `len` / `is_empty` が push/pop に追従し、容量を超えない（off-by-one 防止）。
+    #[test]
+    fn len_tracks_occupancy_and_is_capped() {
+        let (mut p, mut c) = chunk_ring(3);
+        assert!(c.is_empty());
+        for s in 0..3 {
+            p.push(chunk(s));
+        }
+        assert_eq!(c.len(), 3);
+        assert!(!c.is_empty());
+        // 満杯後にさらに 2 件 → 容量は 3 のまま（最古を捨てて入れ替え）。
+        p.push(chunk(3));
+        p.push(chunk(4));
+        assert_eq!(c.len(), 3, "占有数は容量 3 を超えない");
+        // 残るのは最新 3 件 seq2,3,4。
+        assert_eq!(c.try_pop().unwrap().seq, 2);
+        assert_eq!(c.try_pop().unwrap().seq, 3);
+        assert_eq!(c.try_pop().unwrap().seq, 4);
+        assert!(c.try_pop().is_none());
+        assert!(c.is_empty());
+    }
+
+    /// 空リングからの `try_pop` は None（非ブロッキング）。producer/consumer は
+    /// dropped カウンタを共有する。
+    #[test]
+    fn empty_pop_is_none_and_dropped_is_shared() {
+        let (mut p, mut c) = chunk_ring(2);
+        assert!(c.try_pop().is_none());
+        // 容量 2 → 1 件ドロップさせる。
+        p.push(chunk(0));
+        p.push(chunk(1));
+        p.push(chunk(2)); // seq0 を捨てる。
+        assert_eq!(p.dropped_count(), 1);
+        assert_eq!(c.dropped_count(), 1, "consumer 側も同じ dropped を観測する");
+    }
 }

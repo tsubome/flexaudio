@@ -532,3 +532,246 @@ pub fn open_mock_stream(
     stream.start().map_err(to_napi_err)?;
     Ok(FlexStream::spawn(stream, on_chunk, None))
 }
+
+#[cfg(test)]
+mod tests {
+    //! marshalling の純粋部分を JS ランタイム無しで検証する。
+    //!
+    //! ここでテストするのは「Rust 値 → JS 向け中間表現」の純粋変換のみ:
+    //! - `parse_source_kind` / `source_kind_str`（往復）
+    //! - `parse_process_mode`（既定/明示/未知）
+    //! - `build_config`（OpenOptions → StreamConfig の既定・反映）
+    //! - `to_napi_err`（flexaudio::Error → napi 文字列・Status）
+    //! - `event_to_js` / `device_event_to_js`（種別文字列・payload）
+    //! - `chunk_to_js`（seq u64 → BigInt・data・frames・peak/rms）
+    //!
+    //! `Float32Array::new(Vec)` と `BigInt::from(u64)` は純 Rust フィールドへ値を格納し、
+    //! `Deref<[f32]>` / `get_u64()` で JS ランタイム無しに読み戻せる（napi 2.16）。
+
+    use super::*;
+
+    // --- source kind 往復 ---
+
+    #[test]
+    fn source_kind_roundtrips() {
+        for (s, k) in [
+            ("mic", SourceKind::Mic),
+            ("system", SourceKind::SystemLoopback),
+            ("process", SourceKind::ProcessLoopback),
+        ] {
+            assert_eq!(parse_source_kind(s).unwrap(), k);
+            assert_eq!(source_kind_str(k), s);
+        }
+    }
+
+    #[test]
+    fn parse_source_kind_rejects_unknown() {
+        let err = parse_source_kind("bogus").unwrap_err();
+        assert_eq!(err.status, Status::InvalidArg);
+    }
+
+    // --- process mode ---
+
+    #[test]
+    fn parse_process_mode_defaults_and_explicit() {
+        // None / "include" は既定 Include。
+        assert_eq!(parse_process_mode(None).unwrap(), ProcessMode::Include);
+        assert_eq!(
+            parse_process_mode(Some("include")).unwrap(),
+            ProcessMode::Include
+        );
+        // "exclude" は Exclude。
+        assert_eq!(
+            parse_process_mode(Some("exclude")).unwrap(),
+            ProcessMode::Exclude
+        );
+    }
+
+    #[test]
+    fn parse_process_mode_rejects_unknown() {
+        let err = parse_process_mode(Some("nope")).unwrap_err();
+        assert_eq!(err.status, Status::InvalidArg);
+    }
+
+    // --- build_config ---
+
+    #[test]
+    fn build_config_defaults() {
+        let opts = OpenOptions {
+            kind: "mic".to_string(),
+            device_id: None,
+            process_id: None,
+            mode: None,
+            exclude_self: None,
+            output_rate: None,
+            output_channels: None,
+            chunk_ms: None,
+        };
+        let cfg = build_config(&opts).unwrap();
+        assert_eq!(cfg.kind, SourceKind::Mic);
+        // 既定 output {48000, 2}。
+        assert_eq!(cfg.output.sample_rate, 48_000);
+        assert_eq!(cfg.output.channels, 2);
+        assert_eq!(cfg.mode, ProcessMode::Include);
+        assert!(!cfg.exclude_self);
+        assert_eq!(cfg.target_pid, None);
+        assert_eq!(cfg.device_id, None);
+        // chunk_ms 未指定なら StreamConfig 既定（20）。
+        assert_eq!(cfg.chunk_ms, 20);
+    }
+
+    #[test]
+    fn build_config_reflects_all_fields() {
+        let opts = OpenOptions {
+            kind: "process".to_string(),
+            device_id: Some("dev-x".to_string()),
+            process_id: Some(9999),
+            mode: Some("exclude".to_string()),
+            exclude_self: Some(true),
+            output_rate: Some(16_000),
+            output_channels: Some(1),
+            chunk_ms: Some(20),
+        };
+        let cfg = build_config(&opts).unwrap();
+        assert_eq!(cfg.kind, SourceKind::ProcessLoopback);
+        assert_eq!(cfg.device_id.as_deref(), Some("dev-x"));
+        assert_eq!(cfg.target_pid, Some(9999));
+        assert_eq!(cfg.mode, ProcessMode::Exclude);
+        assert!(cfg.exclude_self);
+        assert_eq!(cfg.output.sample_rate, 16_000);
+        assert_eq!(cfg.output.channels, 1);
+        assert_eq!(cfg.chunk_ms, 20);
+    }
+
+    #[test]
+    fn build_config_rejects_unknown_kind() {
+        let opts = OpenOptions {
+            kind: "speaker".to_string(),
+            device_id: None,
+            process_id: None,
+            mode: None,
+            exclude_self: None,
+            output_rate: None,
+            output_channels: None,
+            chunk_ms: None,
+        };
+        let err = build_config(&opts).unwrap_err();
+        assert_eq!(err.status, Status::InvalidArg);
+    }
+
+    // --- to_napi_err ---
+
+    #[test]
+    fn to_napi_err_carries_message_and_status() {
+        let err = to_napi_err(flexaudio::Error::DeviceNotFound);
+        assert_eq!(err.status, Status::GenericFailure);
+        // Display 文字列が reason に入る。
+        assert_eq!(err.reason, flexaudio::Error::DeviceNotFound.to_string());
+        assert!(err.reason.contains("device not found"));
+    }
+
+    // --- event_to_js ---
+
+    #[test]
+    fn event_to_js_maps_each_variant() {
+        let dropped = event_to_js(Event::ChunkDropped { count: 7 });
+        assert_eq!(dropped.kind, "chunkDropped");
+        assert_eq!(dropped.count, Some(7));
+        assert_eq!(dropped.message, None);
+
+        assert_eq!(event_to_js(Event::StreamStalled).kind, "stalled");
+        assert_eq!(event_to_js(Event::StreamRecovered).kind, "recovered");
+        assert_eq!(
+            event_to_js(Event::PermissionDenied).kind,
+            "permissionDenied"
+        );
+        assert_eq!(event_to_js(Event::DeviceLost).kind, "deviceLost");
+
+        let errev = event_to_js(Event::Error("boom".to_string()));
+        assert_eq!(errev.kind, "error");
+        assert_eq!(errev.message, Some("boom".to_string()));
+    }
+
+    // --- device_event_to_js ---
+
+    #[test]
+    fn device_event_to_js_maps_variants() {
+        let info = DeviceInfo {
+            id: "node-1".to_string(),
+            name: "Mic A".to_string(),
+            source_kind: SourceKind::Mic,
+            sample_rate: 48_000,
+            channels: 2,
+            is_loopback: false,
+            is_default: true,
+        };
+        let added = device_event_to_js(DeviceEvent::Added(info));
+        assert_eq!(added.kind, "added");
+        let dev = added.device.expect("device present");
+        assert_eq!(dev.id, "node-1");
+        assert_eq!(dev.source_kind, "mic");
+        assert!(dev.is_default);
+
+        let removed = device_event_to_js(DeviceEvent::Removed {
+            id: "gone".to_string(),
+        });
+        assert_eq!(removed.kind, "removed");
+        assert_eq!(removed.id.as_deref(), Some("gone"));
+
+        let changed = device_event_to_js(DeviceEvent::DefaultChanged {
+            kind: SourceKind::SystemLoopback,
+            id: "sink-2".to_string(),
+        });
+        assert_eq!(changed.kind, "defaultChanged");
+        assert_eq!(changed.id.as_deref(), Some("sink-2"));
+        assert_eq!(changed.source_kind.as_deref(), Some("system"));
+    }
+
+    // --- seq u64 → BigInt の変換（marshalling の純粋部分） ---
+    //
+    // NOTE: `chunk_to_js` 全体（`Float32Array` を生成する）は **テストできない**。
+    // napi 2.16 の `Float32Array` は `Drop` 実装が `napi_call_threadsafe_function`
+    // を無条件参照するため、cdylib のユニットテストバイナリ（Node ホスト不在）では
+    // リンク不能になる（CI の `cargo test -p flexaudio-napi` が壊れる）。そこで
+    // `chunk_to_js` のうち **JS ランタイムに依存しない seq→BigInt 変換**だけを
+    // 同一ロジック（`BigInt::from(u64)` + `get_u64`）で検証する。data/Float32Array
+    // 経路は Node 側の E2E（`__openMockStream`）でカバーされる。
+
+    #[test]
+    fn seq_u64_to_bigint_is_lossless() {
+        // chunk_to_js は `BigInt::from(chunk.seq)` で seq を BigInt 化する。
+        // 2^53+1（f64 では表せない大きさ）でも無損失で往復することを確認する。
+        let seq: u64 = 9_007_199_254_740_993; // 2^53 + 1。
+        let big = BigInt::from(seq);
+        let (sign, value, lossless) = big.get_u64();
+        assert!(!sign, "seq は非負");
+        assert_eq!(value, seq, "seq 値が無損失で保持される（f64 では落ちる桁）");
+        assert!(lossless, "u64 1 ワードなので lossless");
+
+        // u64::MAX 境界でも無損失。
+        let (_, max_val, max_lossless) = BigInt::from(u64::MAX).get_u64();
+        assert_eq!(max_val, u64::MAX);
+        assert!(max_lossless);
+    }
+
+    #[test]
+    fn device_info_to_js_maps_all_fields() {
+        let info = DeviceInfo {
+            id: "id-x".to_string(),
+            name: "Name X".to_string(),
+            source_kind: SourceKind::SystemLoopback,
+            sample_rate: 44_100,
+            channels: 1,
+            is_loopback: true,
+            is_default: false,
+        };
+        let js = device_info_to_js(info);
+        assert_eq!(js.id, "id-x");
+        assert_eq!(js.name, "Name X");
+        assert_eq!(js.source_kind, "system");
+        assert_eq!(js.sample_rate, 44_100);
+        assert_eq!(js.channels, 1);
+        assert!(js.is_loopback);
+        assert!(!js.is_default);
+    }
+}

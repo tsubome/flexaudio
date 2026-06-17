@@ -1060,3 +1060,300 @@ fn describe_error(err: Error) -> String {
         other => format!("ストリーム初期化に失敗しました: {other}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CLI 引数列から `Cli` を組む（clap 経由）。最低限 `flexaudio-cli` を先頭に置く。
+    fn cli_from(args: &[&str]) -> Cli {
+        let mut full = vec!["flexaudio-cli"];
+        full.extend_from_slice(args);
+        Cli::parse_from(full)
+    }
+
+    // --- parse_sources ---
+
+    /// `mic:2,system:2,process:2` を 3 セグメント（kind + secs）へ正しくパースする。
+    #[test]
+    fn parse_sources_three_segments() {
+        let segs = parse_sources("mic:2,system:2,process:2").expect("valid spec");
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0].kind, SourceKind::Mic);
+        assert_eq!(segs[0].secs, 2);
+        assert_eq!(segs[1].kind, SourceKind::SystemLoopback);
+        assert_eq!(segs[2].kind, SourceKind::ProcessLoopback);
+    }
+
+    /// 空白や異なる秒数も許容し、trim される。
+    #[test]
+    fn parse_sources_trims_and_varies_secs() {
+        let segs = parse_sources(" mic:1 , system:5 ").expect("valid spec");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].kind, SourceKind::Mic);
+        assert_eq!(segs[0].secs, 1);
+        assert_eq!(segs[1].kind, SourceKind::SystemLoopback);
+        assert_eq!(segs[1].secs, 5);
+    }
+
+    /// 単一セグメントも有効。
+    #[test]
+    fn parse_sources_single_segment() {
+        let segs = parse_sources("mic:3").expect("valid");
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].kind, SourceKind::Mic);
+        assert_eq!(segs[0].secs, 3);
+    }
+
+    /// 空文字列はエラー（空 spec）。
+    #[test]
+    fn parse_sources_rejects_empty_string() {
+        assert!(parse_sources("").is_err());
+    }
+
+    /// 空セグメント（連続カンマ）はエラー。
+    #[test]
+    fn parse_sources_rejects_empty_segment() {
+        assert!(parse_sources("mic:2,,system:2").is_err());
+    }
+
+    /// `<src>:<secs>` 形式でない（コロン無し）はエラー。
+    #[test]
+    fn parse_sources_rejects_missing_colon() {
+        assert!(parse_sources("mic2").is_err());
+    }
+
+    /// 未知のソース名はエラー。
+    #[test]
+    fn parse_sources_rejects_unknown_source() {
+        assert!(parse_sources("foo:2").is_err());
+    }
+
+    /// 秒数が非数値はエラー。
+    #[test]
+    fn parse_sources_rejects_non_numeric_secs() {
+        assert!(parse_sources("mic:abc").is_err());
+    }
+
+    /// 秒数 0 はエラー（1 以上必須）。
+    #[test]
+    fn parse_sources_rejects_zero_secs() {
+        assert!(parse_sources("mic:0").is_err());
+    }
+
+    // --- config_for_kind ---
+
+    /// `config_for_kind` が CLI 共有設定（output / pid / mode / exclude_self / device_id）を
+    /// StreamConfig へ正しく反映し、kind を引数で上書きする。
+    #[test]
+    fn config_for_kind_reflects_cli_settings() {
+        let cli = cli_from(&[
+            "--source",
+            "process",
+            "--process-id",
+            "4321",
+            "--mode",
+            "exclude",
+            "--output-rate",
+            "16000",
+            "--output-channels",
+            "1",
+            "--device-id",
+            "my-mic",
+        ]);
+        let cfg = config_for_kind(&cli, SourceKind::ProcessLoopback);
+        assert_eq!(cfg.kind, SourceKind::ProcessLoopback);
+        assert_eq!(cfg.target_pid, Some(4321));
+        assert_eq!(cfg.mode, ProcessMode::Exclude);
+        assert_eq!(cfg.output.sample_rate, 16_000);
+        assert_eq!(cfg.output.channels, 1);
+        assert_eq!(cfg.device_id.as_deref(), Some("my-mic"));
+        // kind は引数で上書きされる（CLI の --source とは独立に指定できる）。
+        let cfg_mic = config_for_kind(&cli, SourceKind::Mic);
+        assert_eq!(cfg_mic.kind, SourceKind::Mic);
+        // 他の共有設定は据え置き。
+        assert_eq!(cfg_mic.output.sample_rate, 16_000);
+    }
+
+    /// `--exclude-self` が StreamConfig.exclude_self に反映される。
+    #[test]
+    fn config_for_kind_reflects_exclude_self() {
+        let cli = cli_from(&["--source", "system", "--exclude-self"]);
+        let cfg = config_for_kind(&cli, SourceKind::SystemLoopback);
+        assert!(cfg.exclude_self);
+        // 既定（未指定）は false。
+        let cli2 = cli_from(&["--source", "system"]);
+        assert!(!config_for_kind(&cli2, SourceKind::SystemLoopback).exclude_self);
+    }
+
+    /// 既定 CLI（引数最小）は output {48000,2} / mode Include / pid None になる。
+    #[test]
+    fn config_for_kind_defaults() {
+        let cli = cli_from(&[]);
+        let cfg = config_for_kind(&cli, SourceKind::Mic);
+        assert_eq!(cfg.output.sample_rate, 48_000);
+        assert_eq!(cfg.output.channels, 2);
+        assert_eq!(cfg.mode, ProcessMode::Include);
+        assert_eq!(cfg.target_pid, None);
+        assert!(!cfg.exclude_self);
+        assert_eq!(cfg.device_id, None);
+    }
+
+    /// `Cli::output_format` / `is_stdout_stream` の基本動作。
+    #[test]
+    fn cli_output_format_and_stdout_detection() {
+        let cli = cli_from(&["--output-rate", "8000", "--output-channels", "1"]);
+        let of = cli.output_format();
+        assert_eq!(of.sample_rate, 8_000);
+        assert_eq!(of.channels, 1);
+        assert!(!cli.is_stdout_stream());
+
+        let cli_stream = cli_from(&["--out", "-"]);
+        assert!(cli_stream.is_stdout_stream());
+    }
+
+    // --- describe_error ---
+
+    /// 主要な Error バリアントが人間向け文言へ変換される（種別ごとに分岐）。
+    #[test]
+    fn describe_error_maps_known_variants() {
+        assert!(describe_error(Error::DeviceNotFound).contains("入力デバイスが見つかりません"));
+        assert!(describe_error(Error::PermissionDenied).contains("権限"));
+        assert!(describe_error(Error::DeviceLost).contains("失われました"));
+        // その他は汎用文言 + Display を含む。
+        let msg = describe_error(Error::Unsupported);
+        assert!(msg.contains("ストリーム初期化に失敗しました"));
+    }
+
+    // --- source_kind_label / truncate ---
+
+    /// ラベルは短い英語識別子。
+    #[test]
+    fn source_kind_label_is_short() {
+        assert_eq!(source_kind_label(SourceKind::Mic), "mic");
+        assert_eq!(source_kind_label(SourceKind::SystemLoopback), "system");
+        assert_eq!(source_kind_label(SourceKind::ProcessLoopback), "process");
+    }
+
+    /// `truncate` は max 文字以下ならそのまま、超過なら … 付きで max 文字に収める。
+    #[test]
+    fn truncate_respects_char_boundary() {
+        assert_eq!(truncate("abc", 5), "abc");
+        // ちょうど max はそのまま。
+        assert_eq!(truncate("abcde", 5), "abcde");
+        // 超過は … 付きで max 文字（keep = max-1）。
+        let t = truncate("abcdefgh", 5);
+        assert_eq!(t.chars().count(), 5);
+        assert!(t.ends_with('…'));
+        assert!(t.starts_with("abcd"));
+        // マルチバイト（日本語）でも char 単位で安全に切る（panic しない）。
+        let jp = truncate("あいうえおかきくけこ", 3);
+        assert_eq!(jp.chars().count(), 3);
+        assert!(jp.ends_with('…'));
+    }
+
+    // --- write_wav ---
+
+    /// `write_wav` が出力フォーマットどおりの WAV ヘッダ（rate/ch/16bit）を書き、
+    /// peak/rms を正しく計算する。書いた WAV を hound で読み戻して検証する。
+    #[test]
+    fn write_wav_header_and_stats() {
+        // 出力 {16000, 1} で 2 チャンク分の既知サンプルを書く。
+        let output = OutputFormat {
+            sample_rate: 16_000,
+            channels: 1,
+        };
+        // 振幅 0.5 / -0.5 の交互（peak=0.5, rms=0.5）。
+        let data: Vec<f32> = (0..320)
+            .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+            .collect();
+        let chunk = AudioChunk {
+            data: data.clone(),
+            frames: 320,
+            pts_ns: 0,
+            seq: 0,
+            flags: flexaudio::core::ChunkFlags::empty(),
+            dropped_before: 0,
+            peak: 0.5,
+            rms: 0.5,
+        };
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("flexaudio_cli_test_{}.wav", std::process::id()));
+        let stats = write_wav(&path, std::slice::from_ref(&chunk), output).expect("write wav");
+
+        // peak/rms は既知（全サンプル |0.5| なので peak=0.5, rms=0.5）。
+        assert!((stats.peak - 0.5).abs() < 1e-6, "peak: {}", stats.peak);
+        assert!((stats.rms - 0.5).abs() < 1e-6, "rms: {}", stats.rms);
+
+        // ヘッダを読み戻して rate/ch/bits を検証。
+        let reader = hound::WavReader::open(&path).expect("open wav");
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, 16_000);
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+        // サンプル数 = 320（mono 1 チャンク）。
+        assert_eq!(reader.len(), 320);
+
+        // 一時ファイル削除。
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `write_chunk` の s16 量子化: f32 [-1,1] → i16。clamp とスケールを検証する。
+    #[test]
+    fn write_chunk_s16_quantizes_and_clamps() {
+        let chunk = AudioChunk {
+            // 0.0 / 1.0 / -1.0 / 範囲外 2.0(→clamp 1.0) / -2.0(→clamp -1.0)。
+            data: vec![0.0, 1.0, -1.0, 2.0, -2.0],
+            frames: 5,
+            pts_ns: 0,
+            seq: 0,
+            flags: flexaudio::core::ChunkFlags::empty(),
+            dropped_before: 0,
+            peak: 1.0,
+            rms: 0.5,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_chunk(&mut buf, &chunk, EncodingArg::S16).expect("write");
+        // s16 LE: 1 サンプル 2 byte × 5 = 10 byte。
+        assert_eq!(buf.len(), 10);
+        let s = |i: usize| i16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]);
+        assert_eq!(s(0), 0); // 0.0
+        assert_eq!(s(1), 32767); // 1.0 * 32767
+        assert_eq!(s(2), -32767); // -1.0 * 32767
+        assert_eq!(s(3), 32767); // 2.0 clamp 1.0
+        assert_eq!(s(4), -32767); // -2.0 clamp -1.0
+    }
+
+    /// `write_chunk` の f32 経路: バイト長 = サンプル数 × 4、LE 復元が一致する。
+    #[test]
+    fn write_chunk_f32_roundtrips() {
+        let chunk = AudioChunk {
+            data: vec![0.25, -0.5, 0.75],
+            frames: 3,
+            pts_ns: 0,
+            seq: 0,
+            flags: flexaudio::core::ChunkFlags::empty(),
+            dropped_before: 0,
+            peak: 0.75,
+            rms: 0.5,
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_chunk(&mut buf, &chunk, EncodingArg::F32).expect("write");
+        assert_eq!(buf.len(), 12); // 3 サンプル × 4 byte。
+        let f = |i: usize| {
+            f32::from_le_bytes([buf[i * 4], buf[i * 4 + 1], buf[i * 4 + 2], buf[i * 4 + 3]])
+        };
+        assert_eq!(f(0), 0.25);
+        assert_eq!(f(1), -0.5);
+        assert_eq!(f(2), 0.75);
+    }
+
+    /// `fmt_dbfs`: 有限値は dBFS 表記、無限は無音表記。
+    #[test]
+    fn fmt_dbfs_finite_and_infinite() {
+        assert!(fmt_dbfs(-6.0).contains("dBFS"));
+        assert!(fmt_dbfs(f64::NEG_INFINITY).contains("無音"));
+    }
+}

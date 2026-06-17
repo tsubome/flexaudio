@@ -99,4 +99,46 @@ mod tests {
         let t2 = n.normalize(4_000_000);
         assert_eq!(t2 - t0, 3_000_000);
     }
+
+    /// `normalize` の差分は `wrapping_sub` 由来。device_pts が `i64::MAX` 近辺で
+    /// オーバーフローしても panic せず、ラップした差分が単調原点に加算される。
+    /// 原点 `i64::MAX` から +1（ラップして `i64::MIN`）→ デルタは `wrapping_sub` で
+    /// `i64::MIN - i64::MAX = +1`（ラップ）になることを確認する。
+    #[test]
+    fn normalize_wrapping_sub_handles_i64_boundary() {
+        let mut n = ClockNormalizer::new();
+        // 原点を i64::MAX に固定（単調原点はその時の monotonic_now_ns）。
+        let base = n.normalize(i64::MAX);
+        // device_pts を i64::MIN へ（壁時計の桁あふれを模す）。
+        // wrapping_sub(i64::MAX) は +1 にラップする（i64::MIN - i64::MAX = 1 mod 2^64）。
+        let next = n.normalize(i64::MIN);
+        assert_eq!(
+            next.wrapping_sub(base),
+            1,
+            "wrapping_sub 境界: MIN - MAX はラップして +1 のはず"
+        );
+    }
+
+    /// 原点未確定の正規化器を作るたびに、初回 normalize が `is_unset` を false にする。
+    /// 大きな負の device_pts でも初回はその時点の monotonic 原点を返す（差分計算しない）。
+    #[test]
+    fn first_normalize_ignores_device_value_for_origin() {
+        let mut n = ClockNormalizer::new();
+        // 初回は device 値に依らず monotonic_now_ns を返す（原点確定のみ）。
+        let before = monotonic_now_ns();
+        let t0 = n.normalize(i64::MIN);
+        let after = monotonic_now_ns();
+        assert!(
+            t0 >= before && t0 <= after,
+            "初回は monotonic 原点を返すはず: {before} <= {t0} <= {after}"
+        );
+        assert!(!n.is_unset());
+    }
+
+    /// `Default` は `new` と同じ未確定状態を作る。
+    #[test]
+    fn default_is_unset_like_new() {
+        let n = ClockNormalizer::default();
+        assert!(n.is_unset());
+    }
 }

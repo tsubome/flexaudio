@@ -5,7 +5,7 @@
 //! [`Stream`](crate::Stream) を実機なしで end-to-end 駆動できる。
 
 use std::f32::consts::PI;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -133,6 +133,132 @@ impl CaptureBackend for MockBackend {
 }
 
 impl Drop for MockBackend {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// 失速（stall）を起こせるテスト専用バックエンド。
+///
+/// 通常の [`MockBackend`] は理想正弦を途切れず push し続けるため、ウォッチドッグの
+/// 失速検知 → 再オープン → [`ChunkFlags::RECOVERED`](flexaudio_core::types::ChunkFlags::RECOVERED)
+/// 経路をテストできない。本バックエンドは **最初の `start()` セッションだけ**を
+/// `stall_after` 経過後に給餌停止（=stall）し、ウォッチドッグが `stop()`→`start()` で
+/// 再オープンした 2 回目以降のセッションは正常給餌に戻る。これにより
+/// 「stall → 自動復帰 → 復帰チャンクに RECOVERED」を実機なしで再現できる。
+///
+/// `start()` 呼び出し回数を共有 [`AtomicU32`] で数え、世代 0（初回）でのみ stall する。
+/// テスト用途のみ（公開 API ではない）。
+pub struct StallableMockBackend {
+    sample_rate: u32,
+    channels: u16,
+    freq_hz: f32,
+    /// 初回セッションで給餌を止めるまでの経過時間。
+    stall_after: Duration,
+    /// 生成スレッドへの停止指示。
+    running: Arc<AtomicBool>,
+    /// これまでの `start()` 呼び出し回数（=セッション世代）。共有して生成スレッドが読む。
+    start_count: Arc<AtomicU32>,
+    /// 生成スレッドのハンドル。
+    handle: Option<JoinHandle<()>>,
+}
+
+impl StallableMockBackend {
+    /// ネイティブ `(sample_rate, channels)` と周波数、初回セッションで失速するまでの
+    /// 経過時間を指定して作る。
+    pub fn new(sample_rate: u32, channels: u16, freq_hz: f32, stall_after: Duration) -> Self {
+        Self {
+            sample_rate: sample_rate.max(1),
+            channels: channels.max(1),
+            freq_hz,
+            stall_after,
+            running: Arc::new(AtomicBool::new(false)),
+            start_count: Arc::new(AtomicU32::new(0)),
+            handle: None,
+        }
+    }
+
+    /// これまでの `start()` 呼び出し回数（=再オープン回数 + 1）。テストの観測用。
+    pub fn start_count(&self) -> u32 {
+        self.start_count.load(Ordering::SeqCst)
+    }
+}
+
+impl CaptureBackend for StallableMockBackend {
+    fn native_format(&self) -> (u32, u16) {
+        (self.sample_rate, self.channels)
+    }
+
+    fn start(&mut self, mut sink: RawSink) -> Result<()> {
+        if self.running.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.running.store(true, Ordering::SeqCst);
+
+        // このセッションの世代（0 始まり）。世代 0 でのみ stall する。
+        let generation = self.start_count.fetch_add(1, Ordering::SeqCst);
+
+        let running = self.running.clone();
+        let sample_rate = self.sample_rate;
+        let channels = self.channels as usize;
+        let freq = self.freq_hz;
+        let stall_after = self.stall_after;
+
+        let handle = thread::Builder::new()
+            .name("flexaudio-stallable-mock-gen".into())
+            .spawn(move || {
+                let frames_per_block =
+                    ((sample_rate as u64 * BLOCK_MS as u64) / 1000).max(1) as usize;
+                let block_dur = Duration::from_millis(BLOCK_MS as u64);
+                let two_pi_f_over_sr = 2.0 * PI * freq / sample_rate as f32;
+
+                let mut phase_frame: u64 = 0;
+                let session_start = Instant::now();
+                let mut scratch: Vec<f32> = Vec::with_capacity(frames_per_block * channels);
+
+                while running.load(Ordering::SeqCst) {
+                    // 世代 0 かつ stall_after を超えたら給餌停止（=失速）。
+                    // スレッドは生かしたまま push だけ止めるので、ウォッチドッグが
+                    // last_sample_ns の停滞を STALL_THRESHOLD 後に検知する。
+                    let stalled = generation == 0 && session_start.elapsed() >= stall_after;
+
+                    if !stalled {
+                        scratch.clear();
+                        for _ in 0..frames_per_block {
+                            let s = if freq > 0.0 {
+                                (two_pi_f_over_sr * phase_frame as f32).sin() * 0.5
+                            } else {
+                                0.0
+                            };
+                            for _ in 0..channels {
+                                scratch.push(s);
+                            }
+                            phase_frame = phase_frame.wrapping_add(1);
+                        }
+                        let pts_ns = session_start.elapsed().as_nanos() as i64;
+                        sink.push(&scratch, pts_ns);
+                    }
+
+                    thread::sleep(block_dur);
+                }
+            })
+            .map_err(|e| {
+                flexaudio_core::types::Error::Backend(format!("spawn stallable mock thread: {e}"))
+            })?;
+
+        self.handle = Some(handle);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for StallableMockBackend {
     fn drop(&mut self) {
         self.stop();
     }
