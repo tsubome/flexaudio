@@ -39,7 +39,7 @@ use std::thread::{self, JoinHandle};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::clock::monotonic_now_ns;
-use flexaudio_core::types::{DeviceEvent, DeviceInfo, Error, Result, SourceKind};
+use flexaudio_core::types::{DeviceEvent, DeviceInfo, Error, ProcessMode, Result, SourceKind};
 
 use pipewire as pw;
 use pw::spa;
@@ -91,7 +91,7 @@ fn pw_init_once() {
 /// use flexaudio_os_linux::PwSystemBackend;
 /// use flexaudio_core::backend::CaptureBackend;
 ///
-/// let backend = PwSystemBackend::new();
+/// let backend = PwSystemBackend::new(false);
 /// assert_eq!(backend.native_format(), (48_000, 2));
 /// // let mut backend = backend;
 /// // backend.start(sink)?;   // PipeWire 不在/動作中 sink 無しなら Err(Backend)
@@ -99,6 +99,11 @@ fn pw_init_once() {
 /// // backend.stop();
 /// ```
 pub struct PwSystemBackend {
+    /// 自ホスト（自プロセス）除外フラグ（②）。`true` でシステム音から自プロセスの再生音を
+    /// 除外する（フィードバック防止）。**Linux では PipeWire に OS プリミティブが無く未実装**で、
+    /// `true` のとき [`start`](CaptureBackend::start) は [`Error::Unsupported`] を返す
+    /// （黙殺でなく明示エラー。実装は Wave F。`false`＝既定 monitor は無変更で回帰ゼロ）。
+    exclude_self: bool,
     /// 起動中フラグ（二重 start ガード／drop 判定用）。`Send`。
     running: Arc<AtomicBool>,
     /// PipeWire ループスレッドへ停止を伝える送信端。`start` で `Some`。
@@ -116,20 +121,30 @@ struct Terminate;
 impl PwSystemBackend {
     /// 新しいバックエンドを構築する（この時点では PipeWire へ接続しない）。
     ///
+    /// `exclude_self`（②・自ホスト除外）を保持する。`false`（既定）は既定 sink の monitor を
+    /// そのまま録る現状動作。`true` は Linux 未実装で [`start`](CaptureBackend::start) が
+    /// [`Error::Unsupported`] を返す（Wave F で実装予定）。
+    ///
     /// 実際の接続・ストリーム作成は [`start`](CaptureBackend::start) 内で
     /// 専用スレッド上で行われる。
-    pub fn new() -> Self {
+    pub fn new(exclude_self: bool) -> Self {
         Self {
+            exclude_self,
             running: Arc::new(AtomicBool::new(false)),
             stop_tx: None,
             handle: None,
         }
     }
+
+    /// 保持している `exclude_self` フラグ（②）。
+    pub fn exclude_self(&self) -> bool {
+        self.exclude_self
+    }
 }
 
 impl Default for PwSystemBackend {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
@@ -139,6 +154,12 @@ impl CaptureBackend for PwSystemBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
+        // 自ホスト除外（②）は Linux 未実装。黙殺せず明示エラーで弾く（Wave F で実装）。
+        // sink はここで drop（消費せず返す）。`false` の既定経路は従来どおり無変更。
+        if self.exclude_self {
+            let _ = sink;
+            return Err(Error::Unsupported);
+        }
         // 二重 start に安全（既に動作中なら何もしない）。
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
@@ -266,23 +287,26 @@ impl Drop for PwSystemBackend {
 /// （冪等に再リンク可能）。PipeWire デーモン不在・registry 取得失敗のみ
 /// [`Error::Backend`] で即返す（panic しない）。
 ///
-/// # `exclude_self`
+/// # `mode`（①: Include / Exclude）
 ///
-/// プロセスキャプチャは対象 PID のノードのみ録るので、自プロセスの再生は構造的に
-/// 入らない＝[`exclude_self`](StreamConfig::exclude_self) は**常に成立し no-op**。
-/// フラグは受け取って保持するだけで、リンク挙動の分岐には使わない。
-/// （システムキャプチャの `exclude_self` は PipeWire に OS プリミティブが無く未実装
-/// ＝将来課題。）
+/// - [`ProcessMode::Include`]（既定）: 対象 PID のノードのみ録る現状動作（fan-out リンク）。
+/// - [`ProcessMode::Exclude`]: 対象 PID **以外**の全システム音を録る。**Linux では未実装**で、
+///   [`start`](CaptureBackend::start) が [`Error::Unsupported`] を返す（黙殺でなく明示エラー。
+///   実装は Wave F＝「指定 PID 以外の sink-input monitor をリンク」）。
+///
+/// system ソースの `exclude_self`（②）はこのプロセス backend とは無関係（非合成）。
 ///
 /// ```no_run
 /// use flexaudio_os_linux::PwProcessBackend;
 /// use flexaudio_core::backend::CaptureBackend;
+/// use flexaudio_core::types::ProcessMode;
 ///
-/// let backend = PwProcessBackend::new(12345, false);
+/// let backend = PwProcessBackend::new(12345, ProcessMode::Include);
 /// assert_eq!(backend.native_format(), (48_000, 2));
 /// // let mut backend = backend;
 /// // backend.start(sink)?;  // PipeWire 不在/registry 失敗なら Err(Backend)、
-/// //                        // それ以外は成功して対象 PID 出現まで待機
+/// //                        // それ以外は成功して対象 PID 出現まで待機（Include）。
+/// //                        // Exclude は Err(Unsupported)。
 /// // ...
 /// // backend.stop();
 /// ```
@@ -291,10 +315,10 @@ pub struct PwProcessBackend {
     /// `pipewire.sec.pid`（`*pw::keys::SEC_PID`）と突合し、その Client を `client.id` で
     /// 指す出力ノードを対象にする（二段照合。[`resolve_node_pid`] 参照）。
     target_pid: u32,
-    /// 自プロセス除外フラグ。プロセス経路では構造的に常に成立する no-op だが、
-    /// 契約（[`StreamConfig::exclude_self`]）を保持するために控える。リンク挙動の
-    /// 分岐には使わない。
-    exclude_self: bool,
+    /// 対象 PID の扱い（①・Include/Exclude）。[`ProcessMode::Include`] は対象 PID のみ録る
+    /// 現状動作。[`ProcessMode::Exclude`] は Linux 未実装で [`start`](CaptureBackend::start) が
+    /// [`Error::Unsupported`] を返す（Wave F で実装予定）。
+    mode: ProcessMode,
     /// 起動中フラグ（二重 start ガード／drop 判定用）。`Send`。
     running: Arc<AtomicBool>,
     /// PipeWire ループスレッドへ停止を伝える送信端。`start` で `Some`。
@@ -305,16 +329,16 @@ pub struct PwProcessBackend {
 }
 
 impl PwProcessBackend {
-    /// 対象 PID と `exclude_self` フラグからバックエンドを構築する（この時点では
-    /// PipeWire へ接続しない）。実際の接続・ストリーム作成・link-factory リンクは
+    /// 対象 PID と `mode`（①）からバックエンドを構築する（この時点では PipeWire へ
+    /// 接続しない）。実際の接続・ストリーム作成・link-factory リンクは
     /// [`start`](CaptureBackend::start) 内で専用スレッド上で行われる。
     ///
-    /// `exclude_self` はプロセス経路では no-op（対象 PID のみ録るため構造的に成立）
-    /// だが、契約として受け取り保持する。
-    pub fn new(target_pid: u32, exclude_self: bool) -> Self {
+    /// [`ProcessMode::Include`] は対象 PID のみ録る現状動作。[`ProcessMode::Exclude`] は
+    /// Linux 未実装で `start` が [`Error::Unsupported`] を返す（Wave F で実装予定）。
+    pub fn new(target_pid: u32, mode: ProcessMode) -> Self {
         Self {
             target_pid,
-            exclude_self,
+            mode,
             running: Arc::new(AtomicBool::new(false)),
             stop_tx: None,
             handle: None,
@@ -326,10 +350,9 @@ impl PwProcessBackend {
         self.target_pid
     }
 
-    /// 保持している `exclude_self` フラグ（プロセス経路では構造的に常に成立する
-    /// no-op。値はあくまで契約[`StreamConfig::exclude_self`]の保持用）。
-    pub fn exclude_self(&self) -> bool {
-        self.exclude_self
+    /// 保持している `mode`（①・Include/Exclude）。
+    pub fn mode(&self) -> ProcessMode {
+        self.mode
     }
 }
 
@@ -339,6 +362,12 @@ impl CaptureBackend for PwProcessBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
+        // Exclude（①）は Linux 未実装。黙殺せず明示エラーで弾く（Wave F で実装）。
+        // sink はここで drop（消費せず返す）。Include の既定経路は従来どおり無変更。
+        if self.mode == ProcessMode::Exclude {
+            let _ = sink;
+            return Err(Error::Unsupported);
+        }
         // 二重 start に安全（既に動作中なら何もしない）。
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
@@ -2160,16 +2189,34 @@ mod tests {
     /// 構築直後にネイティブフォーマットが固定契約どおり (48000, 2) であること。
     #[test]
     fn native_format_is_48k_stereo() {
-        let be = PwSystemBackend::new();
+        let be = PwSystemBackend::new(false);
         assert_eq!(be.native_format(), (NATIVE_RATE, NATIVE_CHANNELS));
         assert_eq!(be.native_format(), (48_000, 2));
+        assert!(!be.exclude_self());
     }
 
     /// 未 start での stop / 二重 stop が安全（panic しない）。
     #[test]
     fn stop_without_start_is_safe() {
-        let mut be = PwSystemBackend::new();
+        let mut be = PwSystemBackend::new(false);
         be.stop();
+        be.stop();
+    }
+
+    /// system の `exclude_self=true`（②）は Linux 未実装なので `start` が
+    /// [`Error::Unsupported`] を返す（黙殺でなく明示エラー・panic しない）。
+    /// `false`（既定 monitor）の回帰ゼロとは独立に、明示エラー経路を固定する。
+    #[test]
+    fn system_exclude_self_is_unsupported() {
+        let (prod, _cons) = raw_ring(1 << 16);
+        let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
+        let mut be = PwSystemBackend::new(true);
+        assert!(be.exclude_self());
+        match be.start(sink) {
+            Err(Error::Unsupported) => { /* 期待どおり */ }
+            other => panic!("exclude_self=true は Unsupported を返すべき: {other:?}"),
+        }
+        // 起動していないので stop は安全な no-op。
         be.stop();
     }
 
@@ -2231,7 +2278,7 @@ mod tests {
     fn start_is_graceful_without_pipewire() {
         let (prod, _cons) = raw_ring(1 << 16);
         let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
-        let mut be = PwSystemBackend::new();
+        let mut be = PwSystemBackend::new(false);
         match be.start(sink) {
             Ok(()) => {
                 // 動作中 PipeWire/sink がある環境。停止まで一巡できること。
@@ -2259,7 +2306,7 @@ mod tests {
         use std::time::Duration;
         let (prod, mut cons) = raw_ring(1 << 18);
         let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
-        let mut be = PwSystemBackend::new();
+        let mut be = PwSystemBackend::new(false);
         be.start(sink).expect("start should succeed on a PipeWire desktop");
         // 録音が回るのを少し待つ。
         thread::sleep(Duration::from_millis(500));
@@ -2284,24 +2331,40 @@ mod tests {
     }
 
     /// 構築直後にネイティブフォーマットが固定契約どおり (48000, 2) であること。
-    /// PID / exclude_self の保持も確認する。
+    /// PID / mode の保持も確認する。
     #[test]
     fn process_native_format_is_48k_stereo() {
-        let be = PwProcessBackend::new(4242, true);
+        let be = PwProcessBackend::new(4242, ProcessMode::Exclude);
         assert_eq!(be.native_format(), (NATIVE_RATE, NATIVE_CHANNELS));
         assert_eq!(be.native_format(), (48_000, 2));
         // 構築引数が保持されること。
         assert_eq!(be.target_pid(), 4242);
-        assert!(be.exclude_self());
-        let be2 = PwProcessBackend::new(1, false);
-        assert!(!be2.exclude_self());
+        assert_eq!(be.mode(), ProcessMode::Exclude);
+        let be2 = PwProcessBackend::new(1, ProcessMode::Include);
+        assert_eq!(be2.mode(), ProcessMode::Include);
     }
 
     /// 未 start での stop / 二重 stop が安全（panic しない）。
     #[test]
     fn process_stop_without_start_is_safe() {
-        let mut be = PwProcessBackend::new(1234, false);
+        let mut be = PwProcessBackend::new(1234, ProcessMode::Include);
         be.stop();
+        be.stop();
+    }
+
+    /// process の [`ProcessMode::Exclude`]（①）は Linux 未実装なので `start` が
+    /// [`Error::Unsupported`] を返す（黙殺でなく明示エラー・panic しない）。
+    /// Include の回帰ゼロとは独立に、明示エラー経路を固定する。
+    #[test]
+    fn process_exclude_mode_is_unsupported() {
+        let (prod, _cons) = raw_ring(1 << 16);
+        let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
+        let mut be = PwProcessBackend::new(4242, ProcessMode::Exclude);
+        match be.start(sink) {
+            Err(Error::Unsupported) => { /* 期待どおり */ }
+            other => panic!("ProcessMode::Exclude は Unsupported を返すべき: {other:?}"),
+        }
+        // 起動していないので stop は安全な no-op。
         be.stop();
     }
 
@@ -2427,8 +2490,8 @@ mod tests {
     fn process_start_is_graceful_without_pipewire() {
         let (prod, _cons) = raw_ring(1 << 16);
         let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
-        // 実在しないであろう PID。出現しなくても start は待機成功し得る。
-        let mut be = PwProcessBackend::new(u32::MAX, false);
+        // 実在しないであろう PID。出現しなくても start は待機成功し得る（Include）。
+        let mut be = PwProcessBackend::new(u32::MAX, ProcessMode::Include);
         match be.start(sink) {
             Ok(()) => {
                 // PipeWire セッションがある環境。対象 PID 未出現でも待機成功。
@@ -2471,7 +2534,7 @@ mod tests {
         let pid: u32 = pid_str.parse().expect("FLEXAUDIO_TEST_PID は u32");
         let (prod, mut cons) = raw_ring(1 << 18);
         let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
-        let mut be = PwProcessBackend::new(pid, false);
+        let mut be = PwProcessBackend::new(pid, ProcessMode::Include);
         be.start(sink)
             .expect("start should succeed on a PipeWire desktop");
         // リンク確立 + 録音が回るのを少し待つ。

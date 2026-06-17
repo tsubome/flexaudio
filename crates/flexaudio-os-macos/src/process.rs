@@ -1,9 +1,14 @@
 //! [`MacProcessBackend`] — プロセス別 Process Tap loopback（本丸）。
 //!
-//! 対象 PID を `AudioObjectID` へ変換し、`exclude_self` で INCLUDE / EXCLUDE を切り替える:
-//! - `exclude_self == false` → `initStereoMixdownOfProcesses([objectID])`（対象だけ録る）。
-//! - `exclude_self == true`  → `initStereoGlobalTapButExcludeProcesses([objectID])`
-//!   （対象を除く全システム音）。
+//! 対象 PID を `AudioObjectID` へ変換し、[`ProcessMode`]（①）で INCLUDE / EXCLUDE を
+//! 切り替える:
+//! - [`ProcessMode::Include`]（既定）→ `initStereoMixdownOfProcesses([objectID])`
+//!   （対象 PID だけ録る）。
+//! - [`ProcessMode::Exclude`] → `initStereoGlobalTapButExcludeProcesses([objectID])`
+//!   （対象 PID を除く全システム音）。
+//!
+//! `mode`（①）は process ソース専用。system ソースの `exclude_self`（②）とは**合成しない**
+//! （process ソースは `exclude_self` を見ない）。
 //!
 //! Windows の [`WasapiProcessBackend`](../flexaudio_os_windows) / Linux の
 //! [`PwProcessBackend`](../flexaudio_os_linux) 相当。
@@ -18,7 +23,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
-use flexaudio_core::types::{Error, Result};
+use flexaudio_core::types::{Error, ProcessMode, Result};
 
 use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
 use crate::system::run_tap_thread;
@@ -30,14 +35,14 @@ use crate::tap::TapKind;
 /// interleaved f32 を [`RawSink::push`] へ流す。対象が無音/不在で objectID が得られない
 /// 場合は **panic せず** [`start`](CaptureBackend::start) が [`Error::DeviceNotFound`] を返す。
 ///
-/// この型は `Send`（保持するのは `target_pid` / `exclude_self` / 停止フラグ /
+/// この型は `Send`（保持するのは `target_pid` / `mode` / 停止フラグ /
 /// [`JoinHandle`] / キャッシュ済みフォーマット。`!Send` な ObjC は専用スレッド内に閉じ込める）。
 pub struct MacProcessBackend {
     /// キャプチャ対象プロセスの PID。
     target_pid: u32,
-    /// 自プロセス（対象ツリー）除外フラグ。`true` で EXCLUDE（対象を除く全システム音）、
-    /// `false` で INCLUDE（対象の音だけ）。
-    exclude_self: bool,
+    /// 録音モード（①）。[`ProcessMode::Include`] で INCLUDE（対象 PID の音だけ）、
+    /// [`ProcessMode::Exclude`] で EXCLUDE（対象 PID を除く全システム音）。
+    mode: ProcessMode,
     /// 起動中フラグ（二重 start ガード／停止指示／drop 判定）。`Send`。
     stop_flag: Arc<AtomicBool>,
     /// tap チェーンを所有するスレッドのハンドル（start 後に `Some`）。
@@ -48,11 +53,11 @@ pub struct MacProcessBackend {
 }
 
 impl MacProcessBackend {
-    /// 対象 PID と `exclude_self` からバックエンドを構築する（この時点では接続しない）。
-    pub fn new(target_pid: u32, exclude_self: bool) -> Self {
+    /// 対象 PID と [`ProcessMode`]（①）からバックエンドを構築する（この時点では接続しない）。
+    pub fn new(target_pid: u32, mode: ProcessMode) -> Self {
         Self {
             target_pid,
-            exclude_self,
+            mode,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             native: FALLBACK_FORMAT,
@@ -64,9 +69,9 @@ impl MacProcessBackend {
         self.target_pid
     }
 
-    /// 保持している `exclude_self` フラグ。
-    pub fn exclude_self(&self) -> bool {
-        self.exclude_self
+    /// 保持している録音モード（①）。
+    pub fn mode(&self) -> ProcessMode {
+        self.mode
     }
 }
 
@@ -84,7 +89,8 @@ impl CaptureBackend for MacProcessBackend {
         let stop_flag = self.stop_flag.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let target_pid = self.target_pid;
-        let exclude_self = self.exclude_self;
+        // ProcessMode は Copy なのでそのままクロージャへ move して問題ない。
+        let mode = self.mode;
 
         let handle = thread::Builder::new()
             .name("flexaudio-macos-process".into())
@@ -96,13 +102,12 @@ impl CaptureBackend for MacProcessBackend {
                         let _ = ready_tx.send(Err(Error::DeviceNotFound));
                         return;
                     }
-                    Ok(object_id) => {
-                        if exclude_self {
-                            TapKind::ExcludeProcesses(vec![object_id])
-                        } else {
-                            TapKind::IncludeProcesses(vec![object_id])
-                        }
-                    }
+                    Ok(object_id) => match mode {
+                        // INCLUDE（既定）: 対象 PID だけの mixdown。
+                        ProcessMode::Include => TapKind::IncludeProcesses(vec![object_id]),
+                        // EXCLUDE: 対象 PID を除く全システム音（global-but-exclude）。
+                        ProcessMode::Exclude => TapKind::ExcludeProcesses(vec![object_id]),
+                    },
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                         return;
@@ -154,19 +159,19 @@ mod tests {
     /// `new` + `native_format` は panic せず妥当な値を返す。
     #[test]
     fn new_and_native_format_do_not_panic() {
-        let backend = MacProcessBackend::new(1234, false);
+        let backend = MacProcessBackend::new(1234, ProcessMode::Include);
         let (rate, channels) = backend.native_format();
         assert!(rate > 0);
         assert!(channels > 0);
         assert_eq!(backend.target_pid(), 1234);
-        assert!(!backend.exclude_self());
+        assert_eq!(backend.mode(), ProcessMode::Include);
     }
 
     /// `start` → `stop` が対象 PID 有無を問わず panic しないこと。
     /// 不在 PID / TCC 未承認では `Err` を許容（panic だけ不可）。
     #[test]
     fn start_then_stop_tolerates_missing_target() {
-        let mut backend = MacProcessBackend::new(0xFFFF_FFFE, false);
+        let mut backend = MacProcessBackend::new(0xFFFF_FFFE, ProcessMode::Include);
         let (rate, channels) = backend.native_format();
         let cap = (rate as usize * channels as usize).max(1);
         let (prod, _cons) = raw_ring(cap);

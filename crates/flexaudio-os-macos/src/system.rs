@@ -1,9 +1,19 @@
 //! [`MacSystemBackend`] — システム音声出力全体の Process Tap loopback。
 //!
-//! `CATapDescription::initStereoGlobalTapButExcludeProcesses([])`（除外なし=全システム音）
-//! で tap を作り、private aggregate device + IOProc で録る。Windows の
+//! `CATapDescription::initStereoGlobalTapButExcludeProcesses([...])` で tap を作り、
+//! private aggregate device + IOProc で録る。Windows の
 //! [`WasapiSystemBackend`](../flexaudio_os_windows) / Linux の
 //! [`PwSystemBackend`](../flexaudio_os_linux) 相当。
+//!
+//! # `exclude_self`（②）
+//! [`MacSystemBackend::new`] の `exclude_self`（②）で除外集合を切り替える:
+//! - `exclude_self == false`（既定）→ 除外なし `excludeProcesses([])` ＝全システム音。
+//! - `exclude_self == true` → 自ホストプロセス（[`std::process::id`]）を除外
+//!   `excludeProcesses([self_object])` ＝自分の出力を取り込まない（フィードバック防止）。
+//!
+//! `exclude_self`（②）は system ソース専用。process ソースの
+//! [`ProcessMode`](flexaudio_core::types::ProcessMode)（①）とは**合成しない**
+//! （system ソースは `mode` を見ない）。
 //!
 //! # スレッド / Send
 //! tap/aggregate/ioproc 周りの `!Send` な ObjC オブジェクト（[`TapChain`]）は専用スレッド
@@ -18,7 +28,7 @@ use std::thread::{self, JoinHandle};
 use flexaudio_core::backend::{CaptureBackend, RawSink};
 use flexaudio_core::types::{Error, Result};
 
-use crate::common::FALLBACK_FORMAT;
+use crate::common::{translate_pid_to_object, FALLBACK_FORMAT};
 use crate::tap::{build_tap_chain, TapChain, TapKind};
 
 /// システム音声出力全体を Process Tap でキャプチャする [`CaptureBackend`]。
@@ -27,9 +37,14 @@ use crate::tap::{build_tap_chain, TapChain, TapKind};
 /// RT block から interleaved f32 を [`RawSink::push`] へ流す。tap 作成が TCC 未承認等で
 /// 失敗した場合は **panic せず** [`start`](CaptureBackend::start) が [`Error`] を返す。
 ///
-/// この型は `Send`（保持するのは停止フラグ・[`JoinHandle`]・キャッシュ済みフォーマットのみ。
-/// `!Send` な ObjC は専用スレッド内に閉じ込める）。
+/// `exclude_self`（②）で自ホストプロセスの出力を除外するか切り替える（フィードバック防止）。
+///
+/// この型は `Send`（保持するのは `exclude_self`・停止フラグ・[`JoinHandle`]・キャッシュ済み
+/// フォーマットのみ。`!Send` な ObjC は専用スレッド内に閉じ込める）。
 pub struct MacSystemBackend {
+    /// 自ホストプロセス除外フラグ（②）。`true` で自分（[`std::process::id`]）の出力を
+    /// 除外集合に加える（`excludeProcesses([self])`）、`false` で除外なし＝全システム音。
+    exclude_self: bool,
     /// 起動中フラグ（二重 start ガード／停止指示／drop 判定）。`Send`。
     stop_flag: Arc<AtomicBool>,
     /// tap チェーンを所有するスレッドのハンドル（start 後に `Some`）。
@@ -42,12 +57,17 @@ pub struct MacSystemBackend {
 impl MacSystemBackend {
     /// 新しいシステム loopback バックエンドを構築する（この時点では tap を作らない）。
     ///
+    /// `exclude_self`（②）が `true` のとき、`start` で自ホストプロセス
+    /// （[`std::process::id`]）を除外集合に加える（フィードバック防止）。`false` のときは
+    /// 除外なしの全システム tap（従来挙動）。
+    ///
     /// ネイティブフォーマットはフォールバック `(48000, 2)` をキャッシュする。実フォーマットは
     /// tap 作成時（`start`）に tap の ASBD から決まるが、`native_format` の契約上は構築時に
     /// 1 つ返す必要があるため、tap 不要で安全に得られるフォールバックを採る（Normalizer は
     /// 出力 20ms 時間ベースのため、多少のネイティブ推定差は第 1 段リサンプルで吸収される）。
-    pub fn new() -> Self {
+    pub fn new(exclude_self: bool) -> Self {
         Self {
+            exclude_self,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             native: FALLBACK_FORMAT,
@@ -57,7 +77,7 @@ impl MacSystemBackend {
 
 impl Default for MacSystemBackend {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }
 
@@ -74,11 +94,33 @@ impl CaptureBackend for MacSystemBackend {
 
         let stop_flag = self.stop_flag.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        // bool は Copy なのでそのままクロージャへ move して問題ない。
+        let exclude_self = self.exclude_self;
 
         let handle = thread::Builder::new()
             .name("flexaudio-macos-system".into())
             .spawn(move || {
-                run_tap_thread(TapKind::ExcludeProcesses(Vec::new()), sink, stop_flag, ready_tx);
+                let kind = if exclude_self {
+                    // PID → AudioObjectID 変換は CoreAudio を叩くので所有スレッド内で行う
+                    // （process.rs と同型）。自ホストプロセスのオブジェクトを除外集合に入れる。
+                    match translate_pid_to_object(std::process::id() as i32) {
+                        // 自プロセスに対応するオーディオオブジェクトが無い（今は無音で
+                        // 出力していない等）。除外すべき「自分の音」が存在しないので、
+                        // エラーにせず除外なしの全システム tap へ degrade する（録り逃さない）。
+                        Ok(0) => TapKind::ExcludeProcesses(Vec::new()),
+                        // 自プロセスのオブジェクトを除外集合に加える（フィードバック防止）。
+                        Ok(self_object_id) => TapKind::ExcludeProcesses(vec![self_object_id]),
+                        // 変換自体が失敗（TCC 等）。readiness として Err を返して終了。
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return;
+                        }
+                    }
+                } else {
+                    // 除外なし＝全システム音（従来挙動。PID 変換不要でハッピーパスを byte-identical に）。
+                    TapKind::ExcludeProcesses(Vec::new())
+                };
+                run_tap_thread(kind, sink, stop_flag, ready_tx);
             })
             .map_err(|e| Error::Backend(format!("spawn macos system thread: {e}")))?;
 
@@ -164,7 +206,7 @@ mod tests {
     /// `new` + `native_format` は panic せず妥当な値を返す。
     #[test]
     fn new_and_native_format_do_not_panic() {
-        let backend = MacSystemBackend::new();
+        let backend = MacSystemBackend::new(false);
         let (rate, channels) = backend.native_format();
         assert!(rate > 0);
         assert!(channels > 0);
@@ -174,7 +216,7 @@ mod tests {
     /// TCC 未承認 / tap 不可環境では `Err` を許容（panic だけ不可）。
     #[test]
     fn start_then_stop_tolerates_failure() {
-        let mut backend = MacSystemBackend::new();
+        let mut backend = MacSystemBackend::new(false);
         let (rate, channels) = backend.native_format();
         let cap = (rate as usize * channels as usize).max(1);
         let (prod, _cons) = raw_ring(cap);
@@ -186,6 +228,27 @@ mod tests {
                 backend.stop(); // 二重 stop も安全。
             }
             Err(_e) => { /* TCC 未承認 / tap 不可は許容 */ }
+        }
+    }
+
+    /// `exclude_self == true` でも `native_format` が妥当で、`start` → `stop` が panic
+    /// しないこと（headless/CI は TCC 無しなので `Err` を許容。自 PID 変換経路を踏ませる）。
+    #[test]
+    fn new_exclude_self_start_then_stop_tolerates_failure() {
+        let mut backend = MacSystemBackend::new(true);
+        let (rate, channels) = backend.native_format();
+        assert!(rate > 0);
+        assert!(channels > 0);
+        let cap = (rate as usize * channels as usize).max(1);
+        let (prod, _cons) = raw_ring(cap);
+        let sink = RawSink::new(prod, rate, channels);
+
+        match backend.start(sink) {
+            Ok(()) => {
+                backend.stop();
+                backend.stop(); // 二重 stop も安全。
+            }
+            Err(_e) => { /* TCC 未承認 / tap 不可 / 自 PID 変換不可は許容 */ }
         }
     }
 }

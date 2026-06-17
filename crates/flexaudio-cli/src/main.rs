@@ -20,6 +20,14 @@
 //! device_id は **mic 専用**で、system（既定 render 固定）・process（target_pid 固定）
 //! では無視される。
 //!
+//! process / system の 2 概念は別フラグに分離している（合成しない）:
+//! - `--mode include|exclude`（①・**process 専用**・既定 include）: include=対象 PID だけ録る /
+//!   exclude=対象 PID 以外の全システム音を録る（`--process-id` 必須）。
+//! - `--exclude-self`（②・**system 専用**）: システム音から自ホスト（自プロセス）の音を除外する
+//!   （フィードバック防止）。
+//!   process ソースは `--exclude-self` を、system ソースは `--mode` を無視する。
+//!   Linux では `--mode exclude` / `--exclude-self` はいずれも未実装で `Error::Unsupported`。
+//!
 //! ```text
 //! flexaudio-cli --list-devices
 //! flexaudio-cli --source mic --device-id "ステレオ ミキサー (Realtek(R) Audio)" --out cap.wav
@@ -52,7 +60,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 
 use flexaudio::core::{AudioChunk, Error, OutputFormat, SourceKind, StreamConfig};
-use flexaudio::Stream;
+use flexaudio::{ProcessMode, Stream};
 
 /// キャプチャするソース種別（CLI 引数用）。
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -63,6 +71,24 @@ enum SourceArg {
     System,
     /// プロセス出力ループバック（Linux / Windows / macOS・`--process-id <PID>` 必須）。
     Process,
+}
+
+/// `--source process` の対象 PID の扱い（①・process 専用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModeArg {
+    /// 対象 PID（そのツリー）だけを録る（既定）。
+    Include,
+    /// 対象 PID（そのツリー）以外の全システム音を録る（`--process-id` 必須）。
+    Exclude,
+}
+
+impl From<ModeArg> for ProcessMode {
+    fn from(m: ModeArg) -> Self {
+        match m {
+            ModeArg::Include => ProcessMode::Include,
+            ModeArg::Exclude => ProcessMode::Exclude,
+        }
+    }
 }
 
 /// stdout ストリーミング時の標本形式（`--out -` 専用）。
@@ -100,6 +126,8 @@ struct Cli {
     /// 各 secs の総和が総録音時間）。`process` を含む場合は `--process-id` が必須。
     /// 切替境界では `[switch] -> <kind>` を stderr に出す。切替失敗時は警告を出して
     /// 録音は継続する（旧ソースのまま）。WAV 出力では各 secs は 1 以上であること。
+    /// `--mode`（①）/ `--exclude-self`（②）は全セグメントに一様に渡る
+    /// （process セグメントは `--mode`、system セグメントは `--exclude-self` のみ honor）。
     #[arg(long)]
     sources: Option<String>,
 
@@ -117,10 +145,19 @@ struct Cli {
     #[arg(long)]
     device_id: Option<String>,
 
-    /// 自プロセスの再生音を除外する（フィードバックループ防止）。
-    /// `--source process` では対象 PID のみ録るため**常に成立し no-op**
-    /// （フラグは受け取って保持するだけ）。system キャプチャの exclude_self は
-    /// PipeWire に OS プリミティブが無く未実装＝将来課題。
+    /// `--source process` の対象 PID の扱い（①・process 専用・既定 include）。
+    /// `include`=対象 PID だけ録る / `exclude`=対象 PID 以外の全システム音を録る
+    /// （`--process-id` 必須）。mic / system では無視される。
+    /// 旧来の「対象除外」は本フラグ `--mode exclude` へ移行した（旧 `--exclude-self` の
+    /// 対象除外用途ではない）。Linux では `exclude` は未実装で `Error::Unsupported`。
+    #[arg(long, value_enum, default_value_t = ModeArg::Include)]
+    mode: ModeArg,
+
+    /// システム音から**自ホスト（自プロセス）の再生音を除外**する（②・system 専用・
+    /// フィードバックループ防止）。`--source system` でのみ効く。mic / process では無視。
+    /// **意味更新**: 旧「対象除外」の用途は `--mode exclude`（①）へ移行済み。本フラグは
+    /// 自ホスト除外（自プロセスの音をシステム録音から外す）専用。Linux では未実装で
+    /// `Error::Unsupported`（Windows/macOS は OS プリミティブで対応）。
     #[arg(long, default_value_t = false)]
     exclude_self: bool,
 
@@ -245,6 +282,9 @@ fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
         kind,
         output: cli.output_format(),
         target_pid: cli.process_id,
+        // mode（①）は process セグメントでのみ honor される（mic/system では facade が無視）。
+        mode: cli.mode.into(),
+        // exclude_self（②）は system セグメントでのみ honor される（mic/process では無視）。
         exclude_self: cli.exclude_self,
         // device_id は mic のみで honor される（system/process では facade が無視）。
         // セグメント config でも一様に載せておけば mic セグメントだけ効く。
@@ -469,6 +509,9 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         kind,
         output,
         target_pid: cli.process_id,
+        // mode（①・process 専用）。include 既定。
+        mode: cli.mode.into(),
+        // exclude_self（②・system 専用）。自ホスト除外。
         exclude_self: cli.exclude_self,
         // device_id は mic 選択用（system/process では facade が無視する）。
         device_id: cli.device_id.clone(),
@@ -626,6 +669,11 @@ fn watch_devices_loop() -> std::result::Result<(), String> {
                         source_kind_label(kind),
                         id,
                     );
+                }
+                // DeviceEvent は #[non_exhaustive]。将来バリアント追加に備えた前方互換アーム
+                // （未知種別もデバッグ表現で表示し、握り潰さない）。
+                other => {
+                    eprintln!("[?] UNKNOWN  {other:?}");
                 }
             }
         }

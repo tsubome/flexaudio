@@ -100,7 +100,11 @@ pub struct DeviceInfo {
 /// デバイス単位の事象として配信する。pull 型（`poll_event`）で取る。
 ///
 /// 着脱は低頻度だが取りこぼし不可なので、配信キューは無制限で溜める。
+///
+/// `#[non_exhaustive]`: 外部公開で将来バリアントを足しても semver メジャー破壊に
+/// ならないよう付与する（外部 match は `_ =>` を要求される）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeviceEvent {
     /// デバイスが追加された（接続・新規ノード出現）。
     Added(DeviceInfo),
@@ -128,6 +132,30 @@ pub enum SourceKind {
     SystemLoopback,
     /// 特定プロセスの出力ループバック。
     ProcessLoopback,
+}
+
+/// [`SourceKind::ProcessLoopback`] における対象 PID の扱い（**process ソース専用・①**）。
+///
+/// 2 概念分離設計の片側。process ソースが「対象 PID をどう扱うか」だけを決め、
+/// system ソースの自ホスト除外（[`StreamConfig::exclude_self`]＝②）とは**合成しない**。
+/// 各々が OS の「単一 PID 除外」プリミティブへ 1 対 1 で写る:
+///
+/// - [`Include`](ProcessMode::Include)（既定）: 対象 `target_pid`（そのプロセスツリー）
+///   **だけ**を録る。
+/// - [`Exclude`](ProcessMode::Exclude): 対象 `target_pid`（そのプロセスツリー）**以外**の
+///   全システム音を録る（`target_pid` が必須）。
+///
+/// # 非合成（重要）
+/// process ソースはこの `mode` のみを見て [`StreamConfig::exclude_self`] を**無視**する。
+/// 逆に system ソースは `exclude_self` のみを見て `mode` を**無視**する。mic はどちらも無関係。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProcessMode {
+    /// 対象 `target_pid`（そのプロセスツリー）だけを録る（既定）。
+    #[default]
+    Include,
+    /// 対象 `target_pid`（そのプロセスツリー）以外の全システム音を録る。
+    /// `target_pid` が必須（無ければ facade が [`Error::InvalidArg`]）。
+    Exclude,
 }
 
 /// 出力チャンクのフォーマット（サンプルレートとチャンネル数）。
@@ -194,8 +222,13 @@ impl Default for OutputFormat {
 /// 1 ストリームを開くための構成。
 ///
 /// [`Default`] は固定契約に沿った値（`chunk_ms = 20`,
-/// `ring_capacity_chunks = 50`, `exclude_self = false`, `kind = Mic`,
-/// `output = {48000, 2}`）を返す。
+/// `ring_capacity_chunks = 50`, `mode = Include`, `exclude_self = false`,
+/// `kind = Mic`, `output = {48000, 2}`）を返す。
+///
+/// # process / system の 2 概念分離（非合成）
+/// process ソースの対象 PID 扱いは [`mode`](Self::mode)（①）だけが決め、system ソースの
+/// 自ホスト除外は [`exclude_self`](Self::exclude_self)（②）だけが決める。両者は**合成しない**:
+/// process ソースは `exclude_self` を無視し、system ソースは `mode` を無視する。mic は両方無関係。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamConfig {
     /// 対象デバイス ID。`None` なら既定デバイス。
@@ -208,7 +241,14 @@ pub struct StreamConfig {
     pub ring_capacity_chunks: usize,
     /// [`SourceKind::ProcessLoopback`] の対象 PID。
     pub target_pid: Option<u32>,
-    /// 自プロセスの再生音を除外するか（フィードバックループ防止）。
+    /// **process ソース専用（①）**: 対象 PID を含めるか（[`ProcessMode::Include`]・既定）
+    /// 除くか（[`ProcessMode::Exclude`]）。[`SourceKind::ProcessLoopback`] 以外では無視される。
+    /// `Exclude` は `target_pid` 必須（無ければ facade が [`Error::InvalidArg`]）。
+    pub mode: ProcessMode,
+    /// **system ソース専用（②）**: システム音から**自ホスト（自プロセス）の再生音を除外**するか
+    /// （フィードバックループ防止）。`true` で self PID（`std::process::id()`）を除外する。
+    /// [`SourceKind::SystemLoopback`] 以外では無視される（process ソースは [`mode`](Self::mode)
+    /// のみを見る）。
     pub exclude_self: bool,
     /// 出力チャンクのフォーマット。既定 `{48000, 2}`（パススルー）。
     pub output: OutputFormat,
@@ -222,6 +262,7 @@ impl Default for StreamConfig {
             chunk_ms: 20,
             ring_capacity_chunks: 50,
             target_pid: None,
+            mode: ProcessMode::Include,
             exclude_self: false,
             output: OutputFormat::default(),
         }
@@ -229,7 +270,11 @@ impl Default for StreamConfig {
 }
 
 /// ストリーム実行中に消費側へ通知される非同期イベント。
+///
+/// `#[non_exhaustive]`: 外部公開で将来バリアントを足しても semver メジャー破壊に
+/// ならないよう付与する（外部 match は `_ =>` を要求される）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Event {
     /// チャンクリング満杯により `count` 個のチャンクがドロップされた。
     ChunkDropped {
@@ -249,7 +294,11 @@ pub enum Event {
 }
 
 /// flexaudio-core の操作で発生しうるエラー。
+///
+/// `#[non_exhaustive]`: 外部公開で将来バリアントを足しても semver メジャー破壊に
+/// ならないよう付与する（外部 match は `_ =>` を要求される）。
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// 引数が無効。
     #[error("invalid argument: {0}")]
@@ -292,6 +341,7 @@ mod tests {
         let c = StreamConfig::default();
         assert_eq!(c.chunk_ms, 20);
         assert_eq!(c.ring_capacity_chunks, 50);
+        assert_eq!(c.mode, ProcessMode::Include);
         assert!(!c.exclude_self);
         assert_eq!(c.kind, SourceKind::Mic);
         assert_eq!(c.device_id, None);
@@ -393,6 +443,13 @@ mod tests {
         };
         assert!(sys.is_loopback);
         assert_ne!(mic, sys);
+    }
+
+    #[test]
+    fn process_mode_default_is_include() {
+        // 既定は Include（対象 PID だけ録る）。Exclude は明示指定が要る。
+        assert_eq!(ProcessMode::default(), ProcessMode::Include);
+        assert_ne!(ProcessMode::Include, ProcessMode::Exclude);
     }
 
     #[test]

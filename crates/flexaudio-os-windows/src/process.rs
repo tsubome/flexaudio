@@ -1,9 +1,14 @@
 //! [`WasapiProcessBackend`] — プロセス別 WASAPI loopback（本丸）。
 //!
 //! `ActivateAudioInterfaceAsync` + `AUDIOCLIENT_ACTIVATION_PARAMS`（プロセス
-//! ループバック）で**特定 PID（そのプロセスツリー）**の音声を録る。`exclude_self`
-//! で「対象ツリーを除く全システム音」へ反転する。Linux の
+//! ループバック）で**特定 PID（そのプロセスツリー）**の音声を録る。`mode`
+//! （[`ProcessMode::Include`]）で「対象ツリーの音だけ」、[`ProcessMode::Exclude`]
+//! で「対象ツリーを除く全システム音」を録る。Linux の
 //! [`PwProcessBackend`](../flexaudio_os_linux)（link-factory fan-out）相当。
+//!
+//! このモジュールの [`setup_process_loopback`] は `pub(crate)` で、`system` モジュール
+//! （[`WasapiSystemBackend`](crate::WasapiSystemBackend)）の `exclude_self == true`
+//! 経路からも再利用される（自ホスト PID を EXCLUDE して全システム音を録る）。
 //!
 //! # PROPVARIANT（VT_BLOB）の難所
 //!
@@ -23,7 +28,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use flexaudio_core::backend::{CaptureBackend, RawSink};
-use flexaudio_core::types::{Error, Result};
+use flexaudio_core::types::{Error, ProcessMode, Result};
 
 use windows::core::{implement, Interface, HRESULT, PROPVARIANT};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -169,14 +174,14 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler {
 /// `AUDIOCLIENT_ACTIVATION_PARAMS`）で `IAudioClient` を取得、固定 WAVEFORMATEX
 /// （48k/2ch/f32）で Initialize し、イベント駆動でパケットを [`RawSink::push`] へ流す。
 ///
-/// この型は `Send`（保持するのは `target_pid` / `exclude_self` / 停止フラグ /
+/// この型は `Send`（保持するのは `target_pid` / `mode` / 停止フラグ /
 /// [`JoinHandle`] / 固定フォーマット。`!Send` な COM は専用スレッド内に閉じ込める）。
 pub struct WasapiProcessBackend {
     /// キャプチャ対象プロセスの PID。
     target_pid: u32,
-    /// 自プロセス（対象ツリー）除外フラグ。`true` で EXCLUDE（対象ツリー以外の全システム音）、
-    /// `false` で INCLUDE（対象ツリーの音だけ）。
-    exclude_self: bool,
+    /// 録音モード。[`ProcessMode::Include`] で INCLUDE（対象ツリーの音だけ）、
+    /// [`ProcessMode::Exclude`] で EXCLUDE（対象ツリー以外の全システム音）。
+    mode: ProcessMode,
     /// 起動中フラグ（二重 start ガード／停止指示／drop 判定）。`Send`。
     stop_flag: Arc<AtomicBool>,
     /// COM/キャプチャを所有するスレッドのハンドル（start 後に `Some`）。
@@ -186,11 +191,11 @@ pub struct WasapiProcessBackend {
 }
 
 impl WasapiProcessBackend {
-    /// 対象 PID と `exclude_self` からバックエンドを構築する（この時点では接続しない）。
-    pub fn new(target_pid: u32, exclude_self: bool) -> Self {
+    /// 対象 PID と `mode` からバックエンドを構築する（この時点では接続しない）。
+    pub fn new(target_pid: u32, mode: ProcessMode) -> Self {
         Self {
             target_pid,
-            exclude_self,
+            mode,
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             native: (NATIVE_RATE, NATIVE_CHANNELS),
@@ -202,9 +207,9 @@ impl WasapiProcessBackend {
         self.target_pid
     }
 
-    /// 保持している `exclude_self` フラグ。
-    pub fn exclude_self(&self) -> bool {
-        self.exclude_self
+    /// 保持している録音モード（[`ProcessMode::Include`] / [`ProcessMode::Exclude`]）。
+    pub fn mode(&self) -> ProcessMode {
+        self.mode
     }
 }
 
@@ -222,12 +227,12 @@ impl CaptureBackend for WasapiProcessBackend {
         let stop_flag = self.stop_flag.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
         let target_pid = self.target_pid;
-        let exclude_self = self.exclude_self;
+        let mode = self.mode;
 
         let handle = thread::Builder::new()
             .name("flexaudio-wasapi-process".into())
             .spawn(move || {
-                run_process_thread(target_pid, exclude_self, sink, stop_flag, ready_tx);
+                run_process_thread(target_pid, mode, sink, stop_flag, ready_tx);
             })
             .map_err(|e| Error::Backend(format!("spawn wasapi process thread: {e}")))?;
 
@@ -284,14 +289,14 @@ fn fixed_process_format() -> WAVEFORMATEX {
 /// [`WasapiProcessBackend::start`] へ報告する。
 fn run_process_thread(
     target_pid: u32,
-    exclude_self: bool,
+    mode: ProcessMode,
     sink: RawSink,
     stop_flag: Arc<AtomicBool>,
     ready_tx: mpsc::Sender<Result<()>>,
 ) {
     let _com = ComThread::new();
 
-    let setup = unsafe { setup_process_loopback(target_pid, exclude_self) };
+    let setup = unsafe { setup_process_loopback(target_pid, mode) };
     let (client, capture, event, channels) = match setup {
         Ok(t) => t,
         Err(e) => {
@@ -310,30 +315,33 @@ fn run_process_thread(
 /// プロセスループバックをセットアップし、Initialize 済みの `IAudioClient` /
 /// `IAudioCaptureClient` / イベントハンドル / チャンネル数（固定 2）を返す。
 ///
+/// `mode` で INCLUDE（対象ツリーだけ）／EXCLUDE（対象ツリー以外の全システム音）を選ぶ。
+/// `system` モジュールの `exclude_self == true` 経路は、自ホスト PID を
+/// [`ProcessMode::Exclude`] で渡してこれを再利用する（だから `pub(crate)`）。
+///
 /// # Safety
 /// 呼び出しスレッドで COM が初期化済みであること。
 #[allow(clippy::type_complexity)]
-unsafe fn setup_process_loopback(
+pub(crate) unsafe fn setup_process_loopback(
     target_pid: u32,
-    exclude_self: bool,
+    mode: ProcessMode,
 ) -> Result<(
     IAudioClient,
     windows::Win32::Media::Audio::IAudioCaptureClient,
     HANDLE,
     u16,
 )> {
-    // activation params を組む。exclude_self で INCLUDE/EXCLUDE を切り替える。
-    let mode = if exclude_self {
-        PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
-    } else {
-        PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE
+    // activation params を組む。mode で INCLUDE/EXCLUDE を切り替える。
+    let loopback_mode = match mode {
+        ProcessMode::Include => PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+        ProcessMode::Exclude => PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
     };
     let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
                 TargetProcessId: target_pid,
-                ProcessLoopbackMode: mode,
+                ProcessLoopbackMode: loopback_mode,
             },
         },
     };
@@ -426,14 +434,15 @@ fn map_process_activation_err(ctx: &str, e: windows::core::Error) -> Error {
 mod tests {
     use super::*;
     use flexaudio_core::raw_ring;
+    // `ProcessMode` は親モジュールの `use` 経由で `super::*` から見える。
 
     /// `new` + `native_format` は固定 `(48000, 2)` を返し panic しない。
     #[test]
     fn new_and_native_format_are_fixed() {
-        let backend = WasapiProcessBackend::new(1234, false);
+        let backend = WasapiProcessBackend::new(1234, ProcessMode::Include);
         assert_eq!(backend.native_format(), (48_000, 2));
         assert_eq!(backend.target_pid(), 1234);
-        assert!(!backend.exclude_self());
+        assert_eq!(backend.mode(), ProcessMode::Include);
     }
 
     /// PROPVARIANT ミラーが SDK レイアウト（24B/8 アライン）と一致すること（const assert
@@ -450,7 +459,7 @@ mod tests {
     #[test]
     fn start_then_stop_tolerates_missing_target() {
         // 存在しない PID。activation 自体は通り得るが Initialize/capture で失敗し得る。
-        let mut backend = WasapiProcessBackend::new(0xFFFF_FFFE, false);
+        let mut backend = WasapiProcessBackend::new(0xFFFF_FFFE, ProcessMode::Include);
         let (rate, channels) = backend.native_format();
         let cap = (rate as usize * channels as usize).max(1);
         let (prod, _cons) = raw_ring(cap);
@@ -478,7 +487,7 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .expect("FLEXAUDIO_TEST_PID に音を鳴らしているプロセスの PID を指定");
 
-        let mut backend = WasapiProcessBackend::new(pid, false);
+        let mut backend = WasapiProcessBackend::new(pid, ProcessMode::Include);
         let (rate, channels) = backend.native_format();
         let cap = rate as usize * channels as usize * 2; // 約 2 秒
         let (prod, mut cons) = raw_ring(cap);

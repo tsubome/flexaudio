@@ -24,7 +24,7 @@ use napi::{Error as NapiError, Result as NapiResult, Status};
 use napi_derive::napi;
 
 use flexaudio::{
-    AudioChunk, DeviceEvent, DeviceInfo, Event, OutputFormat, SourceKind, StreamConfig,
+    AudioChunk, DeviceEvent, DeviceInfo, Event, OutputFormat, ProcessMode, SourceKind, StreamConfig,
 };
 
 // bridge スレッドのポーリング間隔。20ms チャンクに対し十分小さく、空転も避ける。
@@ -99,6 +99,13 @@ pub struct OpenOptions {
     pub kind: String,
     pub device_id: Option<String>,
     pub process_id: Option<u32>,
+    /// process の対象 PID の扱い（①・process 専用）。"include"（既定）| "exclude"。
+    /// include=対象 PID だけ録る / exclude=対象 PID 以外の全システム音（process_id 必須）。
+    /// mic / system では無視される。Linux では "exclude" は未実装で start 時に例外。
+    pub mode: Option<String>,
+    /// システム音から自ホスト（自プロセス）の音を除外するか（②・system 専用）。既定 false。
+    /// mic / process では無視される。Linux では true は未実装で start 時に例外。
+    pub exclude_self: Option<bool>,
     /// 既定 48000
     pub output_rate: Option<u32>,
     /// 既定 2
@@ -128,6 +135,18 @@ fn parse_source_kind(s: &str) -> NapiResult<SourceKind> {
         other => Err(NapiError::new(
             Status::InvalidArg,
             format!("unknown kind: {other:?} (expected mic|system|process)"),
+        )),
+    }
+}
+
+/// "include" | "exclude" を [`ProcessMode`] へ（①・process 専用）。`None`/未指定は既定 Include。
+fn parse_process_mode(s: Option<&str>) -> NapiResult<ProcessMode> {
+    match s {
+        None | Some("include") => Ok(ProcessMode::Include),
+        Some("exclude") => Ok(ProcessMode::Exclude),
+        Some(other) => Err(NapiError::new(
+            Status::InvalidArg,
+            format!("unknown mode: {other:?} (expected include|exclude)"),
         )),
     }
 }
@@ -191,6 +210,13 @@ fn event_to_js(ev: Event) -> JsStreamEvent {
             count: None,
             message: Some(msg),
         },
+        // Event は #[non_exhaustive]。将来バリアント追加に備えた前方互換アーム
+        // （未知種別は "error" + デバッグ表現で JS へ通知し、握り潰さない）。
+        other => JsStreamEvent {
+            kind: "error".to_string(),
+            count: None,
+            message: Some(format!("unknown event: {other:?}")),
+        },
     }
 }
 
@@ -214,11 +240,20 @@ fn device_event_to_js(ev: DeviceEvent) -> JsDeviceEvent {
             id: Some(id),
             source_kind: Some(source_kind_str(kind)),
         },
+        // DeviceEvent は #[non_exhaustive]。将来バリアント追加に備えた前方互換アーム
+        // （未知種別は "unknown" として JS へ渡し、握り潰さない）。
+        _ => JsDeviceEvent {
+            kind: "unknown".to_string(),
+            device: None,
+            id: None,
+            source_kind: None,
+        },
     }
 }
 
 fn build_config(options: &OpenOptions) -> NapiResult<StreamConfig> {
     let kind = parse_source_kind(&options.kind)?;
+    let mode = parse_process_mode(options.mode.as_deref())?;
     let output = OutputFormat {
         sample_rate: options.output_rate.unwrap_or(48_000),
         channels: options.output_channels.unwrap_or(2),
@@ -228,6 +263,9 @@ fn build_config(options: &OpenOptions) -> NapiResult<StreamConfig> {
         output,
         device_id: options.device_id.clone(),
         target_pid: options.process_id,
+        // mode（①・process 専用）/ exclude_self（②・system 専用）。非合成は facade が担保。
+        mode,
+        exclude_self: options.exclude_self.unwrap_or(false),
         ..Default::default()
     };
     if let Some(ms) = options.chunk_ms {

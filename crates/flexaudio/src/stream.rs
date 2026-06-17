@@ -465,7 +465,7 @@ impl Stream {
     /// [`Error::InvalidArg`] で弾く。
     ///
     /// 成功時、`config` の **可変項目のみ**（`kind` / `device_id` / `target_pid`
-    /// / `exclude_self`）を新しい値へ更新する。`output` / `chunk_ms`
+    /// / `mode` / `exclude_self`）を新しい値へ更新する。`output` / `chunk_ms`
     /// / `ring_capacity_chunks` は据え置く。
     ///
     /// # エラー
@@ -495,6 +495,7 @@ impl Stream {
             kind: new_config.kind,
             device_id: new_config.device_id,
             target_pid: new_config.target_pid,
+            mode: new_config.mode,
             exclude_self: new_config.exclude_self,
             ..self.config.clone()
         };

@@ -19,8 +19,8 @@ pub use stream::Stream;
 // 型の定義そのものは変えず、`flexaudio-core` の再エクスポートを facade へ橋渡しするだけ。
 pub use flexaudio_core::backend::CaptureBackend;
 pub use flexaudio_core::types::{
-    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, Result,
-    SourceKind, StreamConfig,
+    AudioChunk, ChunkFlags, DeviceEvent, DeviceInfo, Error, Event, OutputFormat, ProcessMode,
+    Result, SourceKind, StreamConfig,
 };
 
 /// 全ソース統合のデバイス列挙（§0.8 `devices()`）。
@@ -92,20 +92,30 @@ pub fn watch_devices() -> Result<DeviceWatcher> {
 ///
 /// # ソース → バックエンドの分岐
 /// - [`SourceKind::Mic`] → [`flexaudio_mic::CpalMicBackend`]（cpal, **全 OS**）。
-/// - [`SourceKind::SystemLoopback`] → **Linux / Windows**
+/// - [`SourceKind::SystemLoopback`] → **Linux / Windows / macOS**
 ///   （Linux: [`flexaudio_os_linux::PwSystemBackend`]＝既定出力の monitor / PipeWire。
 ///   Windows: `flexaudio_os_windows::WasapiSystemBackend`＝既定 render endpoint の
-///   WASAPI loopback）。その他 OS では [`Error::Unsupported`]。
-/// - [`SourceKind::ProcessLoopback`] → **Linux / Windows**
+///   WASAPI loopback）。`config.exclude_self`（②）をそのまま渡す（自ホスト除外）。
+///   その他 OS では [`Error::Unsupported`]。
+/// - [`SourceKind::ProcessLoopback`] → **Linux / Windows / macOS**
 ///   （Linux: [`flexaudio_os_linux::PwProcessBackend`]。Windows:
 ///   `flexaudio_os_windows::WasapiProcessBackend`）。`config.target_pid` が必須で、
-///   無ければ [`Error::InvalidArg`]。`config.exclude_self` をそのまま渡す。
+///   無ければ [`Error::InvalidArg`]。`config.mode`（①）をそのまま渡す。
 ///   その他 OS では [`Error::Unsupported`]。
+///
+/// # 2 概念分離（非合成）
+/// process ソースは `config.mode`（①）のみを見て `config.exclude_self`（②）を**無視**し、
+/// system ソースは `config.exclude_self`（②）のみを見て `config.mode`（①）を**無視**する。
+/// 各々が OS の「単一 PID 除外」プリミティブへ 1 対 1 で写る（合成しない）。
 ///
 /// # エラー
 /// - 出力フォーマットが非対応 → [`Error::UnsupportedFormat`]（早期に弾く）。
-/// - ProcessLoopback で `target_pid` 欠落 → [`Error::InvalidArg`]。
-/// - 当該 OS で非対応のソース（Linux/Windows 以外の system/process）→ [`Error::Unsupported`]。
+/// - ProcessLoopback で `target_pid` 欠落 → [`Error::InvalidArg`]
+///   （[`ProcessMode::Exclude`] でも `target_pid` 必須）。
+/// - 当該 OS で非対応のソース（Linux/Windows/macOS 以外の system/process）→ [`Error::Unsupported`]。
+/// - **Linux** で process [`ProcessMode::Exclude`] / system `exclude_self=true` を要求すると
+///   `start` 時に [`Error::Unsupported`]（黙殺でなく明示エラー。Wave F で実装予定。
+///   Include / `exclude_self=false` は無変更で回帰ゼロ）。
 /// - その他は [`Stream::open`] 由来（`ring_capacity_chunks == 0` 等）。
 ///
 /// # 例
@@ -168,18 +178,21 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
         SourceKind::Mic => Box::new(flexaudio_mic::CpalMicBackend::new(config.device_id.clone())),
 
         // システム出力ループバックは Linux / Windows / macOS 対応。
+        // exclude_self（②・自ホスト除外）を backend へ配線する。mode（①）は見ない（非合成）。
         SourceKind::SystemLoopback => {
             #[cfg(target_os = "linux")]
             {
-                Box::new(flexaudio_os_linux::PwSystemBackend::new())
+                Box::new(flexaudio_os_linux::PwSystemBackend::new(config.exclude_self))
             }
             #[cfg(target_os = "windows")]
             {
-                Box::new(flexaudio_os_windows::WasapiSystemBackend::new())
+                Box::new(flexaudio_os_windows::WasapiSystemBackend::new(
+                    config.exclude_self,
+                ))
             }
             #[cfg(target_os = "macos")]
             {
-                Box::new(flexaudio_os_macos::MacSystemBackend::new())
+                Box::new(flexaudio_os_macos::MacSystemBackend::new(config.exclude_self))
             }
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
             {
@@ -188,6 +201,8 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
         }
 
         // プロセス出力ループバックは Linux / Windows / macOS 対応・target_pid 必須。
+        // mode（①・Include/Exclude）を backend へ配線する。exclude_self（②）は見ない（非合成）。
+        // mode:Exclude も含めて target_pid は必須（無ければ InvalidArg）。
         SourceKind::ProcessLoopback => {
             #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
             {
@@ -196,24 +211,18 @@ pub(crate) fn build_backend(config: &StreamConfig) -> Result<Box<dyn CaptureBack
                 })?;
                 #[cfg(target_os = "linux")]
                 {
-                    Box::new(flexaudio_os_linux::PwProcessBackend::new(
-                        pid,
-                        config.exclude_self,
-                    ))
+                    Box::new(flexaudio_os_linux::PwProcessBackend::new(pid, config.mode))
                 }
                 #[cfg(target_os = "windows")]
                 {
                     Box::new(flexaudio_os_windows::WasapiProcessBackend::new(
                         pid,
-                        config.exclude_self,
+                        config.mode,
                     ))
                 }
                 #[cfg(target_os = "macos")]
                 {
-                    Box::new(flexaudio_os_macos::MacProcessBackend::new(
-                        pid,
-                        config.exclude_self,
-                    ))
+                    Box::new(flexaudio_os_macos::MacProcessBackend::new(pid, config.mode))
                 }
             }
             #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
