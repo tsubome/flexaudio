@@ -13,3 +13,7 @@ flexaudio-mic = { path = "../flexaudio-mic" }
 # デバイス列挙でシステム出力 sink（PipeWire）を束ねる（Linux のみ）。
 [target.'cfg(target_os = "linux")'.dependencies]
 flexaudio-os-linux = { path = "../flexaudio-os-linux" }
+
+# システム/プロセスループバック（WASAPI）を束ねる（Windows のみ）。
+[target.'cfg(target_os = "windows")'.dependencies]
+flexaudio-os-windows = { path = "../flexaudio-os-windows" }

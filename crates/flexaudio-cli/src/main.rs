@@ -49,9 +49,9 @@ use flexaudio::Stream;
 enum SourceArg {
     /// 既定マイク入力。
     Mic,
-    /// システム出力ループバック（Linux のみ）。
+    /// システム出力ループバック（Linux / Windows）。
     System,
-    /// プロセス出力ループバック（Linux のみ・`--process-id <PID>` 必須）。
+    /// プロセス出力ループバック（Linux / Windows・`--process-id <PID>` 必須）。
     Process,
 }
 
@@ -93,7 +93,7 @@ struct Cli {
     #[arg(long)]
     sources: Option<String>,
 
-    /// `--source process` の対象プロセス PID（Linux のみ・process では必須）。
+    /// `--source process` の対象プロセス PID（Linux / Windows・process では必須）。
     /// 対象 PID のアプリ出力ノードへ fan-out リンクして複製で録る（非侵襲：
     /// ユーザーのスピーカーは鳴ったまま）。対象が後から鳴り始めるのは正常系。
     #[arg(long)]
@@ -173,27 +173,27 @@ fn parse_sources(spec: &str) -> std::result::Result<Vec<Segment>, String> {
         let kind = match src.trim() {
             "mic" => SourceKind::Mic,
             "system" => {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 {
                     SourceKind::SystemLoopback
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
                     return Err(
-                        "--sources の system（システム出力ループバック）は現在 Linux のみ対応です。"
+                        "--sources の system（システム出力ループバック）は現在 Linux / Windows のみ対応です。"
                             .into(),
                     );
                 }
             }
             "process" => {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 {
                     SourceKind::ProcessLoopback
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
                 {
                     return Err(
-                        "--sources の process（プロセス出力ループバック）は現在 Linux のみ対応です。"
+                        "--sources の process（プロセス出力ループバック）は現在 Linux / Windows のみ対応です。"
                             .into(),
                     );
                 }
@@ -385,43 +385,44 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         match cli.source {
         SourceArg::Mic => (SourceKind::Mic, "mic（既定入力デバイス）"),
         SourceArg::System => {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 (
                     SourceKind::SystemLoopback,
                     "system（既定出力の monitor / PipeWire）",
                 )
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             {
                 return Err(
-                    "--source system（システム出力ループバック）は現在 Linux のみ対応です。"
+                    "--source system（システム出力ループバック）は現在 Linux / Windows のみ対応です。"
                         .into(),
                 );
             }
         }
         SourceArg::Process => {
-            #[cfg(target_os = "linux")]
+            // process では PID 必須。無ければ分かりやすいエラーで止める
+            // （facade も InvalidArg を返すが、CLI では人間向け文言で先に弾く）。
+            // PID 必須チェックは OS 非依存（system/process 対応 OS なら常に要求）。
+            if cli.process_id.is_none() {
+                return Err(
+                    "--source process には --process-id <PID> が必要です。\
+                     （対象プロセスの PID を指定してください。例: \
+                     speaker-test を鳴らして得た PID）"
+                        .into(),
+                );
+            }
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
-                // process では PID 必須。無ければ分かりやすいエラーで止める
-                // （facade も InvalidArg を返すが、CLI では人間向け文言で先に弾く）。
-                if cli.process_id.is_none() {
-                    return Err(
-                        "--source process には --process-id <PID> が必要です。\
-                         （対象プロセスの PID を指定してください。例: \
-                         speaker-test を鳴らして得た PID）"
-                            .into(),
-                    );
-                }
                 (
                     SourceKind::ProcessLoopback,
                     "process（特定 PID 出力の fan-out / PipeWire）",
                 )
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             {
                 return Err(
-                    "--source process（プロセス出力ループバック）は現在 Linux のみ対応です。"
+                    "--source process（プロセス出力ループバック）は現在 Linux / Windows のみ対応です。"
                         .into(),
                 );
             }
