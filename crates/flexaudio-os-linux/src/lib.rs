@@ -100,9 +100,10 @@ fn pw_init_once() {
 /// ```
 pub struct PwSystemBackend {
     /// 自ホスト（自プロセス）除外フラグ（②）。`true` でシステム音から自プロセスの再生音を
-    /// 除外する（フィードバック防止）。**Linux では PipeWire に OS プリミティブが無く未実装**で、
-    /// `true` のとき [`start`](CaptureBackend::start) は [`Error::Unsupported`] を返す
-    /// （黙殺でなく明示エラー。実装は Wave F。`false`＝既定 monitor は無変更で回帰ゼロ）。
+    /// 除外する（フィードバック防止）。`true` のとき [`start`](CaptureBackend::start) は
+    /// **プロセス Exclude 機構を再利用**し、除外 PID = `std::process::id()` として自分以外の
+    /// 全アプリ出力（`Stream/Output/Audio`）を fan-in リンクして録る（sink monitor では
+    /// 自分を引き算できないため）。`false`＝既定 sink の monitor は無変更で回帰ゼロ。
     exclude_self: bool,
     /// 起動中フラグ（二重 start ガード／drop 判定用）。`Send`。
     running: Arc<AtomicBool>,
@@ -122,8 +123,8 @@ impl PwSystemBackend {
     /// 新しいバックエンドを構築する（この時点では PipeWire へ接続しない）。
     ///
     /// `exclude_self`（②・自ホスト除外）を保持する。`false`（既定）は既定 sink の monitor を
-    /// そのまま録る現状動作。`true` は Linux 未実装で [`start`](CaptureBackend::start) が
-    /// [`Error::Unsupported`] を返す（Wave F で実装予定）。
+    /// そのまま録る現状動作。`true` は自分以外の全アプリ出力を fan-in して録る
+    /// （プロセス Exclude 機構の再利用。除外 PID = `std::process::id()`）。
     ///
     /// 実際の接続・ストリーム作成は [`start`](CaptureBackend::start) 内で
     /// 専用スレッド上で行われる。
@@ -154,12 +155,6 @@ impl CaptureBackend for PwSystemBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        // 自ホスト除外（②）は Linux 未実装。黙殺せず明示エラーで弾く（Wave F で実装）。
-        // sink はここで drop（消費せず返す）。`false` の既定経路は従来どおり無変更。
-        if self.exclude_self {
-            let _ = sink;
-            return Err(Error::Unsupported);
-        }
         // 二重 start に安全（既に動作中なら何もしない）。
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
@@ -175,10 +170,38 @@ impl CaptureBackend for PwSystemBackend {
         let running = self.running.clone();
         running.store(true, Ordering::SeqCst);
 
+        // 自ホスト除外（②）は **プロセス Exclude 機構を再利用**して実現する。
+        // 除外 PID = 自プロセス（std::process::id()）として、自分以外の全アプリ出力
+        // （Stream/Output/Audio）を自キャプチャ入力へ fan-in リンクする。これにより
+        // 「システム音 − 自プロセスの再生音」が録れる（フィードバック防止）。
+        // **注意**: この経路は既定 sink の monitor（生 sink loopback）ではなく、各アプリの
+        // 出力ストリームを fan-in する方式である。monitor は「sink へ流れる全混合音」で
+        // あり、そこから自プロセス分だけを引き算する OS プリミティブが PipeWire には
+        // 無いため、自分を除外できる唯一の方法としてアプリ出力 fan-in を採る。
+        // `exclude_self == false` の既定経路は従来どおり sink monitor で**無変更（回帰ゼロ）**。
+        let exclude_self = self.exclude_self;
         let handle = thread::Builder::new()
-            .name("flexaudio-pw-system".into())
+            .name(
+                if exclude_self {
+                    "flexaudio-pw-system-excl"
+                } else {
+                    "flexaudio-pw-system"
+                }
+                .into(),
+            )
             .spawn(move || {
-                run_pw_loop(sink, stop_rx, &ready_tx);
+                if exclude_self {
+                    // 自分（std::process::id()）以外を録る Exclude 機構へ委譲。停止/ready/
+                    // running/join は system 経路と同じチャネル・Terminate を共有する。
+                    run_pw_process_loop(
+                        PidSelect::Exclude(std::process::id()),
+                        sink,
+                        stop_rx,
+                        &ready_tx,
+                    );
+                } else {
+                    run_pw_loop(sink, stop_rx, &ready_tx);
+                }
             })
             .map_err(|e| Error::Backend(format!("spawn pipewire thread: {e}")))?;
 
@@ -289,10 +312,11 @@ impl Drop for PwSystemBackend {
 ///
 /// # `mode`（①: Include / Exclude）
 ///
-/// - [`ProcessMode::Include`]（既定）: 対象 PID のノードのみ録る現状動作（fan-out リンク）。
-/// - [`ProcessMode::Exclude`]: 対象 PID **以外**の全システム音を録る。**Linux では未実装**で、
-///   [`start`](CaptureBackend::start) が [`Error::Unsupported`] を返す（黙殺でなく明示エラー。
-///   実装は Wave F＝「指定 PID 以外の sink-input monitor をリンク」）。
+/// - [`ProcessMode::Include`]（既定）: 対象 PID のノードのみ録る現状動作（fan-out リンク。
+///   代表 1 ノード）。
+/// - [`ProcessMode::Exclude`]: 対象 PID **以外**の全アプリ出力（`Stream/Output/Audio`）を
+///   自キャプチャ入力へ fan-in リンクして録る（Include の機構を述語反転 + 多ノード化で
+///   再利用）。PID が未解決のノードは Client 到着まで保留し、除外プロセスを取り違えない。
 ///
 /// system ソースの `exclude_self`（②）はこのプロセス backend とは無関係（非合成）。
 ///
@@ -305,8 +329,8 @@ impl Drop for PwSystemBackend {
 /// assert_eq!(backend.native_format(), (48_000, 2));
 /// // let mut backend = backend;
 /// // backend.start(sink)?;  // PipeWire 不在/registry 失敗なら Err(Backend)、
-/// //                        // それ以外は成功して対象 PID 出現まで待機（Include）。
-/// //                        // Exclude は Err(Unsupported)。
+/// //                        // それ以外は成功して待機（Include は対象 PID 出現待ち、
+/// //                        // Exclude は対象 PID 以外を順次 fan-in リンク）。
 /// // ...
 /// // backend.stop();
 /// ```
@@ -316,8 +340,8 @@ pub struct PwProcessBackend {
     /// 指す出力ノードを対象にする（二段照合。[`resolve_node_pid`] 参照）。
     target_pid: u32,
     /// 対象 PID の扱い（①・Include/Exclude）。[`ProcessMode::Include`] は対象 PID のみ録る
-    /// 現状動作。[`ProcessMode::Exclude`] は Linux 未実装で [`start`](CaptureBackend::start) が
-    /// [`Error::Unsupported`] を返す（Wave F で実装予定）。
+    /// 現状動作。[`ProcessMode::Exclude`] は対象 PID **以外**の全アプリ出力を fan-in して録る
+    /// （Include 機構を述語反転 + 多ノード化で再利用）。
     mode: ProcessMode,
     /// 起動中フラグ（二重 start ガード／drop 判定用）。`Send`。
     running: Arc<AtomicBool>,
@@ -334,7 +358,7 @@ impl PwProcessBackend {
     /// [`start`](CaptureBackend::start) 内で専用スレッド上で行われる。
     ///
     /// [`ProcessMode::Include`] は対象 PID のみ録る現状動作。[`ProcessMode::Exclude`] は
-    /// Linux 未実装で `start` が [`Error::Unsupported`] を返す（Wave F で実装予定）。
+    /// 対象 PID **以外**の全アプリ出力を fan-in して録る（Include 機構の再利用）。
     pub fn new(target_pid: u32, mode: ProcessMode) -> Self {
         Self {
             target_pid,
@@ -362,16 +386,18 @@ impl CaptureBackend for PwProcessBackend {
     }
 
     fn start(&mut self, sink: RawSink) -> Result<()> {
-        // Exclude（①）は Linux 未実装。黙殺せず明示エラーで弾く（Wave F で実装）。
-        // sink はここで drop（消費せず返す）。Include の既定経路は従来どおり無変更。
-        if self.mode == ProcessMode::Exclude {
-            let _ = sink;
-            return Err(Error::Unsupported);
-        }
         // 二重 start に安全（既に動作中なら何もしない）。
         if self.running.load(Ordering::SeqCst) {
             return Ok(());
         }
+
+        // ①の mode をノード選択述語へ写す。
+        // - Include: 対象 PID のノードのみリンク（代表 1 ノード。従来動作）。
+        // - Exclude: 対象 PID 以外の全 Stream/Output/Audio ノードをリンク（fan-in）。
+        let select = match self.mode {
+            ProcessMode::Include => PidSelect::Include(self.target_pid),
+            ProcessMode::Exclude => PidSelect::Exclude(self.target_pid),
+        };
 
         // ループスレッドへの停止チャネル（受信端は loop に attach する）。
         let (stop_tx, stop_rx) = pw::channel::channel::<Terminate>();
@@ -384,11 +410,10 @@ impl CaptureBackend for PwProcessBackend {
         let running = self.running.clone();
         running.store(true, Ordering::SeqCst);
 
-        let target_pid = self.target_pid;
         let handle = thread::Builder::new()
             .name("flexaudio-pw-process".into())
             .spawn(move || {
-                run_pw_process_loop(target_pid, sink, stop_rx, &ready_tx);
+                run_pw_process_loop(select, sink, stop_rx, &ready_tx);
             })
             .map_err(|e| Error::Backend(format!("spawn pipewire process thread: {e}")))?;
 
@@ -454,16 +479,17 @@ impl Drop for PwProcessBackend {
 /// 破棄する（いずれも `!Send`）。セットアップ完了/失敗を `ready_tx` で呼び出し元へ
 /// 返し、成功時は `main_loop.run()` で停止指示（[`Terminate`]）まで回り続ける。
 /// 対象 PID のノードを registry で待ち受け、対象出力ポートと自入力ポートが揃った
-/// 時点で link-factory リンクを張る。
+/// 時点で link-factory リンクを張る。`select` で「対象 PID のみ録る（Include）」か
+/// 「対象 PID 以外を録る（Exclude / exclude_self）」かを切り替える。
 fn run_pw_process_loop(
-    target_pid: u32,
+    select: PidSelect,
     sink: RawSink,
     stop_rx: pw::channel::Receiver<Terminate>,
     ready_tx: &mpsc::Sender<std::result::Result<(), String>>,
 ) {
     // セットアップ（接続・stream 生成・registry リスナ登録）を別関数に集約。
     // 戻り値はループ実行中ずっと生かす所有物（drop すると監視/リンクが止まる）。
-    let (main_loop, _keep) = match setup_pw_process(target_pid, sink) {
+    let (main_loop, _keep) = match setup_pw_process(select, sink) {
         Ok(t) => t,
         Err(msg) => {
             // セットアップ失敗を通知して終了（panic しない）。
@@ -501,16 +527,20 @@ fn run_pw_process_loop(
 /// - `StreamListener`: param_changed/process コールバック登録。drop で外れる。
 /// - `RegistryRc`: registry プロキシ本体。
 /// - `Registry Listener`: global/global_remove リスナ（drop で外れる）。
-/// - `links`: link-factory で生成した [`pw::link::Link`] プロキシ群。**drop すると
-///   リンクが切れる**ため、ループスレッド上で生かし続ける。registry コールバックが
-///   ここへ push / clear するので `Rc<RefCell<…>>` で共有する。
+/// - `links`: link-factory で生成した [`pw::link::Link`] プロキシ群を、リンク先の出力
+///   ノードの registry global id 毎に束ねたマップ。**drop するとリンクが切れる**ため、
+///   ループスレッド上で生かし続ける。registry コールバックがここへ insert / remove /
+///   clear するので `Rc<RefCell<…>>` で共有する。Include は高々 1 エントリ、Exclude は
+///   多数のエントリを持つ（マップごと drop すれば全リンクが一括で切れる）。
 #[allow(clippy::type_complexity)]
 struct ProcessKeep {
     _stream: pw::stream::StreamRc,
     _listener: pw::stream::StreamListener<UserData>,
     _registry: pw::registry::RegistryRc,
     _registry_listener: pw::registry::Listener,
-    _links: std::rc::Rc<std::cell::RefCell<Vec<pw::link::Link>>>,
+    _links: std::rc::Rc<
+        std::cell::RefCell<std::collections::HashMap<u32, Vec<pw::link::Link>>>,
+    >,
     _core: pw::core::CoreRc,
 }
 
@@ -639,6 +669,30 @@ fn capture_node_name(target_pid: u32) -> String {
     format!("flexaudio-capture-{target_pid}")
 }
 
+/// プロセスキャプチャループのノード選択述語。
+///
+/// Include / Exclude / exclude_self の 3 経路を 1 本の fan-in リンク機構に集約する。
+/// 内包する `u32` はいずれも「比較対象の PID」で、Include は一致を、Exclude は不一致を
+/// （= 当該 PID を**残す**）リンク条件にする。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PidSelect {
+    /// 解決済み PID == この PID のノードだけリンクする（現状の Include 動作。代表 1 ノード）。
+    Include(u32),
+    /// 解決済み PID != この PID の `Stream/Output/Audio` ノードを**すべて**リンクする
+    /// （Exclude / exclude_self）。内包 PID は録音から**除外する**プロセスの PID。
+    Exclude(u32),
+}
+
+impl PidSelect {
+    /// 比較対象 PID（Include は録る側、Exclude は除外する側）。`global_remove` で
+    /// 「対象/除外 Client の消失」を判定するのに使う。
+    fn pid(self) -> u32 {
+        match self {
+            PidSelect::Include(p) | PidSelect::Exclude(p) => p,
+        }
+    }
+}
+
 /// プロセスキャプチャのセットアップ一式。失敗は `Err(String)`（panic しない）。
 ///
 /// 方式 B（link-factory）。[`setup_pw`]（システム monitor）との違い:
@@ -654,12 +708,16 @@ fn capture_node_name(target_pid: u32) -> String {
 ///   Client を指すだけなので、PID 照合は二段（node → client.id → Client の PID。
 ///   [`resolve_node_pid`]）。Client が先でも Node が先でも、各 global 到着時に再評価する
 ///   （到着順非依存）。
-/// - 「`target_pid` に属する Stream/Output/Audio ノードの出力ポート」と「自ノードの入力
-///   ポート」が揃った時点で、registry コールバック（ループスレッド実行）から
-///   `core.create_object::<pw::link::Link>("link-factory", ...)` でチャンネル対応
-///   （[`pair_ports`]：FL→FL/FR→FR、モノは複製）のリンクを張る。
-/// - `global_remove` でリンク中ノード/対象 Client/対象出力ポートの消失を検知したら、保持中の
-///   Link を drop してリンクを切り、表からも除去して再待機する（冪等に再リンク可能）。
+/// - `select`（[`PidSelect`]）の述語でリンク対象ノードを決める。Include は「対象 PID に
+///   属する Stream/Output/Audio ノード」1 件（代表）、Exclude は「除外 PID **以外**の
+///   解決済み PID を持つ Stream/Output/Audio ノード」**全件**（PID 未解決は Client 到着
+///   まで保留）。各対象ノードの出力ポートと自ノードの入力ポートが揃った時点で、registry
+///   コールバック（ループスレッド実行）から `core.create_object::<pw::link::Link>(
+///   "link-factory", ...)` でチャンネル対応（[`pair_ports`]：FL→FL/FR→FR、モノは複製）の
+///   リンクを張る。リンクはノード単位で `linked`（node_id → Links）マップに保持する。
+/// - `global_remove` で個別リンク中ノード/その出力ポートの消失を検知したらそのノードの
+///   エントリだけ drop（Exclude では他ノードのリンクは保つ）、自ノード/自入力ポート/対象
+///   Client の消失は全エントリを drop して再待機する（いずれも冪等に再リンク可能）。
 ///
 /// 使うキー定数（いずれも crate `keys.rs` で feature gate 外を確認済み）:
 /// `*pw::keys::SEC_PID`(="pipewire.sec.pid")・`*pw::keys::CLIENT_ID`(="client.id")・
@@ -668,7 +726,7 @@ fn capture_node_name(target_pid: u32) -> String {
 /// `LINK_OUTPUT_PORT`/`LINK_INPUT_NODE`/`LINK_INPUT_PORT`。
 #[allow(clippy::type_complexity)]
 fn setup_pw_process(
-    target_pid: u32,
+    select: PidSelect,
     sink: RawSink,
 ) -> std::result::Result<(pw::main_loop::MainLoopRc, ProcessKeep), String> {
     use std::cell::{Cell, RefCell};
@@ -694,8 +752,9 @@ fn setup_pw_process(
     // - media.role=Music: ヒント
     // - node.name=flexaudio-capture-<pid>: registry で自分の入力ポートを引くための固有名
     // **STREAM_CAPTURE_SINK は付けない**。**AUTOCONNECT も付けない**（マイクへの自動
-    // リンクを防ぐ。明示 link-factory リンクのみ）。
-    let node_name = capture_node_name(target_pid);
+    // リンクを防ぐ。明示 link-factory リンクのみ）。node.name は select の比較 PID を
+    // 埋めて衝突を避ける（Include=録る PID / Exclude=除外する PID）。
+    let node_name = capture_node_name(select.pid());
     let props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Capture",
@@ -744,33 +803,44 @@ fn setup_pw_process(
     let nodes: Rc<RefCell<HashMap<u32, NodeEntry>>> = Rc::new(RefCell::new(HashMap::new()));
     // Client 表: Client の registry global id → その Client の pipewire.sec.pid。
     let client_pid: Rc<RefCell<HashMap<u32, u32>>> = Rc::new(RefCell::new(HashMap::new()));
-    // application PID == target_pid の Client の registry global id（判明時 Some）。
+    // 比較対象 PID（Include は録る PID / Exclude は除外する PID）の Client の registry
+    // global id（判明時 Some）。global_remove で「対象/除外 Client 消失」を判定するのに使う。
     let target_client_id: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
     // ポート表: registry port global id → 登録情報（所有 node.id / direction / channel）。
     let ports: Rc<RefCell<HashMap<u32, PortEntry>>> = Rc::new(RefCell::new(HashMap::new()));
-    // 現在リンク中の対象ノードの registry global id（None=未リンク。MVP は代表 1 ノード）。
-    let linked_node_id: Rc<Cell<Option<u32>>> = Rc::new(Cell::new(None));
-    // 生成した Link プロキシ群。drop でリンクが切れるため run 中ずっと保持する。
-    let links: Rc<RefCell<Vec<pw::link::Link>>> = Rc::new(RefCell::new(Vec::new()));
+    // 現在リンク中の出力ノード表: 出力ノードの registry global id → そのノード向けに生成した
+    // Link プロキシ群。**drop でリンクが切れる**ため run 中ずっと保持する。Include は高々
+    // 1 エントリ（代表 1 ノード）、Exclude は多数。エントリ単位 remove で個別に、map ごと
+    // clear で一括でリンクを切れる。linked_node_id + links を 1 本に統合したもの。
+    let linked: Rc<RefCell<HashMap<u32, Vec<pw::link::Link>>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 
-    // 全状態が更新されるたびに「未リンク かつ 対象出力ポート・自入力ポートが揃った」を
-    // 再評価し、揃っていれば link-factory でチャンネル対応リンクを張るヘルパ。
+    // 全状態が更新されるたびに「リンクすべき出力ノードのうち未リンクのもの」を再評価し、
+    // 対象出力ポート・自入力ポートが揃っていれば link-factory でチャンネル対応リンクを
+    // 張るヘルパ。`select` の述語で対象ノード集合を決める:
+    // - Include(pid): 解決済み PID == pid のノード（代表 1 ノードのみ。`linked` が
+    //   既に非空なら何もしない＝従来の単一ノード意味論を保つ）。
+    // - Exclude(pid): 解決済み PID != pid の `Stream/Output/Audio` ノードを**すべて**。
+    //   PID 未解決（None）のノードは**まだリンクしない**（Client 到着で PID が解ける
+    //   まで待つ。除外プロセスを取り違えてリンクするのを防ぐ）。
+    // 既に `linked` のキーになっているノードは二重リンクしない（冪等）。
     // ループスレッド上で呼ばれる（`!Send` な core/stream を触ってよい）。
     #[allow(clippy::too_many_arguments)]
     fn try_link(
         core: &pw::core::CoreRc,
         stream: &pw::stream::StreamRc,
-        target_pid: u32,
+        select: PidSelect,
         self_node_id: &Cell<Option<u32>>,
         nodes: &RefCell<HashMap<u32, NodeEntry>>,
         client_pid: &RefCell<HashMap<u32, u32>>,
         ports: &RefCell<HashMap<u32, PortEntry>>,
-        linked_node_id: &Cell<Option<u32>>,
-        links: &RefCell<Vec<pw::link::Link>>,
+        linked: &RefCell<HashMap<u32, Vec<pw::link::Link>>>,
     ) {
-        // 既にリンク済みなら何もしない（MVP は代表 1 ノードのみ）。
-        if linked_node_id.get().is_some() {
-            return;
+        // Include は代表 1 ノードのみ。既にリンク済みなら何もしない（従来意味論を保つ）。
+        if let PidSelect::Include(_) = select {
+            if !linked.borrow().is_empty() {
+                return;
+            }
         }
 
         // 自ノード id を stream から読み直す（connect 直後は未確定のことがある）。
@@ -783,79 +853,111 @@ fn setup_pw_process(
             return;
         };
 
-        // 対象 PID に属する Stream/Output/Audio ノードを 1 件選ぶ（代表 1 ノード）。
-        let target_node_id = {
+        // リンクすべき出力ノード id 集合を述語で決める。
+        // - Include: 解決済み PID == pid のノードを 1 件だけ（代表）。
+        // - Exclude: 解決済み PID（!= pid）のノードを全件（PID 未解決は除く）。
+        let targets: Vec<u32> = {
             let nodes = nodes.borrow();
             let client_pid = client_pid.borrow();
-            nodes
-                .iter()
-                .find(|(_id, entry)| resolve_node_pid(entry, &client_pid) == Some(target_pid))
-                .map(|(&node_id, _)| node_id)
-        };
-        let Some(target_node_id) = target_node_id else {
-            return;
+            let linked = linked.borrow();
+            match select {
+                PidSelect::Include(pid) => nodes
+                    .iter()
+                    .find(|(id, entry)| {
+                        !linked.contains_key(id)
+                            && resolve_node_pid(entry, &client_pid) == Some(pid)
+                    })
+                    .map(|(&node_id, _)| node_id)
+                    .into_iter()
+                    .collect(),
+                PidSelect::Exclude(pid) => nodes
+                    .iter()
+                    .filter(|(id, entry)| {
+                        if linked.contains_key(id) {
+                            return false;
+                        }
+                        // PID が**解決済みかつ除外 PID 以外**のときだけ対象にする。
+                        // 未解決（None）は Client 到着まで保留（除外プロセスを取り違えない）。
+                        matches!(resolve_node_pid(entry, &client_pid), Some(other) if other != pid)
+                    })
+                    .map(|(&node_id, _)| node_id)
+                    .collect(),
+            }
         };
 
-        // 対象ノードの出力ポートと、自ノードの入力ポートを ports 表から引く。
-        let (out_ports, in_ports): (Vec<(u32, String)>, Vec<(u32, String)>) = {
+        if targets.is_empty() {
+            return;
+        }
+
+        // 自ノードの入力ポートを ports 表から引く（全対象ノードで共有）。
+        let in_ports: Vec<(u32, String)> = {
             let ports = ports.borrow();
-            let out_ports = ports
-                .iter()
-                .filter(|(_pid, p)| p.node_id == target_node_id && p.direction == "out")
-                .map(|(&pid, p)| (pid, p.channel.clone()))
-                .collect();
-            let in_ports = ports
+            ports
                 .iter()
                 .filter(|(_pid, p)| p.node_id == self_nid && p.direction == "in")
                 .map(|(&pid, p)| (pid, p.channel.clone()))
-                .collect();
-            (out_ports, in_ports)
+                .collect()
         };
-
-        // どちらかが未出現ならまだリンクできない（次の global 到着で再評価）。
-        if out_ports.is_empty() || in_ports.is_empty() {
+        // 自入力ポートがまだ無ければリンクできない（次の global 到着で再評価）。
+        if in_ports.is_empty() {
             return;
         }
 
-        // チャンネル対応（FL→FL/FR→FR、モノは複製、取れなければ順序）でペアを作る。
-        let pairs = pair_ports(&out_ports, &in_ports);
-        if pairs.is_empty() {
-            return;
-        }
-        let want = pairs.len();
-
-        // link-factory で各ペアをリンクする。
-        let mut created: Vec<pw::link::Link> = Vec::with_capacity(want);
-        for (out_port_id, in_port_id) in pairs {
-            let link_props = properties! {
-                *pw::keys::LINK_OUTPUT_NODE => target_node_id.to_string(),
-                *pw::keys::LINK_OUTPUT_PORT => out_port_id.to_string(),
-                *pw::keys::LINK_INPUT_NODE => self_nid.to_string(),
-                *pw::keys::LINK_INPUT_PORT => in_port_id.to_string(),
+        for target_node_id in targets {
+            // 対象ノードの出力ポートを ports 表から引く。
+            let out_ports: Vec<(u32, String)> = {
+                let ports = ports.borrow();
+                ports
+                    .iter()
+                    .filter(|(_pid, p)| p.node_id == target_node_id && p.direction == "out")
+                    .map(|(&pid, p)| (pid, p.channel.clone()))
+                    .collect()
             };
-            match core.create_object::<pw::link::Link>("link-factory", &link_props) {
-                Ok(link) => created.push(link),
-                Err(_e) => {
-                    // このペアのリンク生成に失敗。残りは試さず部分リンクを避ける。
-                    break;
+            // 出力ポートが未出現ならこのノードはまだリンクできない（次回再評価）。
+            if out_ports.is_empty() {
+                continue;
+            }
+
+            // チャンネル対応（FL→FL/FR→FR、モノは複製、取れなければ順序）でペアを作る。
+            let pairs = pair_ports(&out_ports, &in_ports);
+            if pairs.is_empty() {
+                continue;
+            }
+            let want = pairs.len();
+
+            // link-factory で各ペアをリンクする。
+            let mut created: Vec<pw::link::Link> = Vec::with_capacity(want);
+            for (out_port_id, in_port_id) in pairs {
+                let link_props = properties! {
+                    *pw::keys::LINK_OUTPUT_NODE => target_node_id.to_string(),
+                    *pw::keys::LINK_OUTPUT_PORT => out_port_id.to_string(),
+                    *pw::keys::LINK_INPUT_NODE => self_nid.to_string(),
+                    *pw::keys::LINK_INPUT_PORT => in_port_id.to_string(),
+                };
+                match core.create_object::<pw::link::Link>("link-factory", &link_props) {
+                    Ok(link) => created.push(link),
+                    Err(_e) => {
+                        // このペアのリンク生成に失敗。残りは試さず部分リンクを避ける。
+                        break;
+                    }
                 }
             }
-        }
 
-        // **全ペアが張れたときだけ**リンク確立とみなす。片チャンネルだけ成功した
-        // 部分リンク（例: FL だけ繋がり FR が落ちる）を「確立」と誤認すると、対象が
-        // 実質モノラルに固定化されてしまう。全ペア揃わなければ、ここで作った Link を
-        // 破棄（drop）して未リンクのまま待機を続け、次の global 到着で再評価する
-        // （残りポートが後から出る/リンクが落ちた一時状態に対して冪等にリトライ）。
-        if created.len() != want {
-            // created を drop してリンクを残さない（部分リンクを確定させない）。
-            drop(created);
-            return;
-        }
+            // **全ペアが張れたときだけ**このノードのリンク確立とみなす。片チャンネル
+            // だけ成功した部分リンク（例: FL だけ繋がり FR が落ちる）を「確立」と
+            // 誤認すると、対象が実質モノラルに固定化されてしまう。全ペア揃わなければ、
+            // ここで作った Link を破棄（drop）してこのノードは未リンクのまま据え置き、
+            // 次の global 到着で再評価する（残りポートが後から出る/リンクが落ちた一時
+            // 状態に対して冪等にリトライ）。他の対象ノードの処理は続行する。
+            if created.len() != want {
+                // created を drop してリンクを残さない（部分リンクを確定させない）。
+                drop(created);
+                continue;
+            }
 
-        // 全ペア確立。Link プロキシを保持してリンク確立とみなす。
-        links.borrow_mut().extend(created);
-        linked_node_id.set(Some(target_node_id));
+            // 全ペア確立。Link プロキシをノード単位で保持してリンク確立とみなす。
+            linked.borrow_mut().insert(target_node_id, created);
+        }
     }
 
     // --- registry global / global_remove リスナ ---
@@ -869,8 +971,7 @@ fn setup_pw_process(
     let client_pid_for_global = client_pid.clone();
     let target_client_for_global = target_client_id.clone();
     let ports_for_global = ports.clone();
-    let linked_for_global = linked_node_id.clone();
-    let links_for_global = links.clone();
+    let linked_for_global = linked.clone();
 
     let core_for_remove = core.clone();
     let stream_for_remove = stream.clone();
@@ -879,8 +980,7 @@ fn setup_pw_process(
     let client_pid_for_remove = client_pid.clone();
     let target_client_for_remove = target_client_id.clone();
     let ports_for_remove = ports.clone();
-    let linked_for_remove = linked_node_id.clone();
-    let links_for_remove = links.clone();
+    let linked_for_remove = linked.clone();
 
     let _registry_listener = registry
         .add_listener_local()
@@ -902,7 +1002,9 @@ fn setup_pw_process(
                             return;
                         };
                         client_pid_for_global.borrow_mut().insert(global.id, pid);
-                        if pid == target_pid {
+                        // 比較対象 PID（Include は録る PID / Exclude は除外する PID）の
+                        // Client を控える（global_remove で消失検知に使う）。
+                        if pid == select.pid() {
                             target_client_for_global.set(Some(global.id));
                         }
                     }
@@ -957,13 +1059,12 @@ fn setup_pw_process(
                 try_link(
                     &core_for_global,
                     &stream_for_global,
-                    target_pid,
+                    select,
                     &self_node_for_global,
                     &nodes_for_global,
                     &client_pid_for_global,
                     &ports_for_global,
                     &linked_for_global,
-                    &links_for_global,
                 );
             }));
         })
@@ -971,28 +1072,31 @@ fn setup_pw_process(
             // FFI 越えの panic は UB。本体を catch_unwind で包む（defense-in-depth）。
             let _ = catch_unwind(AssertUnwindSafe(|| {
                 // 消えた id の種類に応じて表から除去し、リンク状態を見直す。
+                // 借用衝突を避けるため、まず scoped borrow で「何をするか」を booleans /
+                // owner として確定させ、その後で linked を変更し try_link を呼ぶ。
                 let mut relink_needed = false;
 
-                // 消えた id が「リンク中ノード」or「対象 Client」or「対象出力ポート」or
-                // **自ノード** or **自入力ポート**なら、保持中の Link を drop してリンク
-                // 解除し再待機する。
-                let was_linked_node = linked_for_remove.get() == Some(id);
+                // 消えた id が「リンク中ノード」or「対象/除外 Client」or「自ノード」か。
+                let was_linked_node = linked_for_remove.borrow().contains_key(&id);
                 let was_target_client = target_client_for_remove.get() == Some(id);
                 // 自ノード（自前キャプチャ stream のノード）自体が消えたか。
                 let was_self_node = self_node_for_remove.get() == Some(id);
-                // リンク中ノードに属する出力ポート、または **自ノードに属する入力ポート**が
-                // 消えたか（ports 表で判定）。自入力ポートの消失を見逃すと、入力ポートが
-                // 落ちているのに linked 扱いのまま固着し、無音のまま復帰しなくなる。
-                let (was_linked_out_port, was_self_in_port) = {
+
+                // 消えた id がリンク中いずれかのノードに属する出力ポートなら、その所有ノード
+                // id を求める。また自ノードに属する入力ポートが消えたかも判定する
+                // （自入力ポートの消失を見逃すと、入力ポートが落ちているのに linked 扱いの
+                // まま固着し、無音のまま復帰しなくなる）。ports.borrow() を try_link 呼び出し
+                // 跨ぎで保持しないよう、この scope 内で owner / bool を計算してから抜ける。
+                let (linked_out_owner, was_self_in_port): (Option<u32>, bool) = {
                     let ports = ports_for_remove.borrow();
-                    let linked_out = if let Some(linked) = linked_for_remove.get() {
-                        ports
-                            .get(&id)
-                            .map(|p| p.node_id == linked && p.direction == "out")
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
+                    let owner = ports.get(&id).and_then(|p| {
+                        if p.direction == "out" && linked_for_remove.borrow().contains_key(&p.node_id)
+                        {
+                            Some(p.node_id)
+                        } else {
+                            None
+                        }
+                    });
                     let self_in = if let Some(self_nid) = self_node_for_remove.get() {
                         ports
                             .get(&id)
@@ -1001,20 +1105,32 @@ fn setup_pw_process(
                     } else {
                         false
                     };
-                    (linked_out, self_in)
+                    (owner, self_in)
                 };
 
-                if was_linked_node
-                    || was_target_client
-                    || was_linked_out_port
-                    || was_self_node
-                    || was_self_in_port
-                {
+                // 自ノード/自入力ポート/対象 Client の消失は **全リンクを一括解除**して
+                // 再評価に委ねる（冪等再リンク）。
+                // - 自ノード/自入力ポート: 入力側が消えたので全リンクが無効。
+                // - 対象/除外 Client: Include ならその PID の全ノードが消える（録る対象消滅）。
+                //   Exclude でも一括解除→再リンクで結果は正しい（除外 Client のノードは
+                //   この後 nodes 表から消えるので再リンクされず、残す側だけ張り直される）。
+                //   spec の「最も単純で正しい規則」に従い was_target_client は一括解除する。
+                if was_self_node || was_self_in_port || was_target_client {
                     // 保持中の Link を全部 drop（= リンク解除）して未リンクに戻す。
-                    links_for_remove.borrow_mut().clear();
-                    linked_for_remove.set(None);
+                    linked_for_remove.borrow_mut().clear();
                     relink_needed = true;
+                } else {
+                    // 個別ノードの消失のみ解除する（Exclude で他ノードのリンクは保つ）。
+                    if was_linked_node {
+                        linked_for_remove.borrow_mut().remove(&id);
+                        relink_needed = true;
+                    }
+                    if let Some(owner) = linked_out_owner {
+                        linked_for_remove.borrow_mut().remove(&owner);
+                        relink_needed = true;
+                    }
                 }
+
                 if was_target_client {
                     target_client_for_remove.set(None);
                 }
@@ -1035,13 +1151,12 @@ fn setup_pw_process(
                     try_link(
                         &core_for_remove,
                         &stream_for_remove,
-                        target_pid,
+                        select,
                         &self_node_for_remove,
                         &nodes_for_remove,
                         &client_pid_for_remove,
                         &ports_for_remove,
                         &linked_for_remove,
-                        &links_for_remove,
                     );
                 }
             }));
@@ -1055,7 +1170,7 @@ fn setup_pw_process(
             _listener: listener,
             _registry: registry,
             _registry_listener,
-            _links: links,
+            _links: linked,
             _core: core,
         },
     ))
@@ -2203,21 +2318,28 @@ mod tests {
         be.stop();
     }
 
-    /// system の `exclude_self=true`（②）は Linux 未実装なので `start` が
-    /// [`Error::Unsupported`] を返す（黙殺でなく明示エラー・panic しない）。
-    /// `false`（既定 monitor）の回帰ゼロとは独立に、明示エラー経路を固定する。
+    /// system の `exclude_self=true`（②）は **プロセス Exclude 機構の再利用で実装済み**。
+    /// `start` は `Unsupported` を返さず、PipeWire 不在の homelab では
+    /// [`Error::Backend`]、PipeWire セッションがある環境では `Ok(())`（待機成功）になる。
+    /// どちらでも panic しないこと・Ok なら `stop()` まで一巡できることを固定する。
+    /// `start_is_graceful_without_pipewire` と同型。
     #[test]
-    fn system_exclude_self_is_unsupported() {
+    fn system_exclude_self_is_graceful() {
         let (prod, _cons) = raw_ring(1 << 16);
         let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
         let mut be = PwSystemBackend::new(true);
         assert!(be.exclude_self());
         match be.start(sink) {
-            Err(Error::Unsupported) => { /* 期待どおり */ }
-            other => panic!("exclude_self=true は Unsupported を返すべき: {other:?}"),
+            Ok(()) => {
+                // PipeWire セッションがある環境。自分以外を fan-in する Exclude 機構へ
+                // 委譲され、対象が未出現でも待機成功。停止まで一巡できること。
+                be.stop();
+            }
+            Err(Error::Backend(_)) => {
+                // PipeWire 不在/registry 失敗: 想定内。panic していないことが要点。
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
         }
-        // 起動していないので stop は安全な no-op。
-        be.stop();
     }
 
     /// `extract_json_name` が PipeWire のメタデータ値（JSON）から name を抜けること。
@@ -2352,20 +2474,33 @@ mod tests {
         be.stop();
     }
 
-    /// process の [`ProcessMode::Exclude`]（①）は Linux 未実装なので `start` が
-    /// [`Error::Unsupported`] を返す（黙殺でなく明示エラー・panic しない）。
-    /// Include の回帰ゼロとは独立に、明示エラー経路を固定する。
+    /// process の [`ProcessMode::Exclude`]（①）は **実装済み**（対象 PID 以外を fan-in）。
+    /// `start` は `Unsupported` を返さず、PipeWire 不在の homelab では [`Error::Backend`]、
+    /// PipeWire セッションがある環境では `Ok(())`（待機成功）になる。どちらでも panic
+    /// しないこと・Ok なら二重 start no-op + stop + 二重 stop まで一巡できることを固定する。
+    /// `process_start_is_graceful_without_pipewire` と同型。
     #[test]
-    fn process_exclude_mode_is_unsupported() {
+    fn process_exclude_mode_is_graceful() {
         let (prod, _cons) = raw_ring(1 << 16);
         let sink = RawSink::new(prod, NATIVE_RATE, NATIVE_CHANNELS);
-        let mut be = PwProcessBackend::new(4242, ProcessMode::Exclude);
+        let mut be = PwProcessBackend::new(u32::MAX, ProcessMode::Exclude);
         match be.start(sink) {
-            Err(Error::Unsupported) => { /* 期待どおり */ }
-            other => panic!("ProcessMode::Exclude は Unsupported を返すべき: {other:?}"),
+            Ok(()) => {
+                // PipeWire セッションがある環境。対象 PID 以外を fan-in する Exclude
+                // 機構へ委譲され待機成功。二重 start に安全（no-op で Ok）。
+                let (prod2, _cons2) = raw_ring(1 << 16);
+                let sink2 = RawSink::new(prod2, NATIVE_RATE, NATIVE_CHANNELS);
+                assert!(be.start(sink2).is_ok());
+                // 停止まで一巡できること（リンク前でも安全に破棄）。
+                be.stop();
+                // 二重 stop も安全。
+                be.stop();
+            }
+            Err(Error::Backend(_)) => {
+                // PipeWire 不在/registry 失敗: 想定内。panic していないことが要点。
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
         }
-        // 起動していないので stop は安全な no-op。
-        be.stop();
     }
 
     /// `resolve_node_pid` の純ロジック検証（PipeWire 非依存）。
