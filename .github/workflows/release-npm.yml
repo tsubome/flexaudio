@@ -45,8 +45,8 @@ jobs:
       fail-fast: false
       # Matrix of host runner + Rust target triple.
       #
-      # Covered: linux x64, linux arm64 (cross-compiled on the x64 ubuntu
-      # runner), macOS x64, macOS arm64, windows x64. This matches the napi
+      # Covered: linux x64, linux arm64 (native on a hosted arm64 runner),
+      # macOS x64, macOS arm64, windows x64. This matches the napi
       # "targets" / optionalDependencies in package.json. Windows on arm64 is
       # deliberately left out: GitHub has no hosted Windows/arm64 runner and
       # cross-linking a WASAPI cdylib for arm64 from x64 is not reliable here.
@@ -57,7 +57,7 @@ jobs:
         include:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
           - runner: macos-latest
             target: x86_64-apple-darwin
@@ -71,8 +71,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: crates/flexaudio-napi/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -82,17 +80,14 @@ jobs:
         with:
           workspaces: . -> target
 
-      # Linux native deps (same set as ci.yml). For the aarch64-linux cross
-      # build we also pull the cross linker; cargo's linker for that target is
-      # configured via the env var below.
+      # Linux native deps (same set as ci.yml). Both linux targets build
+      # natively on their own runner (x64 on ubuntu-latest, arm64 on the hosted
+      # arm64 runner), so no cross toolchain is needed.
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libpipewire-0.3-dev libclang-dev libasound2-dev
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-          fi
 
       - name: Install npm dependencies (@napi-rs/cli)
         run: npm ci || npm install
@@ -101,9 +96,6 @@ jobs:
       # per-platform package suffix from package.json's "napi" config.
       - name: Build native addon
         shell: bash
-        env:
-          # cross-linker for the aarch64-linux target; ignored for native builds.
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: npx napi build --platform --release --target ${{ matrix.target }}
 
       - name: Upload addon artifact
