@@ -1,17 +1,15 @@
 # Build the napi-rs native addon for every supported platform and publish the
-# npm packages (the main @aratech/flexaudio package plus one per-platform
-# optional package, the standard napi-rs distribution model).
+# npm packages (the main `flexaudio` package plus one per-platform optional
+# package, the standard napi-rs distribution model).
 #
 # === What the maintainer must set up ===
 #  - Add a repository secret named NPM_TOKEN
 #    (Settings → Secrets and variables → Actions → New repository secret).
 #    Create an automation token at https://www.npmjs.com/settings/<user>/tokens
-#    with publish rights to the @aratech scope.
-#  - The package is published with `--access public` (publishConfig in
-#    package.json already sets access:public for the scoped package).
-#  - npm provenance (`--provenance`) is intentionally NOT enabled below: it
-#    requires a *public* repository. Once this repo is public, add `--provenance`
-#    to the publish command and `id-token: write` to permissions (see comments).
+#    with publish rights to the `flexaudio` package.
+#  - Packages are published with `--access public` and `--provenance`. Provenance
+#    needs a public repository and `id-token: write` (both set below); it signs
+#    the packages with a verifiable link back to this workflow run.
 #
 # Triggered by a version tag (e.g. v0.2.0) or run manually. No-op on PRs.
 
@@ -30,8 +28,9 @@ on:
 
 permissions:
   contents: read
-  # Enable id-token: write here too if/when you turn on npm --provenance
-  # (public repo only).
+  # Required for npm --provenance: signs the published packages from this
+  # public repo's workflow run (no effect on private repos).
+  id-token: write
 
 # All napi commands run inside the addon crate directory.
 defaults:
@@ -48,13 +47,12 @@ jobs:
       #
       # Covered: linux x64, linux arm64 (cross-compiled on the x64 ubuntu
       # runner), macOS x64, macOS arm64, windows x64. This matches the napi
-      # "targets" in package.json EXCEPT aarch64-pc-windows-msvc (win arm64):
-      # GitHub does not offer a hosted Windows/arm64 runner and cross-linking a
-      # WASAPI cdylib for arm64 from x64 is not reliable here, so win-arm64 is
-      # deliberately omitted. If you need it, drop the matching
-      # @aratech/flexaudio-win32-arm64-msvc entry from optionalDependencies in
-      # package.json, or add a self-hosted win-arm64 runner — do not leave the
-      # optional dep pointing at a package that is never published.
+      # "targets" / optionalDependencies in package.json. Windows on arm64 is
+      # deliberately left out: GitHub has no hosted Windows/arm64 runner and
+      # cross-linking a WASAPI cdylib for arm64 from x64 is not reliable here.
+      # It is removed from package.json too, so no optional dep points at a
+      # package that is never published. To add it later, restore the target,
+      # the optional dep, and a runner that can build it.
       matrix:
         include:
           - runner: ubuntu-latest
@@ -162,12 +160,10 @@ jobs:
           set -euo pipefail
           # Publish each per-platform package first...
           for dir in npm/*/; do
-            ( cd "$dir" && npm publish --access public || true )
+            ( cd "$dir" && npm publish --access public --provenance || true )
           done
           # ...then the main package that depends on them.
-          # NOTE: append --provenance here (and set id-token: write) once the
-          # repo is public.
-          npm publish --access public
+          npm publish --access public --provenance
 
       - name: Dry run (skip publish)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
