@@ -128,13 +128,24 @@ jobs:
             fi
 
             if [ "${DRY_RUN}" = "true" ]; then
-              # --no-verify: the platform-specific crates (os-windows / os-macos)
-              # cannot complete a verification build on a Linux runner — their
-              # native SDK targets are unavailable here. Each OS is already
-              # build/test-verified per-platform in ci.yml, so we skip cargo's
-              # re-verification and apply --no-verify uniformly for consistency.
-              echo "[dry-run] cargo publish -p ${crate} --no-verify"
-              cargo publish -p "${crate}" --no-verify --dry-run --allow-dirty
+              # cargo publish --dry-run resolves deps against the live index, so a
+              # crate that depends on another *workspace* crate fails ("no matching
+              # package") until that dep is actually published — a chicken-and-egg
+              # cargo can't solve in a dry run. So in dry-run we only package the
+              # leaf crates (no workspace deps); the dependent crates are exercised
+              # for real at publish time, where wait_for_index makes each dep
+              # resolvable before the next crate goes up.
+              # --no-verify: os-windows/os-macos can't verification-build on Linux
+              # (native SDKs absent); each OS is already verified in ci.yml.
+              case " flexaudio-core flexaudio-vad " in
+                *" ${crate} "*)
+                  echo "[dry-run] cargo publish -p ${crate} --no-verify"
+                  cargo publish -p "${crate}" --no-verify --dry-run --allow-dirty
+                  ;;
+                *)
+                  echo "[dry-run] skip ${crate} (depends on workspace crates not yet on the index; validated at real publish)"
+                  ;;
+              esac
               echo "::endgroup::"
               continue
             fi
