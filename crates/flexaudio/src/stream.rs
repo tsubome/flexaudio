@@ -19,7 +19,7 @@
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -126,6 +126,11 @@ struct SharedState {
     /// 配信しない（RawRing の取り込みは続けるのでデバイスは止まらず、ウォッチドッグの
     /// 失速判定もぶれない）。resume() で false に戻し、次チャンクへ DISCONTINUITY を立てる。
     paused: AtomicBool,
+
+    /// 入力ゲイン（線形倍率）の f32 ビット表現（`f32::to_bits`/`from_bits` で保持）。
+    /// open() で config.gain から初期化し、set_gain() が録音中いつでも書き換える。
+    /// 取り込みスレッドが完成チャンクごとに読み、1.0 以外なら各サンプルへ乗算する。
+    gain_bits: AtomicU32,
 }
 
 impl SharedState {
@@ -173,6 +178,13 @@ impl Stream {
         if config.ring_capacity_chunks == 0 {
             return Err(Error::InvalidArg("ring_capacity_chunks must be > 0".into()));
         }
+        // 入力ゲインは有限かつ 0.0 以上（NaN・無限大・負は InvalidArg）。
+        if !config.gain.is_finite() || config.gain < 0.0 {
+            return Err(Error::InvalidArg(format!(
+                "gain must be finite and >= 0.0, got {}",
+                config.gain
+            )));
+        }
         // 出力フォーマットが対応域か検証（非対応は UnsupportedFormat）。
         config.output.validate()?;
         let native_format = backend.native_format();
@@ -198,6 +210,7 @@ impl Stream {
             switching: AtomicBool::new(false),
             discontinuity_pending: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            gain_bits: AtomicU32::new(config.gain.to_bits()),
         });
 
         Ok(Stream {
@@ -331,6 +344,29 @@ impl Stream {
     /// 現在ポーズ中かどうか。
     pub fn is_paused(&self) -> bool {
         self.shared.paused.load(Ordering::SeqCst)
+    }
+
+    /// 入力ゲイン（線形倍率）を変更する。1.0=そのまま、2.0=約+6dB、0.0=無音。
+    ///
+    /// 録音中いつでも呼べて、次の完成チャンクから効く（チャンクは 20ms 粒度）。
+    /// 乗算後のサンプルは `-1.0..=1.0` にクランプされる。1.0 のときはサンプルに
+    /// 一切触れない（バイト完全パススルー）。有限かつ 0.0 以上でなければ
+    /// [`Error::InvalidArg`]（現在値は変わらない）。
+    pub fn set_gain(&self, gain: f32) -> Result<()> {
+        if !gain.is_finite() || gain < 0.0 {
+            return Err(Error::InvalidArg(format!(
+                "gain must be finite and >= 0.0, got {gain}"
+            )));
+        }
+        self.shared
+            .gain_bits
+            .store(gain.to_bits(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 現在の入力ゲイン（線形倍率）。
+    pub fn gain(&self) -> f32 {
+        f32::from_bits(self.shared.gain_bits.load(Ordering::Relaxed))
     }
 
     /// 完成済みチャンクを 1 つ取り出す（非ブロッキング）。無ければ `None`。
@@ -578,7 +614,8 @@ impl Stream {
     ///
     /// 成功時、`config` の可変項目（`kind` / `device_id` / `target_pid` / `mode`
     /// / `exclude_self`）だけを新しい値へ更新する。`output` / `chunk_ms`
-    /// / `ring_capacity_chunks` は据え置く。
+    /// / `ring_capacity_chunks` は据え置く。`new_config.gain` も無視する（ゲインは
+    /// ストリームの状態であり、切替では変わらない。変更は [`set_gain`](Self::set_gain)）。
     ///
     /// # エラー
     /// - 未 start → [`Error::InvalidState`]。
@@ -730,7 +767,7 @@ fn run_intake(
         // 完成チャンクを全て取り出して ChunkRing へ。
         let out_channels = output.channels.max(1) as usize;
         let mut emitted_any = false;
-        while let Some((data, pts_ns)) = normalizer.pop_chunk() {
+        while let Some((mut data, pts_ns)) = normalizer.pop_chunk() {
             // ポーズ中は完成チャンクを破棄する。直前の RawRing 取り込みで last_sample_ns は
             // 更新済みなのでデバイスは止まらず、ウォッチドッグの失速判定もぶれない。
             // recovered_pending / discontinuity_pending はここでは消費せず持ち越し、resume 後の
@@ -743,6 +780,16 @@ fn run_intake(
             // frames は時間ベース 20ms 固定（48k=960 / 16k=320 / ...）。
             debug_assert_eq!(data.len() % out_channels, 0);
             let frames = data.len() / out_channels;
+
+            // 入力ゲインを適用する（peak/rms の算出より前＝メーターはゲイン後の実レベル
+            // を示す）。1.0 のときはサンプルに一切触れないバイト完全パススルー。1.0 以外
+            // なら各サンプルへ乗算し、±1.0 にクランプする。
+            let gain = f32::from_bits(shared.gain_bits.load(Ordering::Relaxed));
+            if gain != 1.0 {
+                for x in data.iter_mut() {
+                    *x = (*x * gain).clamp(-1.0, 1.0);
+                }
+            }
 
             // 最終 data に対して peak / rms（線形）を算出する（20ms なので極小コスト）。
             let (peak, rms) = peak_rms(&data);
@@ -1378,6 +1425,151 @@ mod tests {
         let got = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
         stream.stop();
         assert!(got, "resume 一回で配信が再開するはず");
+    }
+
+    // --- 入力ゲイン（config.gain / set_gain） ---
+
+    /// config で指定したゲインが完成チャンクの data と peak/rms メーターに反映される。
+    /// MockBackend のサイン波は振幅 0.5 なので、gain 2.0 でチャンクのピークは約 1.0、
+    /// gain 0.5 で約 0.25 になる。peak はゲイン適用後の data から算出されること
+    /// （メーターがゲイン後の実レベルを示すこと）も確認する。
+    #[test]
+    fn gain_scales_samples_and_meters() {
+        // (gain, 期待ピークの範囲)。サイン振幅 0.5 × gain。
+        for (gain, lo, hi) in [(2.0f32, 0.95f32, 1.0f32), (0.5, 0.2, 0.3)] {
+            let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+            let config = StreamConfig {
+                gain,
+                ..Default::default()
+            };
+            let mut stream = Stream::open(config, backend).expect("open");
+            stream.start().expect("start");
+            let chunks = collect_for(&mut stream, Duration::from_millis(300));
+            stream.stop();
+            assert!(!chunks.is_empty(), "gain={gain} でチャンクが届くはず");
+
+            // peak はゲイン適用後の data と一致する（メーターはゲイン後の実レベル）。
+            let mut max_peak = 0.0f32;
+            for c in &chunks {
+                let recomputed = c.data.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+                assert_eq!(
+                    c.peak, recomputed,
+                    "peak はゲイン適用後の data から算出されるはず"
+                );
+                max_peak = max_peak.max(c.peak);
+            }
+            assert!(
+                (lo..=hi).contains(&max_peak),
+                "gain={gain} のピークは {lo}..={hi} のはず: {max_peak}"
+            );
+        }
+    }
+
+    /// 録音中の set_gain が次のチャンクから効く。1.0 で開始してチャンクを受け取ったあと
+    /// set_gain(0.0) すると、以降のチャンクが全サンプル 0・peak 0 になる。
+    #[test]
+    fn set_gain_takes_effect_mid_stream() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        stream.start().expect("start");
+        assert_eq!(stream.gain(), 1.0, "既定ゲインは 1.0");
+
+        // まず通常のチャンクが届くまで待つ。
+        let got_before = wait_until(|| stream.poll_chunk().is_some(), Duration::from_secs(2));
+        assert!(got_before, "set_gain 前にチャンクが届くはず");
+
+        // ゲインを 0.0（無音）へ。次の完成チャンクから効く（20ms 粒度）。
+        stream.set_gain(0.0).expect("set_gain(0.0)");
+        assert_eq!(stream.gain(), 0.0);
+
+        // 設定前に完成していたチャンクが流れてくる可能性があるので、無音チャンクの
+        // 到着まで待つ。
+        let got_silent = wait_until(
+            || matches!(stream.poll_chunk(), Some(c) if c.peak == 0.0),
+            Duration::from_secs(2),
+        );
+        assert!(got_silent, "set_gain(0.0) 後に無音チャンクが届くはず");
+
+        // 以降のチャンクは全サンプル 0・peak 0・rms 0 のまま。
+        let after = collect_for(&mut stream, Duration::from_millis(300));
+        stream.stop();
+        assert!(!after.is_empty(), "無音でもチャンクは流れ続けるはず");
+        for c in &after {
+            assert!(
+                c.data.iter().all(|&x| x == 0.0),
+                "gain 0.0 では全サンプル 0 のはず"
+            );
+            assert_eq!(c.peak, 0.0);
+            assert_eq!(c.rms, 0.0);
+        }
+    }
+
+    /// 大きなゲインでもサンプルは ±1.0 にクランプされる。サイン振幅 0.5 × gain 100 は
+    /// クランプなしなら 50 に達するが、全サンプルが ±1.0 に収まり、ピークはちょうど 1.0。
+    #[test]
+    fn gain_clamps_to_unit_range() {
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let config = StreamConfig {
+            gain: 100.0,
+            ..Default::default()
+        };
+        let mut stream = Stream::open(config, backend).expect("open");
+        stream.start().expect("start");
+        let chunks = collect_for(&mut stream, Duration::from_millis(300));
+        stream.stop();
+        assert!(!chunks.is_empty(), "チャンクが届くはず");
+
+        let mut max_peak = 0.0f32;
+        for c in &chunks {
+            assert!(
+                c.data.iter().all(|&x| (-1.0..=1.0).contains(&x)),
+                "サンプルは ±1.0 を超えないはず"
+            );
+            max_peak = max_peak.max(c.peak);
+        }
+        assert_eq!(max_peak, 1.0, "クランプによりピークはちょうど 1.0 のはず");
+    }
+
+    /// 不正なゲイン（負・NaN）は open / set_gain の双方で InvalidArg として弾かれる。
+    #[test]
+    fn invalid_gain_rejected() {
+        // open: config.gain が負。
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let config = StreamConfig {
+            gain: -1.0,
+            ..Default::default()
+        };
+        let err = open_err(Stream::open(config, backend), "gain=-1.0");
+        assert!(
+            matches!(err, Error::InvalidArg(_)),
+            "InvalidArg のはず: {err:?}"
+        );
+
+        // open: config.gain が NaN。
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let config = StreamConfig {
+            gain: f32::NAN,
+            ..Default::default()
+        };
+        let err = open_err(Stream::open(config, backend), "gain=NaN");
+        assert!(
+            matches!(err, Error::InvalidArg(_)),
+            "InvalidArg のはず: {err:?}"
+        );
+
+        // set_gain: 負・NaN は InvalidArg で、現在値は変わらない。
+        let backend = Box::new(MockBackend::new(48_000, 2, 440.0));
+        let stream = Stream::open(StreamConfig::default(), backend).expect("open");
+        assert!(matches!(stream.set_gain(-1.0), Err(Error::InvalidArg(_))));
+        assert!(matches!(
+            stream.set_gain(f32::NAN),
+            Err(Error::InvalidArg(_))
+        ));
+        assert_eq!(
+            stream.gain(),
+            1.0,
+            "失敗した set_gain は現在値を変えないはず"
+        );
     }
 
     // --- 堅牢性: backend の panic で無言死しない（poison 連鎖 panic 防止） ---

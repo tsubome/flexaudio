@@ -89,6 +89,9 @@ typedef struct FlexConfig {
     uint16_t output_channels;
     // チャンク長（ミリ秒）。0 なら 20。
     uint32_t chunk_ms;
+    // 開始時の入力ゲイン（線形倍率）。0 なら 1.0（既定）。実行時のミュートは
+    // `flexaudio_set_gain(s, 0.0)` を使う。
+    float gain;
 } FlexConfig;
 
 // 取得した 1 チャンクのオーディオデータ。`flexaudio_poll_chunk` が埋める。
@@ -192,6 +195,21 @@ int32_t flexaudio_resume(struct FlexStream *s);
 // `s` は有効なハンドル（または NULL）でなければならない。
 bool flexaudio_is_paused(const struct FlexStream *s);
 
+// 入力ゲイン（線形倍率）を変更する。1.0 でそのまま、2.0 で約 +6dB、0.0 で無音。
+// 録音中いつでも呼べて、次のチャンクから効く（20ms 粒度）。乗算後のサンプルは
+// ±1.0 にクランプされる。有限かつ 0 以上でなければ FLEX_INVALID_ARG。
+//
+// # Safety
+// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+int32_t flexaudio_set_gain(struct FlexStream *s,
+                           float gain);
+
+// 現在の入力ゲイン（線形倍率）を返す。NULL や panic では 1.0。
+//
+// # Safety
+// `s` は有効なハンドル（または NULL）でなければならない。
+float flexaudio_gain(const struct FlexStream *s);
+
 // チャンクを 1 つ取り出して `out` を埋める。
 //
 // 戻り 1 = 取得して `out` を埋めた / 0 = 今は無し / 負 = エラー。`out.data` は
@@ -220,7 +238,8 @@ void flexaudio_chunk_free(struct FlexChunk *chunk);
 int32_t flexaudio_poll_event(struct FlexStream *s,
                              struct FlexEvent *out);
 
-// 録音を止めずに入力ソースをホットスワップする。
+// 録音を止めずに入力ソースをホットスワップする。`config.gain` は無視される
+// （ゲインはストリームの状態。変更は `flexaudio_set_gain`）。
 //
 // # Safety
 // `s` は有効なハンドル、`config` は有効な `FlexConfig` を指していなければならない。

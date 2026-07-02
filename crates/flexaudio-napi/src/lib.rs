@@ -101,10 +101,10 @@ pub struct OpenOptions {
     pub process_id: Option<u32>,
     /// process の対象 PID の扱い（process 専用）。"include"（既定）| "exclude"。
     /// include=対象 PID だけ録る / exclude=対象 PID 以外の全システム音（process_id 必須）。
-    /// mic / system では無視。Linux では "exclude" は未実装で start 時に例外。
+    /// mic / system では無視。Linux / Windows / macOS の 3 OS とも対応。
     pub mode: Option<String>,
     /// システム音から自ホスト（自プロセス）の音を除くか（system 専用）。既定 false。
-    /// mic / process では無視。Linux では true は未実装で start 時に例外。
+    /// mic / process では無視。Linux / Windows / macOS の 3 OS とも対応。
     pub exclude_self: Option<bool>,
     /// 既定 48000
     pub output_rate: Option<u32>,
@@ -112,6 +112,9 @@ pub struct OpenOptions {
     pub output_channels: Option<u16>,
     /// 既定 20
     pub chunk_ms: Option<u32>,
+    /// 開始時の入力ゲイン（線形倍率）。既定 1.0。1.0=そのまま、2.0=約+6dB、0.0=無音。
+    /// 実行時変更は `setGain`。
+    pub gain: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -266,6 +269,7 @@ fn build_config(options: &OpenOptions) -> NapiResult<StreamConfig> {
         // mode は process 専用 / exclude_self は system 専用。混ぜないのは facade 側が見る。
         mode,
         exclude_self: options.exclude_self.unwrap_or(false),
+        gain: options.gain.unwrap_or(1.0) as f32,
         ..Default::default()
     };
     if let Some(ms) = options.chunk_ms {
@@ -297,6 +301,8 @@ enum BridgeCmd {
     Pause,
     /// 配信を再開する。
     Resume,
+    /// 入力ゲイン（線形倍率）を変更する。値は送信前に napi 側で検証済み。
+    SetGain(f32),
 }
 
 /// 録音ストリームのハンドル。内部で bridge スレッドが `flexaudio::Stream` を
@@ -338,6 +344,11 @@ impl FlexStream {
                         }
                         BridgeCmd::Pause => stream.pause(),
                         BridgeCmd::Resume => stream.resume(),
+                        BridgeCmd::SetGain(g) => {
+                            // 送信前に napi 側で検証済みなので Err は起きない前提。
+                            // 万一の Err もイベントにはしない（結果は捨てる）。
+                            let _ = stream.set_gain(g);
+                        }
                     }
                 }
                 // チャンクは到着し次第すべて吐く。
@@ -392,6 +403,7 @@ impl FlexStream {
     /// `outputChannels`）は切替では変えられない（連続ストリームの frames が変わるため）。
     /// 変更を要求すると `switch_source` が InvalidArg を返し、ここで例外になる。切替前後で
     /// チャンクの `seq` は連続し、切替後最初のチャンクには DISCONTINUITY フラグが立つ。
+    /// `options.gain` は無視される（ゲインはストリームの状態。変更は `setGain`）。
     ///
     /// 既に `stop()` 済み（bridge スレッド停止後）なら例外を返す。
     #[napi]
@@ -446,6 +458,31 @@ impl FlexStream {
             NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
         })?;
         cmd_tx.send(BridgeCmd::Resume).map_err(|_| {
+            NapiError::new(
+                Status::GenericFailure,
+                "bridge thread is not running".to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// 入力ゲイン（線形倍率）を変更する。1.0=そのまま、2.0=約+6dB、0.0=無音。録音中
+    /// いつでも呼べて、次のチャンクから効く（20ms 粒度）。乗算後のサンプルは ±1.0 に
+    /// クランプされる。有限かつ 0 以上でなければ例外。既に `stop()` 済みなら例外。
+    #[napi]
+    pub fn set_gain(&self, gain: f64) -> NapiResult<()> {
+        // f64→f32 変換後の値で検証する（f32 で表せない巨大値が無限大になるのも弾く）。
+        let gain = gain as f32;
+        if !gain.is_finite() || gain < 0.0 {
+            return Err(NapiError::new(
+                Status::InvalidArg,
+                format!("gain must be finite and >= 0.0, got {gain}"),
+            ));
+        }
+        let cmd_tx = self.cmd_tx.as_ref().ok_or_else(|| {
+            NapiError::new(Status::GenericFailure, "stream already stopped".to_string())
+        })?;
+        cmd_tx.send(BridgeCmd::SetGain(gain)).map_err(|_| {
             NapiError::new(
                 Status::GenericFailure,
                 "bridge thread is not running".to_string(),
@@ -656,6 +693,7 @@ mod tests {
             output_rate: None,
             output_channels: None,
             chunk_ms: None,
+            gain: None,
         };
         let cfg = build_config(&opts).unwrap();
         assert_eq!(cfg.kind, SourceKind::Mic);
@@ -668,6 +706,8 @@ mod tests {
         assert_eq!(cfg.device_id, None);
         // chunk_ms 未指定なら StreamConfig 既定（20）。
         assert_eq!(cfg.chunk_ms, 20);
+        // gain 未指定なら既定 1.0。
+        assert_eq!(cfg.gain, 1.0);
     }
 
     #[test]
@@ -681,6 +721,7 @@ mod tests {
             output_rate: Some(16_000),
             output_channels: Some(1),
             chunk_ms: Some(20),
+            gain: Some(2.5),
         };
         let cfg = build_config(&opts).unwrap();
         assert_eq!(cfg.kind, SourceKind::ProcessLoopback);
@@ -691,6 +732,7 @@ mod tests {
         assert_eq!(cfg.output.sample_rate, 16_000);
         assert_eq!(cfg.output.channels, 1);
         assert_eq!(cfg.chunk_ms, 20);
+        assert_eq!(cfg.gain, 2.5);
     }
 
     #[test]
@@ -704,6 +746,7 @@ mod tests {
             output_rate: None,
             output_channels: None,
             chunk_ms: None,
+            gain: None,
         };
         let err = build_config(&opts).unwrap_err();
         assert_eq!(err.status, Status::InvalidArg);

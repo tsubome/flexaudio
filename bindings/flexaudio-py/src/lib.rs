@@ -80,7 +80,7 @@ fn parse_process_mode(s: &str) -> PyResult<ProcessMode> {
 
 /// Python 引数から [`StreamConfig`] を組む。`ring_capacity_chunks` は既定値を使う。
 /// napi の `build_config` と同じく kind/device_id/process_id/mode/exclude_self/
-/// output_rate/output_channels/chunk_ms だけを受ける。
+/// output_rate/output_channels/chunk_ms/gain だけを受ける。
 #[allow(clippy::too_many_arguments)]
 fn build_config(
     kind: &str,
@@ -91,6 +91,7 @@ fn build_config(
     output_rate: u32,
     output_channels: u16,
     chunk_ms: u32,
+    gain: f32,
 ) -> PyResult<StreamConfig> {
     let kind = parse_source_kind(kind)?;
     let mode = parse_process_mode(mode)?;
@@ -107,6 +108,7 @@ fn build_config(
         mode,
         exclude_self,
         chunk_ms,
+        gain,
         // ring_capacity_chunks は既定値を使う。
         ..Default::default()
     })
@@ -325,6 +327,18 @@ impl Stream {
         self.inner.is_paused()
     }
 
+    /// 入力ゲイン（線形倍率）を変更する。1.0 でそのまま、2.0 で約 +6dB、0.0 で無音。
+    /// 録音中いつでも呼べて、次のチャンクから効く（20ms 粒度）。乗算後のサンプルは
+    /// ±1.0 にクランプされる。有限かつ 0 以上でなければ `ValueError`。
+    fn set_gain(&self, gain: f32) -> PyResult<()> {
+        self.inner.set_gain(gain).map_err(to_py_err)
+    }
+
+    /// 現在の入力ゲイン（線形倍率）を返す。
+    fn gain(&self) -> f32 {
+        self.inner.gain()
+    }
+
     /// 取り出せるチャンクがあれば返す。無ければ `None`（非ブロッキング）。
     fn poll_chunk(&mut self) -> Option<PyAudioChunk> {
         self.inner.poll_chunk().map(chunk_to_py)
@@ -339,6 +353,7 @@ impl Stream {
     ///
     /// 出力フォーマット（output_rate/output_channels）は切替では変えられない。変更を
     /// 要求すると `switch_source` がエラーを返し、ここで例外になる。
+    /// `gain` も受けるがコアが無視する（ゲインはストリームの状態。変更は `set_gain`）。
     #[pyo3(signature = (
         kind,
         *,
@@ -349,6 +364,7 @@ impl Stream {
         output_rate = 48_000,
         output_channels = 2,
         chunk_ms = 20,
+        gain = 1.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn switch_source(
@@ -361,6 +377,7 @@ impl Stream {
         output_rate: u32,
         output_channels: u16,
         chunk_ms: u32,
+        gain: f32,
     ) -> PyResult<()> {
         let config = build_config(
             kind,
@@ -371,6 +388,7 @@ impl Stream {
             output_rate,
             output_channels,
             chunk_ms,
+            gain,
         )?;
         self.inner.switch_source(config).map_err(to_py_err)
     }
@@ -418,6 +436,7 @@ fn devices() -> PyResult<Vec<PyDeviceInfo>> {
     output_rate = 48_000,
     output_channels = 2,
     chunk_ms = 20,
+    gain = 1.0,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn open(
@@ -429,6 +448,7 @@ fn open(
     output_rate: u32,
     output_channels: u16,
     chunk_ms: u32,
+    gain: f32,
 ) -> PyResult<Stream> {
     let config = build_config(
         kind,
@@ -439,6 +459,7 @@ fn open(
         output_rate,
         output_channels,
         chunk_ms,
+        gain,
     )?;
     let mut stream = fa::open(config).map_err(to_py_err)?;
     stream.start().map_err(to_py_err)?;
@@ -514,7 +535,7 @@ mod tests {
 
     #[test]
     fn build_config_defaults() {
-        let cfg = build_config("mic", None, None, "include", false, 48_000, 2, 20).unwrap();
+        let cfg = build_config("mic", None, None, "include", false, 48_000, 2, 20, 1.0).unwrap();
         assert_eq!(cfg.kind, SourceKind::Mic);
         assert_eq!(cfg.output.sample_rate, 48_000);
         assert_eq!(cfg.output.channels, 2);
@@ -523,6 +544,7 @@ mod tests {
         assert_eq!(cfg.target_pid, None);
         assert_eq!(cfg.device_id, None);
         assert_eq!(cfg.chunk_ms, 20);
+        assert_eq!(cfg.gain, 1.0);
         // 指定外の ring_capacity_chunks は StreamConfig 既定（50）。
         assert_eq!(
             cfg.ring_capacity_chunks,
@@ -541,6 +563,7 @@ mod tests {
             16_000,
             1,
             20,
+            2.5,
         )
         .unwrap();
         assert_eq!(cfg.kind, SourceKind::ProcessLoopback);
@@ -550,11 +573,12 @@ mod tests {
         assert!(cfg.exclude_self);
         assert_eq!(cfg.output.sample_rate, 16_000);
         assert_eq!(cfg.output.channels, 1);
+        assert_eq!(cfg.gain, 2.5);
     }
 
     #[test]
     fn build_config_rejects_unknown_kind() {
-        assert!(build_config("speaker", None, None, "include", false, 48_000, 2, 20).is_err());
+        assert!(build_config("speaker", None, None, "include", false, 48_000, 2, 20, 1.0).is_err());
     }
 
     #[test]

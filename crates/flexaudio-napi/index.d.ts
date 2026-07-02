@@ -63,6 +63,11 @@ export interface OpenOptions {
   outputChannels?: number
   /** 既定 20 */
   chunkMs?: number
+  /**
+   * 開始時の入力ゲイン（線形倍率）。既定 1.0。1.0=そのまま、2.0=約+6dB、0.0=無音。
+   * 実行時変更は `setGain`。
+   */
+  gain?: number
 }
 /** 利用可能なデバイスを列挙する。ヘッドレス環境では空配列でも throw しない。 */
 export declare function devices(): NapiResult
@@ -96,6 +101,7 @@ export class FlexStream {
    * `outputChannels`）は切替では変えられない（連続ストリームの frames が変わるため）。
    * 変更を要求すると `switch_source` が InvalidArg を返し、ここで例外になる。切替前後で
    * チャンクの `seq` は連続し、切替後最初のチャンクには DISCONTINUITY フラグが立つ。
+   * `options.gain` は無視される（ゲインはストリームの状態。変更は `setGain`）。
    *
    * 既に `stop()` 済み（bridge スレッド停止後）なら例外を返す。
    */
@@ -107,6 +113,12 @@ export class FlexStream {
   pause(): NapiResult
   /** 一時停止を解除して配信を再開する。既に `stop()` 済みなら例外。 */
   resume(): NapiResult
+  /**
+   * 入力ゲイン（線形倍率）を変更する。1.0=そのまま、2.0=約+6dB、0.0=無音。録音中
+   * いつでも呼べて、次のチャンクから効く（20ms 粒度）。乗算後のサンプルは ±1.0 に
+   * クランプされる。有限かつ 0 以上でなければ例外。既に `stop()` 済みなら例外。
+   */
+  setGain(gain: number): NapiResult
 }
 /** デバイス着脱監視のハンドル。bridge スレッドが `DeviceWatcher` を poll する。 */
 export class DeviceWatcherHandle {

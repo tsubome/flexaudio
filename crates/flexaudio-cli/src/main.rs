@@ -175,6 +175,11 @@ struct Cli {
     /// 出力チャンネル数（1 = mono / 2 = stereo）。既定 2。stereo→mono は L/R 平均。
     #[arg(long, default_value_t = 2)]
     output_channels: u16,
+
+    /// 入力ゲイン（線形倍率）。既定 1.0。1.0 でそのまま、2.0 で約 +6dB、0.0 で無音。
+    /// 乗算後のサンプルは ±1.0 にクランプされる。負・NaN はエラー。
+    #[arg(long, default_value_t = 1.0)]
+    gain: f32,
 }
 
 impl Cli {
@@ -283,6 +288,8 @@ fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
         // device_id は mic（入力）と system（出力エンドポイント）で効く（process では
         // facade が無視）。全セグメントに一様に載せておけば該当セグメントが拾う。
         device_id: cli.device_id.clone(),
+        // gain は切替では変わらない（core が無視する）が、初期 config と揃えておく。
+        gain: cli.gain,
         ..Default::default()
     }
 }
@@ -495,6 +502,8 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         // device_id は mic（入力）と system（出力エンドポイント）の選択用（process では
         // facade が無視する）。
         device_id: cli.device_id.clone(),
+        // 開始時の入力ゲイン（線形倍率）。不正値は open が InvalidArg で弾く。
+        gain: cli.gain,
         ..Default::default()
     };
     let mut stream = flexaudio::open(config).map_err(describe_error)?;
@@ -1158,6 +1167,8 @@ mod tests {
             "1",
             "--device-id",
             "my-mic",
+            "--gain",
+            "2.5",
         ]);
         let cfg = config_for_kind(&cli, SourceKind::ProcessLoopback);
         assert_eq!(cfg.kind, SourceKind::ProcessLoopback);
@@ -1166,6 +1177,7 @@ mod tests {
         assert_eq!(cfg.output.sample_rate, 16_000);
         assert_eq!(cfg.output.channels, 1);
         assert_eq!(cfg.device_id.as_deref(), Some("my-mic"));
+        assert_eq!(cfg.gain, 2.5);
         // kind は引数で上書きされる（CLI の --source とは独立に指定できる）。
         let cfg_mic = config_for_kind(&cli, SourceKind::Mic);
         assert_eq!(cfg_mic.kind, SourceKind::Mic);
@@ -1195,6 +1207,7 @@ mod tests {
         assert_eq!(cfg.target_pid, None);
         assert!(!cfg.exclude_self);
         assert_eq!(cfg.device_id, None);
+        assert_eq!(cfg.gain, 1.0);
     }
 
     /// `Cli::output_format` / `is_stdout_stream` の基本動作。

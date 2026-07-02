@@ -209,7 +209,7 @@ impl Default for OutputFormat {
 /// 1 ストリームを開くための構成。
 ///
 /// [`Default`] は `chunk_ms = 20`, `ring_capacity_chunks = 50`, `mode = Include`,
-/// `exclude_self = false`, `kind = Mic`, `output = {48000, 2}` を返す。
+/// `exclude_self = false`, `kind = Mic`, `output = {48000, 2}`, `gain = 1.0` を返す。
 ///
 /// process ソースの対象 PID 扱いは [`mode`](Self::mode) だけ、system ソースの自ホスト
 /// 除外は [`exclude_self`](Self::exclude_self) だけが決める。process ソースは
@@ -240,6 +240,10 @@ pub struct StreamConfig {
     pub exclude_self: bool,
     /// 出力チャンクのフォーマット。既定 `{48000, 2}`（パススルー）。
     pub output: OutputFormat,
+    /// 開始時の入力ゲイン（線形倍率）。1.0=そのまま、2.0=約+6dB、0.0=無音。既定 1.0。
+    /// 有限かつ 0.0 以上であること（外れていれば open が [`Error::InvalidArg`]）。
+    /// 実行時変更は `Stream::set_gain`。
+    pub gain: f32,
 }
 
 impl Default for StreamConfig {
@@ -253,6 +257,7 @@ impl Default for StreamConfig {
             mode: ProcessMode::Include,
             exclude_self: false,
             output: OutputFormat::default(),
+            gain: 1.0,
         }
     }
 }
@@ -332,6 +337,7 @@ mod tests {
         assert_eq!(c.kind, SourceKind::Mic);
         assert_eq!(c.device_id, None);
         assert_eq!(c.target_pid, None);
+        assert_eq!(c.gain, 1.0);
         // 既定の出力は内部正規形と同一（第 2 段パススルー）。
         assert_eq!(c.output.sample_rate, SAMPLE_RATE);
         assert_eq!(c.output.channels, CHANNELS);

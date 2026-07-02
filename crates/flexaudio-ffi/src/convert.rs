@@ -24,6 +24,7 @@ use crate::types::{
 const DEFAULT_OUTPUT_RATE: u32 = 48_000;
 const DEFAULT_OUTPUT_CHANNELS: u16 = 2;
 const DEFAULT_CHUNK_MS: u32 = 20;
+const DEFAULT_GAIN: f32 = 1.0;
 
 /// `FlexSourceKind` → [`SourceKind`]。
 fn source_kind_from_c(kind: FlexSourceKind) -> SourceKind {
@@ -112,6 +113,13 @@ pub unsafe fn build_config(config: &FlexConfig) -> Result<StreamConfig, ()> {
             DEFAULT_CHUNK_MS
         } else {
             config.chunk_ms
+        },
+        // gain 0.0 も番兵＝既定 1.0（output_rate 0→48000 と同じ流儀）。実行時に無音へ
+        // したいときは flexaudio_set_gain(s, 0.0) を使う。
+        gain: if config.gain == 0.0 {
+            DEFAULT_GAIN
+        } else {
+            config.gain
         },
         output,
         // ring_capacity_chunks は公開しない（StreamConfig 既定の値を使う）。
@@ -271,6 +279,7 @@ mod tests {
             output_rate: 0,
             output_channels: 0,
             chunk_ms: 0,
+            gain: 0.0,
         }
     }
 
@@ -287,6 +296,8 @@ mod tests {
         assert_eq!(cfg.device_id, None);
         assert_eq!(cfg.mode, ProcessMode::Include);
         assert!(!cfg.exclude_self);
+        // gain も 0 番兵 → 既定 1.0。
+        assert_eq!(cfg.gain, 1.0);
         // 公開しない ring_capacity_chunks は StreamConfig 既定（50）。
         assert_eq!(cfg.ring_capacity_chunks, 50);
     }
@@ -300,6 +311,7 @@ mod tests {
         c.output_rate = 16_000;
         c.output_channels = 1;
         c.chunk_ms = 20;
+        c.gain = 2.5;
         let cfg = unsafe { build_config(&c) }.unwrap();
         assert_eq!(cfg.kind, SourceKind::ProcessLoopback);
         assert_eq!(cfg.target_pid, Some(4321));
@@ -308,6 +320,20 @@ mod tests {
         assert_eq!(cfg.output.sample_rate, 16_000);
         assert_eq!(cfg.output.channels, 1);
         assert_eq!(cfg.chunk_ms, 20);
+        assert_eq!(cfg.gain, 2.5);
+    }
+
+    #[test]
+    fn build_config_maps_gain_sentinel_and_explicit() {
+        // 0.0 は番兵＝既定 1.0（output_rate 0→48000 と同じ流儀）。
+        let c = make_config(FlexSourceKind::Mic);
+        let cfg = unsafe { build_config(&c) }.unwrap();
+        assert_eq!(cfg.gain, 1.0);
+        // 明示値はそのまま通る。
+        let mut c2 = make_config(FlexSourceKind::Mic);
+        c2.gain = 0.5;
+        let cfg2 = unsafe { build_config(&c2) }.unwrap();
+        assert_eq!(cfg2.gain, 0.5);
     }
 
     #[test]

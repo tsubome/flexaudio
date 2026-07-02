@@ -49,6 +49,9 @@ pub struct FlexConfig {
     pub output_channels: u16,
     /// チャンク長（ミリ秒）。0 なら 20。
     pub chunk_ms: u32,
+    /// 開始時の入力ゲイン（線形倍率）。0 なら 1.0（既定）。実行時のミュートは
+    /// `flexaudio_set_gain(s, 0.0)` を使う。
+    pub gain: f32,
 }
 
 /// 取得した 1 チャンクのオーディオデータ。`flexaudio_poll_chunk` が埋める。

@@ -204,6 +204,43 @@ pub unsafe extern "C" fn flexaudio_is_paused(s: *const FlexStream) -> bool {
     })
 }
 
+/// 入力ゲイン（線形倍率）を変更する。1.0 でそのまま、2.0 で約 +6dB、0.0 で無音。
+/// 録音中いつでも呼べて、次のチャンクから効く（20ms 粒度）。乗算後のサンプルは
+/// ±1.0 にクランプされる。有限かつ 0 以上でなければ FLEX_INVALID_ARG。
+///
+/// # Safety
+/// `s` は有効なハンドルでなければならない（NULL は InvalidArg）。
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_set_gain(s: *mut FlexStream, gain: f32) -> i32 {
+    guard_i32(|| {
+        clear_last_error();
+        let Some(stream) = s.as_mut() else {
+            set_last_error("flexaudio_set_gain: stream pointer is null");
+            return code::FLEX_INVALID_ARG;
+        };
+        match stream.inner.set_gain(gain) {
+            Ok(()) => code::FLEX_OK,
+            Err(e) => {
+                set_last_error(e.to_string());
+                code::FLEX_INVALID_ARG
+            }
+        }
+    })
+}
+
+/// 現在の入力ゲイン（線形倍率）を返す。NULL や panic では 1.0。
+///
+/// # Safety
+/// `s` は有効なハンドル（または NULL）でなければならない。
+#[no_mangle]
+pub unsafe extern "C" fn flexaudio_gain(s: *const FlexStream) -> f32 {
+    catch_unwind(AssertUnwindSafe(|| match s.as_ref() {
+        Some(stream) => stream.inner.gain(),
+        None => 1.0,
+    }))
+    .unwrap_or(1.0)
+}
+
 // ---------------------------------------------------------------------------
 // ポーリング（プル型 API の中心）
 // ---------------------------------------------------------------------------
@@ -283,7 +320,8 @@ pub unsafe extern "C" fn flexaudio_poll_event(s: *mut FlexStream, out: *mut Flex
     })
 }
 
-/// 録音を止めずに入力ソースをホットスワップする。
+/// 録音を止めずに入力ソースをホットスワップする。`config.gain` は無視される
+/// （ゲインはストリームの状態。変更は `flexaudio_set_gain`）。
 ///
 /// # Safety
 /// `s` は有効なハンドル、`config` は有効な `FlexConfig` を指していなければならない。
