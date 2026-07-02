@@ -372,11 +372,20 @@ mod tests {
     use flexaudio_core::raw_ring::raw_ring;
     use std::sync::atomic::AtomicU32;
 
-    /// 定振幅（直流）のサンプルを実時間ペースで push するテスト専用の子バックエンド。
+    /// 定振幅（直流）のサンプルを飽和供給するテスト専用の子バックエンド。
     ///
     /// 正弦波（MockBackend）だと 2 ソース合成時に位相の問題が出るため、合成結果を
     /// 決定論的に検証できる直流信号を使う。`feed_for` を指定すると、その時間だけ給餌
     /// してから push を止める（スレッドは生かしたまま）＝片側飢餓の再現用。
+    ///
+    /// 供給は実時間ペース（10ms sleep）ではなく飽和方式: 子リングが受け取れる限り
+    /// 即座に push し続け、満杯で入り切らなければ 1ms だけ譲って再試行する。実時間
+    /// ペースだと遅いテスト機の粗い sleep 粒度で供給が遅れ、ミキサーが起きた瞬間に
+    /// 片側の FIFO だけ空 → 飢餓埋めで片側だけのチャンクが混ざり、合成値の検証が
+    /// スケジューラ依存になってしまう。飽和供給なら両レーンの FIFO はミキサーが
+    /// いつ起きても非空で、検証対象を「合成の数学」だけに絞れる（スケジューリング
+    /// 耐性そのものは mix_survives_one_side_starvation が担う）。直流なので満杯時の
+    /// ドロップや途中までの書き込みは値に影響しない。
     struct ConstBackend {
         sample_rate: u32,
         channels: u16,
@@ -417,16 +426,24 @@ mod tests {
             let handle = thread::Builder::new()
                 .name("flexaudio-const-gen".into())
                 .spawn(move || {
-                    let frames_per_block = (sample_rate as usize / 100).max(1); // 10ms
+                    let frames_per_block = (sample_rate as usize / 100).max(1); // 10ms 相当
                     let block = vec![value; frames_per_block * channels];
-                    let block_dur = Duration::from_millis(10);
                     let start = Instant::now();
                     while running.load(Ordering::SeqCst) {
                         let feeding = feed_for.is_none_or(|d| start.elapsed() < d);
-                        if feeding {
-                            sink.push(&block, start.elapsed().as_nanos() as i64);
+                        if !feeding {
+                            // 給餌期間が終わったら以降は何も供給しない（片側飢餓の
+                            // 再現）。停止指示だけ見張って眠る。
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
                         }
-                        thread::sleep(block_dur);
+                        // 飽和供給: 全量入ったら即座に次を push、満杯で入り切らな
+                        // かったら 1ms だけ譲って再試行（push は非ブロッキングで
+                        // 入り切らない分を落とす契約。直流なので欠けても無害）。
+                        let accepted = sink.push(&block, start.elapsed().as_nanos() as i64);
+                        if accepted < block.len() {
+                            thread::sleep(Duration::from_millis(1));
+                        }
                     }
                 })
                 .map_err(|e| Error::Backend(format!("spawn const gen thread: {e}")))?;
@@ -495,17 +512,84 @@ mod tests {
         (be, consumer)
     }
 
-    /// 期限まで consumer からサンプルを集めるヘルパ。
-    fn collect_samples(consumer: &mut RawConsumer, dur: Duration) -> Vec<f32> {
+    /// 値比較の許容誤差。直流 2 値の f32 加算の丸めを吸収できれば十分。
+    const VALUE_TOL: f32 = 1e-4;
+
+    /// 「実際に出現した」と認める最低サンプル数 = 内部正規形 1 チャンク分
+    /// （960 frame × 2ch）。存在保証の床は全体比でなく絶対数で置く: 全体比（例:
+    /// 25%）だと、片側飢餓埋めの大きなバースト（FIFO 上限の 48k サンプルが一括で
+    /// 出得る）が混ざったときに分母だけ膨らんで割れる＝結局スケジューラ依存に
+    /// なってしまう。
+    const ONE_CHUNK_SAMPLES: usize = 1_920;
+
+    /// 条件を満たすまで consumer からサンプルを集めるヘルパ。
+    ///
+    /// `done` は新しく pop できたぶんだけを毎回受け取る（呼び出し側が件数などを
+    /// 加算して判定する）。true を返したら全収集分を返す。壁時計の固定窓（「500ms
+    /// で N サンプル」）は、負荷でスレッド群がデスケジュールされると窓内の生産量を
+    /// 保証できず原理的にフレークするため、「条件到達まで待つ」方式にする。
+    /// `max_wait` は極端な負荷でも走り続けないためのハング保険で、超過時は集まった
+    /// ぶんを返す（不足は呼び出し側のアサーションが検出する）。
+    fn collect_until(
+        consumer: &mut RawConsumer,
+        max_wait: Duration,
+        mut done: impl FnMut(&[f32]) -> bool,
+    ) -> Vec<f32> {
         let mut out = Vec::new();
         let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
         let start = Instant::now();
-        while start.elapsed() < dur {
+        loop {
             let got = consumer.pop_slice(&mut scratch);
             out.extend_from_slice(&scratch[..got]);
+            if done(&scratch[..got]) || start.elapsed() >= max_wait {
+                return out;
+            }
             thread::sleep(Duration::from_millis(5));
         }
-        out
+    }
+
+    /// [`collect_until`] の待ち上限。通常環境では条件到達で即抜けるので、これは
+    /// 「極端な負荷でスレッドがほとんど走れない」場合のハング防止でしかない。
+    const COLLECT_MAX_WAIT: Duration = Duration::from_secs(30);
+
+    /// `v` に一致（誤差 [`VALUE_TOL`]）するサンプル数を数えるヘルパ。
+    fn count_near(samples: &[f32], v: f32) -> usize {
+        samples
+            .iter()
+            .filter(|&&s| (s - v).abs() < VALUE_TOL)
+            .count()
+    }
+
+    /// 全サンプルが「理論上現れうる値の集合」のいずれかに一致することを検証し、
+    /// 合成値 `mixed` に一致した個数を返すヘルパ。
+    ///
+    /// なぜ比率でなく集合判定か: 「定常部の 98% が合成値」のような比率アサーションは、
+    /// 負荷で producer / ミキサースレッドが飢餓閾値（60ms）超デスケジュールされると
+    /// 飢餓ゼロ埋めや片側値がどの区間にも混ざり得て、閾値をどこに置いてもいつか割れる
+    /// （比率は本質的に壁時計依存）。一方、直流ソース＋定数ゲインに対してミキサーが
+    /// 出せる値は mixed（両側合成）/ mic 単独（system 飢餓埋め）/ system 単独
+    /// （mic 飢餓埋め）/ 0.0（プライミング境界）の 4 つだけで、間違った和・ゲイン
+    /// 誤適用・クランプ漏れは必ずこの集合の外の値になる。スケジューラは値の分布を
+    /// 動かせても集合の外の値は作れないので、この判定はスケジューラ非依存。
+    fn assert_only_allowed_values(
+        samples: &[f32],
+        mixed: f32,
+        mic_only: f32,
+        system_only: f32,
+    ) -> usize {
+        let allowed = [mixed, mic_only, system_only, 0.0];
+        let mut mixed_count = 0usize;
+        for (i, &s) in samples.iter().enumerate() {
+            if (s - mixed).abs() < VALUE_TOL {
+                mixed_count += 1;
+            } else {
+                assert!(
+                    allowed.iter().any(|&a| (s - a).abs() < VALUE_TOL),
+                    "許容集合 {allowed:?} の外の値（合成の数学の誤り）: samples[{i}] = {s}"
+                );
+            }
+        }
+        mixed_count
     }
 
     /// 既知振幅の直流 2 ソース（0.2 と 0.3）を mic_gain=1.0 / system_gain=2.0 で合成
@@ -517,24 +601,29 @@ mod tests {
         let system = Box::new(ConstBackend::new(0.3, None));
         let (mut be, mut consumer) = start_composite(mic, system, 1.0, 2.0);
 
-        let samples = collect_samples(&mut consumer, Duration::from_millis(500));
+        // 相応の量 + 合成値 1 チャンク分が出るまで集める（負荷で遅くても待つ）。
+        let (mut total, mut mixed) = (0usize, 0usize);
+        let samples = collect_until(&mut consumer, COLLECT_MAX_WAIT, |new| {
+            total += new.len();
+            mixed += count_near(new, 0.8);
+            total >= 10_000 && mixed >= ONE_CHUNK_SAMPLES
+        });
         be.stop();
 
         assert!(
-            samples.len() > 10_000,
-            "500ms で相応のサンプルが出るはず: {}",
+            samples.len() >= 10_000,
+            "相応のサンプルが出るはず: {}",
             samples.len()
         );
-        // 前半は起動過渡（遅いテスト機では子スレッドの立ち上がりがバラつく）として
-        // 捨て、後半 50% の定常部で判定する。テスト機の一時的なスケジューリング停滞
-        // （>60ms）で片側だけ飢餓埋めされると 0.2 / 0.6 が瞬間的に混ざり得るので、
-        // ごく僅かな外れ値だけ許容する（支配値は 0.8）。
-        let steady = &samples[samples.len() / 2..];
-        let ok = steady.iter().filter(|&&s| (s - 0.8).abs() < 1e-4).count();
+        // 全域・全サンプルで集合判定: 現れてよいのは合成値 0.2*1.0 + 0.3*2.0 = 0.8、
+        // 飢餓ゼロ埋め時の片側値 0.2（mic 単独）/ 0.6（system 単独）、プライミング
+        // 境界の 0.0 だけ。1 サンプルでも集合外なら合成の数学が壊れている。
+        let mixed_count = assert_only_allowed_values(&samples, 0.8, 0.2, 0.6);
+        // 存在保証: 合成が実際に起きていること（1 チャンク分の絶対数）。
         assert!(
-            ok as f64 > steady.len() as f64 * 0.98,
-            "合成値は 0.2*1.0 + 0.3*2.0 = 0.8 が支配的なはず: {ok}/{}",
-            steady.len()
+            mixed_count >= ONE_CHUNK_SAMPLES,
+            "合成値 0.8 が相応に出現するはず: {mixed_count}/{}",
+            samples.len()
         );
     }
 
@@ -545,14 +634,14 @@ mod tests {
         let system = Box::new(ConstBackend::new(0.8, None));
         let (mut be, mut consumer) = start_composite(mic, system, 1.0, 1.0);
 
-        let samples = collect_samples(&mut consumer, Duration::from_millis(400));
+        // クランプされた合成値が 1 チャンク分出るまで集める（負荷で遅くても待つ）。
+        let mut clamped = 0usize;
+        let samples = collect_until(&mut consumer, COLLECT_MAX_WAIT, |new| {
+            clamped += count_near(new, 1.0);
+            clamped >= ONE_CHUNK_SAMPLES
+        });
         be.stop();
 
-        assert!(
-            samples.len() > 1920,
-            "サンプルが出るはず: {}",
-            samples.len()
-        );
         // クランプの本質: どのサンプルも 1.0 を超えない。
         for (i, &s) in samples.iter().enumerate() {
             assert!(
@@ -560,20 +649,20 @@ mod tests {
                 "クランプ後は 1.0 を超えないはず: samples[{i}] = {s}"
             );
         }
-        // 前半は起動過渡として捨て、後半 50% の定常部（両側供給）で判定する。
-        // ここでは 1.6 → 1.0 ちょうどが支配的（スケジューリング停滞の片側飢餓埋めの
-        // 瞬間だけ 0.8 になり得るので僅かな外れ値は許容）。
-        let steady = &samples[samples.len() / 2..];
-        let clamped = steady.iter().filter(|&&s| s == 1.0).count();
+        // 全域・全サンプルで集合判定: 現れてよいのは clamp(0.8 + 0.8) = 1.0、
+        // 飢餓ゼロ埋め時の片側値 0.8、プライミング境界の 0.0 だけ（クランプ漏れの
+        // 1.6 などは集合外として即 FAIL）。
+        let clamped_count = assert_only_allowed_values(&samples, 1.0, 0.8, 0.8);
+        // 存在保証: クランプされた合成値が実際に出現していること（1 チャンク分）。
         assert!(
-            clamped as f64 > steady.len() as f64 * 0.98,
-            "クランプ値 1.0 が支配的なはず: {clamped}/{}",
-            steady.len()
+            clamped_count >= ONE_CHUNK_SAMPLES,
+            "クランプ値 1.0 が相応に出現するはず: {clamped_count}/{}",
+            samples.len()
         );
     }
 
-    /// 片側（system）が途中で供給を止めても出力は止まらず、以降は mic 側の音だけが
-    /// 出続ける（飢餓側を無音 0.0 として合成を続行する）。
+    /// 片側（system）が途中で供給を止めても出力は止まらず、飢餓側を無音 0.0 として
+    /// mic 側の音だけで合成が続く（mic 単独値 0.2 が流れ始める）。
     #[test]
     fn mix_survives_one_side_starvation() {
         let mic = Box::new(ConstBackend::new(0.2, None));
@@ -581,24 +670,27 @@ mod tests {
         let system = Box::new(ConstBackend::new(0.3, Some(Duration::from_millis(150))));
         let (mut be, mut consumer) = start_composite(mic, system, 1.0, 1.0);
 
-        // 前半（両側供給）を捨て、system 停止 + 飢餓閾値経過後の出力を観測する。
-        let _ = collect_samples(&mut consumer, Duration::from_millis(400));
-        let late = collect_samples(&mut consumer, Duration::from_millis(400));
+        // system 停止（壁時計 150ms）→ バックログ消化 → 飢餓閾値経過の後、必ず
+        // mic 単独値 0.2 が流れ始める。「400ms 後の窓の大半が 0.2」のような壁時計窓
+        // の判定は、負荷でバックログ消化が遅れるだけで割れるので、「mic 単独値が
+        // 1 チャンク分出るまで待つ」存在保証に置く。
+        let mut mic_only = 0usize;
+        let samples = collect_until(&mut consumer, COLLECT_MAX_WAIT, |new| {
+            mic_only += count_near(new, 0.2);
+            mic_only >= ONE_CHUNK_SAMPLES
+        });
         be.stop();
 
+        // 集合判定: 現れてよいのは合成値 0.5 / mic 単独 0.2 / system 単独 0.3 /
+        // プライミング境界の 0.0 だけ。
+        assert_only_allowed_values(&samples, 0.5, 0.2, 0.3);
+        // 存在保証: system 停止後も出力は止まらず、飢餓側ゼロ埋めの mic 単独値が
+        // 実際に流れること。
+        let mic_only_count = count_near(&samples, 0.2);
         assert!(
-            late.len() > 5_000,
-            "片側が止まっても出力は流れ続けるはず: {} サンプル",
-            late.len()
-        );
-        // 後半は mic 単独（0.2×1.0 + 0.0×1.0 = 0.2）。境界チャンクに合成残り
-        // （0.5）が混ざり得るので、末尾側の大半が 0.2 であることを確認する。
-        let tail = &late[late.len() / 2..];
-        let mic_only = tail.iter().filter(|&&s| (s - 0.2).abs() < 1e-4).count();
-        assert!(
-            mic_only as f64 > tail.len() as f64 * 0.9,
-            "飢餓後は mic 単独の値 0.2 が支配的なはず: {mic_only}/{}",
-            tail.len()
+            mic_only_count >= ONE_CHUNK_SAMPLES,
+            "飢餓後は mic 単独の値 0.2 が流れ続けるはず: {mic_only_count}/{}",
+            samples.len()
         );
     }
 
@@ -673,10 +765,14 @@ mod tests {
         let mut stream = crate::Stream::open(StreamConfig::default(), backend).expect("open");
         stream.start().expect("start");
 
+        // 合成値のサンプルが 1 チャンク分届くまでポーリングする（壁時計の固定窓は
+        // 負荷でフレークするため、条件到達までの待ち方式。上限はハング保険）。
         let mut chunks = Vec::new();
-        let deadline = Instant::now() + Duration::from_millis(600);
-        while Instant::now() < deadline {
+        let mut mixed = 0usize;
+        let deadline = Instant::now() + COLLECT_MAX_WAIT;
+        while Instant::now() < deadline && mixed < ONE_CHUNK_SAMPLES {
             while let Some(c) = stream.poll_chunk() {
+                mixed += count_near(&c.data, 0.5);
                 chunks.push(c);
             }
             thread::sleep(Duration::from_millis(5));
@@ -691,18 +787,17 @@ mod tests {
                 assert!(c.seq > chunks[i - 1].seq, "seq は単調増加");
             }
         }
-        // 前半のチャンクは起動過渡として捨て、後半 50% で判定する。スケジューリング
-        // 停滞の飢餓埋め（0.2/0.3 単独）をごく僅かだけ許容しつつ、合成値 0.5 が
-        // 支配的であること。
-        let mut mixed_samples = 0usize;
-        let mut total_samples = 0usize;
-        for c in &chunks[chunks.len() / 2..] {
-            total_samples += c.data.len();
-            mixed_samples += c.data.iter().filter(|&&s| (s - 0.5).abs() < 1e-4).count();
-        }
+        // 全チャンク・全サンプルで集合判定: 現れてよいのは合成値 0.2 + 0.3 = 0.5、
+        // 飢餓ゼロ埋め時の片側値 0.2（mic 単独）/ 0.3（system 単独）、プライミング
+        // 境界の 0.0 だけ。Stream の第 1 段は 48k/stereo でパススルー（gain 1.0 は
+        // バイト無変更）なので、ミキサー出力の値がそのまま届く。
+        let all: Vec<f32> = chunks.iter().flat_map(|c| c.data.iter().copied()).collect();
+        let mixed_count = assert_only_allowed_values(&all, 0.5, 0.2, 0.3);
+        // 存在保証: 合成が実際に起きていること（1 チャンク分の絶対数）。
         assert!(
-            mixed_samples as f64 > total_samples as f64 * 0.98,
-            "合成値 0.5 が支配的なはず: {mixed_samples}/{total_samples}"
+            mixed_count >= ONE_CHUNK_SAMPLES,
+            "合成値 0.5 が相応に出現するはず: {mixed_count}/{}",
+            all.len()
         );
     }
 }
