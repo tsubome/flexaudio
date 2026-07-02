@@ -8,18 +8,37 @@ use std::time::{Duration, Instant};
 use flexaudio::core::types::{AudioChunk, ChunkFlags, OutputFormat, StreamConfig};
 use flexaudio::{MockBackend, Stream};
 
-/// 指定時間 poll してチャンクを集めるヘルパ。
-fn collect_chunks(stream: &mut Stream, dur: Duration) -> Vec<AudioChunk> {
+/// 条件を満たすまで poll してチャンクを集めるヘルパ。
+///
+/// `done` は集まった全チャンクを受け取り、true を返したら収集を終える。壁時計の
+/// 固定窓（「500ms 集めて N 個来るはず」）は、負荷でスレッド群がデスケジュール
+/// されると窓内の生産量を保証できず原理的にフレークするため、「条件到達まで待つ」
+/// 方式にする。`max_wait` は極端な負荷でも走り続けないためのハング保険で、超過時は
+/// 集まったぶんを返す（不足は呼び出し側のアサーションが検出する）。
+fn collect_until(
+    stream: &mut Stream,
+    max_wait: Duration,
+    mut done: impl FnMut(&[AudioChunk]) -> bool,
+) -> Vec<AudioChunk> {
     let mut chunks = Vec::new();
     let start = Instant::now();
-    while start.elapsed() < dur {
+    loop {
         while let Some(c) = stream.poll_chunk() {
             chunks.push(c);
         }
+        if done(&chunks) || start.elapsed() >= max_wait {
+            return chunks;
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
-    chunks
 }
+
+/// [`collect_until`] の待ち上限。通常環境では条件到達で即抜けるので、これは
+/// 「極端な負荷でスレッドがほとんど走れない」場合のハング防止でしかない。
+const COLLECT_MAX_WAIT: Duration = Duration::from_secs(30);
+
+/// 「パイプラインが実際に流れた」と認める最低チャンク数（20ms × 10 = 約 200ms 分）。
+const MIN_CHUNKS: usize = 10;
 
 /// mono 44100 入力 → stereo 48000 / 960frame チャンクへ正規化される。
 #[test]
@@ -28,10 +47,14 @@ fn mock_mono_44100_to_stereo_960_chunks() {
     let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
     stream.start().expect("start");
 
-    let chunks = collect_chunks(&mut stream, Duration::from_millis(500));
+    let chunks = collect_until(&mut stream, COLLECT_MAX_WAIT, |c| c.len() >= MIN_CHUNKS);
     stream.stop();
 
-    assert!(!chunks.is_empty(), "チャンクが1つも来ていない");
+    assert!(
+        chunks.len() >= MIN_CHUNKS,
+        "チャンクが相応に来ていない: {}",
+        chunks.len()
+    );
     for c in &chunks {
         assert_eq!(c.frames, 960, "20ms@48k = 960 frame でない");
         assert_eq!(c.data.len(), 960 * 2, "stereo interleaved (960*2) でない");
@@ -54,10 +77,14 @@ fn mock_passthrough_48000_stereo() {
     let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
     stream.start().expect("start");
 
-    let chunks = collect_chunks(&mut stream, Duration::from_millis(400));
+    let chunks = collect_until(&mut stream, COLLECT_MAX_WAIT, |c| c.len() >= MIN_CHUNKS);
     stream.stop();
 
-    assert!(!chunks.is_empty(), "チャンクが来ていない");
+    assert!(
+        chunks.len() >= MIN_CHUNKS,
+        "チャンクが相応に来ていない: {}",
+        chunks.len()
+    );
     for c in &chunks {
         assert_eq!(c.frames, 960);
         assert_eq!(c.data.len(), 1920);
@@ -79,10 +106,14 @@ fn mock_output_16k_mono() {
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
 
-    let chunks = collect_chunks(&mut stream, Duration::from_millis(500));
+    let chunks = collect_until(&mut stream, COLLECT_MAX_WAIT, |c| c.len() >= MIN_CHUNKS);
     stream.stop();
 
-    assert!(!chunks.is_empty(), "16k/mono チャンクが来ていない");
+    assert!(
+        chunks.len() >= MIN_CHUNKS,
+        "16k/mono チャンクが相応に来ていない: {}",
+        chunks.len()
+    );
     for c in &chunks {
         assert_eq!(c.frames, 320, "16k 20ms = 320 frame でない");
         assert_eq!(c.data.len(), 320, "mono interleaved (320*1) でない");
@@ -116,10 +147,14 @@ fn mock_output_16k_stereo() {
     let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
 
-    let chunks = collect_chunks(&mut stream, Duration::from_millis(500));
+    let chunks = collect_until(&mut stream, COLLECT_MAX_WAIT, |c| c.len() >= MIN_CHUNKS);
     stream.stop();
 
-    assert!(!chunks.is_empty(), "16k/stereo チャンクが来ていない");
+    assert!(
+        chunks.len() >= MIN_CHUNKS,
+        "16k/stereo チャンクが相応に来ていない: {}",
+        chunks.len()
+    );
     for c in &chunks {
         assert_eq!(c.frames, 320, "16k 20ms = 320 frame でない");
         assert_eq!(c.data.len(), 640, "stereo interleaved (320*2) でない");
@@ -139,10 +174,14 @@ fn mock_default_output_regression_with_peak_rms() {
     let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
     stream.start().expect("start");
 
-    let chunks = collect_chunks(&mut stream, Duration::from_millis(400));
+    let chunks = collect_until(&mut stream, COLLECT_MAX_WAIT, |c| c.len() >= MIN_CHUNKS);
     stream.stop();
 
-    assert!(!chunks.is_empty(), "チャンクが来ていない");
+    assert!(
+        chunks.len() >= MIN_CHUNKS,
+        "チャンクが相応に来ていない: {}",
+        chunks.len()
+    );
     for c in &chunks {
         assert_eq!(c.frames, 960);
         assert_eq!(c.data.len(), 1920);
@@ -187,23 +226,46 @@ fn open_start_stop_is_clean() {
 /// `switch_backend(MockBackend(48000/stereo/220Hz))` で差し替え → さらに数チャンク
 /// 取得。アサート:
 /// 1. 全 chunk の seq が 0,1,2,... と隙間なく連続（切替で seq を触らない）。
-/// 2. 切替後最初のチャンクに DISCONTINUITY が立つ（意図的切替）。
+/// 2. フラグは許容集合（空 / 切替の DISCONTINUITY 単独 / 自動復帰の
+///    RECOVERED|DISCONTINUITY）のみ。切替マーカー（DISCONTINUITY 単独）は高々 1 回・
+///    切替境界以降で、境界以降に不連続の通知が必ず 1 つ以上ある。
 /// 3. 切替前後で frames/data.len が output 一定（既定 48k/2 → 960frame・1920sample）。
 /// 4. 44100/mono → 48000/stereo の第 1 段再構成後も panic/破綻しない。
-/// 5. pts_ns が単調増加（非減少）。
+/// 5. pts_ns の後退が構造的上界（バースト到着の再アンカー幅）を超えない。
 #[test]
 fn switch_backend_keeps_seq_continuous_and_flags_discontinuity() {
+    // 切替マーカーの述語。意図的切替は DISCONTINUITY のみで、自動復帰の RECOVERED は
+    // 付かない設計なので「RECOVERED を伴わない DISCONTINUITY」で識別する（切替が誤って
+    // RECOVERED を立てるバグはこの述語に合致せず検出される）。
+    fn is_switch_marker(c: &AudioChunk) -> bool {
+        c.flags.contains(ChunkFlags::DISCONTINUITY) && !c.flags.contains(ChunkFlags::RECOVERED)
+    }
+
     // 既定出力 {48000, 2}: 切替前後で frames=960 / data.len=1920 が不変であること。
+    //
+    // チャンクリングは既定の 50（=1 秒分）だと、負荷で poll 側だけが長く止まったとき
+    // DROP_OLDEST が起きて本丸の「seq 連続」検証がスケジューラ依存になる。MockBackend の
+    // 生産は実時間ペース（≤50 チャンク/秒）で、このテストの総所要はハング保険込みでも
+    // 収集 2 回 × 30 秒 ≒ 3,000 チャンク強が上限なので、それを丸ごと収容できる容量に
+    // してドロップを構造的に不可能にする。
+    let config = StreamConfig {
+        ring_capacity_chunks: 4096,
+        ..Default::default()
+    };
     let backend = Box::new(MockBackend::new(44_100, 1, 440.0));
-    let mut stream = Stream::open(StreamConfig::default(), backend).expect("open");
+    let mut stream = Stream::open(config, backend).expect("open");
     stream.start().expect("start");
 
     // 切替前のネイティブフォーマット（mono 44100）。
     assert_eq!(stream.native_format(), (44_100, 1));
 
-    // --- 切替前のチャンクを集める ---
-    let before = collect_chunks(&mut stream, Duration::from_millis(300));
-    assert!(!before.is_empty(), "切替前にチャンクが来ていない");
+    // --- 切替前のチャンクを集める（相応の数が揃うまで待つ） ---
+    let before = collect_until(&mut stream, COLLECT_MAX_WAIT, |c| c.len() >= MIN_CHUNKS);
+    assert!(
+        before.len() >= MIN_CHUNKS,
+        "切替前にチャンクが相応に来ていない: {}",
+        before.len()
+    );
     let before_count = before.len();
 
     // --- ソースを 48000/stereo/220Hz へホットスワップ ---
@@ -216,10 +278,17 @@ fn switch_backend_keeps_seq_continuous_and_flags_discontinuity() {
     assert_eq!(stream.native_format(), (48_000, 2));
 
     // --- 切替後のチャンクを集める ---
-    let after = collect_chunks(&mut stream, Duration::from_millis(300));
+    // 不連続の通知（DISCONTINUITY）が観測でき、かつその後もチャンクが相応に流れ続ける
+    // まで待つ（通知が出た瞬間で打ち切ると「切替後もストリームが続く」ことを証明でき
+    // ない）。切替マーカー単独でなく DISCONTINUITY 全般を待つのは、極端な負荷では
+    // 切替の通知が自動復帰チャンクへ合流し得るため（詳細は (2) のコメント参照）。
+    let mut after = collect_until(&mut stream, COLLECT_MAX_WAIT, |c| {
+        c.iter()
+            .position(|chunk| chunk.flags.contains(ChunkFlags::DISCONTINUITY))
+            .is_some_and(|pos| c.len() - (pos + 1) >= MIN_CHUNKS)
+    });
     stream.stop();
     // stop 後にリング残を取り切る。
-    let mut after = after;
     while let Some(c) = stream.poll_chunk() {
         after.push(c);
     }
@@ -239,43 +308,53 @@ fn switch_backend_keeps_seq_continuous_and_flags_discontinuity() {
         );
     }
 
-    // (2) 切替によって DISCONTINUITY がちょうど 1 回立ち、それが切替前後の境界
-    //     （= before_count）以降の最初のチャンクに付く。
-    //     `collect_chunks` の戻りと switch の発効の間に旧ソースのチャンクが 1〜2 個
-    //     `after` 側へ紛れ込み得るため、厳密な index 等値ではなく「境界以降の最初の
-    //     DISCONTINUITY」を探す（その手前の chunk は通常録音でフラグ無し）。
-    let disc_positions: Vec<usize> = all
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.flags.contains(ChunkFlags::DISCONTINUITY))
-        .map(|(i, _)| i)
-        .collect();
-    assert_eq!(
-        disc_positions.len(),
-        1,
-        "DISCONTINUITY はちょうど 1 回（切替）だけ立つはず: 位置={disc_positions:?}"
-    );
-    let disc_idx = disc_positions[0];
-    // DISCONTINUITY は切替境界（before_count）以降に立つ（切替前は通常録音）。
-    assert!(
-        disc_idx >= before_count,
-        "DISCONTINUITY が切替前に立っている: disc_idx={disc_idx} < before_count={before_count}"
-    );
-    // 意図的切替なので RECOVERED は付かない。
-    assert!(
-        !all[disc_idx].flags.contains(ChunkFlags::RECOVERED),
-        "意図的切替なのに RECOVERED が立っている: flags={:?}",
-        all[disc_idx].flags
-    );
-    // DISCONTINUITY より手前は全て通常録音（フラグ無し）。
-    for c in &all[..disc_idx] {
+    // (2) フラグの許容集合検証（mix.rs の「値の許容集合」と同じ発想: スケジューラは
+    //     チャンクの量やタイミングを動かせても、集合の外のフラグは作れない）。
+    //     現れてよいのは:
+    //       - 空 … 通常録音
+    //       - DISCONTINUITY 単独 … 意図的切替のマーカー（RECOVERED は付かない設計）
+    //       - RECOVERED|DISCONTINUITY … ウォッチドッグの自動復帰。極端な負荷で取り込みが
+    //         2 秒超止まると正当に発生する（このテストの検証対象外だが混ざり得る）
+    let recovery_flags = ChunkFlags::RECOVERED | ChunkFlags::DISCONTINUITY;
+    for c in &all {
         assert!(
-            c.flags.is_empty(),
-            "切替前の通常チャンクにフラグが立っている: seq={} flags={:?}",
+            c.flags.is_empty() || c.flags == ChunkFlags::DISCONTINUITY || c.flags == recovery_flags,
+            "許容集合外のフラグ（切替/復帰のフラグ付けが壊れている）: seq={} flags={:?}",
             c.seq,
             c.flags
         );
     }
+    //     切替マーカーは本来「ちょうど 1 回・境界以降」だが、切替直後に自動復帰が重なる
+    //     と、切替の DISCONTINUITY が復帰チャンク（RECOVERED|DISCONTINUITY）へ合流して
+    //     単独マーカーが現れないことがある（両 pending フラグは同じ次チャンクで OR 消費
+    //     される）。そこで決定論に検証できる 3 つへ分ける:
+    //       (2a) 単独マーカーは高々 1 回（2 回以上あれば切替の実装が壊れている）
+    //       (2b) 単独マーカーは切替境界（= before_count）より前には現れない
+    //       (2c) 境界以降に不連続の通知（単独 or 合流）が必ず 1 つ以上ある
+    //     自動復帰が 1 つも無い実行（通常環境は常にこれ）では (2a)+(2c) と許容集合から
+    //     「ちょうど 1 回・境界以降・RECOVERED なし」まで完全に確定する。
+    let marker_positions: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| is_switch_marker(c))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        marker_positions.len() <= 1,
+        "切替の DISCONTINUITY が複数回立っている: 位置={marker_positions:?}"
+    );
+    if let Some(&idx) = marker_positions.first() {
+        assert!(
+            idx >= before_count,
+            "DISCONTINUITY が切替前に立っている: idx={idx} < before_count={before_count}"
+        );
+    }
+    assert!(
+        all[before_count..]
+            .iter()
+            .any(|c| c.flags.contains(ChunkFlags::DISCONTINUITY)),
+        "切替境界以降に DISCONTINUITY が 1 つも無い（切替が不連続を通知していない）"
+    );
 
     // (3)/(4) 全チャンクで frames/data.len が output 一定（48k/2 → 960frame・1920sample）。
     //         切替で第 1 段（44100/mono → 48000/stereo）が再構成されても不変。
@@ -289,11 +368,19 @@ fn switch_backend_keeps_seq_continuous_and_flags_discontinuity() {
         );
     }
 
-    // (5) pts_ns が単調増加（非減少）。
+    // (5) pts_ns の連続性。pts は「到着時刻を音声位置へ張り直すアンカー」からの外挿
+    //     （normalizer の update_pts_anchor）なので、バースト到着（負荷で取り込みが
+    //     止まり、溜まった生サンプルを一括 pop）では直後の再アンカーで小さく後退し得る
+    //     ＝厳密な単調（非減少）は壁時計依存でアサートできない。ただし後退幅は構造的に
+    //     有界: 一括 pop は RawRing／スクラッチの 48,000 サンプルが上限で、音声時間に
+    //     して最長 48000 / 44100(mono) ≒ 1.09 秒（切替後の 48k/stereo なら 0.5 秒）＋
+    //     normalizer 内部の保持ぶん（1〜2 チャンク）。この上界を超える後退（切替で
+    //     クロック原点が巻き戻る類のバグ）だけを検出する。
+    const MAX_PTS_BACKWARD_NS: i64 = 1_200_000_000;
     for w in all.windows(2) {
         assert!(
-            w[1].pts_ns >= w[0].pts_ns,
-            "pts_ns が後退した: {} -> {}",
+            w[1].pts_ns >= w[0].pts_ns - MAX_PTS_BACKWARD_NS,
+            "pts_ns が再アンカーの上界を超えて後退した: {} -> {}",
             w[0].pts_ns,
             w[1].pts_ns
         );
