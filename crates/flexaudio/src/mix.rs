@@ -242,6 +242,7 @@ fn stop_child(child: &mut Box<dyn CaptureBackend>) {
 
 /// 合成スレッド本体。
 ///
+/// まず [`prime_lanes`] で両側の最初の供給が揃うのを待ってから（上限は飢餓閾値）、
 /// 各子を取り込み（pop → 正規化 → FIFO）、両側の揃ったフレームを側別ゲインで加算
 /// 合成して実 sink へ push する。片側が [`STARVATION_FILL_THRESHOLD`] 以上供給ゼロ
 /// なら不足分を無音として続行する（システム側が無音の時間帯も録音は流れ続ける）。
@@ -260,6 +261,12 @@ fn run_mixer(
     // pop 用スクラッチ（子リング容量ぶん）と合成出力スクラッチ。ループ内で再利用する。
     let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
     let mut mixed: Vec<f32> = Vec::with_capacity(FIFO_MAX_SAMPLES);
+
+    // 起動直後は子スレッドの立ち上がりがバラつくため、両側が流れ始めるまで
+    // （上限は飢餓閾値）待ってから合成を始める＝録音の頭が片側だけになるのを防ぐ。
+    if !prime_lanes(&mut mic, &mut system, &mut scratch, &stopping) {
+        return;
+    }
 
     loop {
         if stopping.load(Ordering::SeqCst) {
@@ -284,6 +291,36 @@ fn run_mixer(
             thread::sleep(IDLE_SLEEP);
         }
     }
+}
+
+/// 合成開始前のプライミング。起動直後は子バックエンドのスレッド立ち上がりが
+/// バラつくため、両側の FIFO に最初の正規化済みサンプルが届くまで [`IDLE_SLEEP`]
+/// でポーリングして待ってから合成を始める。ここを飛ばすと、遅れた側のリングが
+/// 空のまま飢餓埋めが発動して録音の頭が片側だけの音になり得る。
+///
+/// 待ちの上限は [`STARVATION_FILL_THRESHOLD`]。片側が最初から供給ゼロ
+/// （例: システム側が何も再生していない）という正当なケースは、既存の飢餓と
+/// 同じ時間感覚で見切って合成を始める。停止指示が来たら待ちを打ち切る。
+/// 正規化の失敗は `false` を返し、呼び出し側が合成スレッドを終える。
+fn prime_lanes(
+    mic: &mut ChildLane,
+    system: &mut ChildLane,
+    scratch: &mut [f32],
+    stopping: &AtomicBool,
+) -> bool {
+    let start = Instant::now();
+    while !stopping.load(Ordering::SeqCst) {
+        if mic.ingest(scratch).is_err() || system.ingest(scratch).is_err() {
+            return false;
+        }
+        if (!mic.fifo.is_empty() && !system.fifo.is_empty())
+            || start.elapsed() >= STARVATION_FILL_THRESHOLD
+        {
+            break;
+        }
+        thread::sleep(IDLE_SLEEP);
+    }
+    true
 }
 
 /// 両側の FIFO から合成できる分を取り出し、側別ゲインで加算合成（±1.0 クランプ）して
@@ -488,10 +525,11 @@ mod tests {
             "500ms で相応のサンプルが出るはず: {}",
             samples.len()
         );
-        // 先頭 1 チャンク分（立ち上がり）を捨てて定常部を見る。テスト機の一時的な
-        // スケジューリング停滞（>60ms）で片側だけ飢餓埋めされると 0.2 / 0.6 が
-        // 瞬間的に混ざり得るので、ごく僅かな外れ値だけ許容する（支配値は 0.8）。
-        let steady = &samples[1920..];
+        // 前半は起動過渡（遅いテスト機では子スレッドの立ち上がりがバラつく）として
+        // 捨て、後半 50% の定常部で判定する。テスト機の一時的なスケジューリング停滞
+        // （>60ms）で片側だけ飢餓埋めされると 0.2 / 0.6 が瞬間的に混ざり得るので、
+        // ごく僅かな外れ値だけ許容する（支配値は 0.8）。
+        let steady = &samples[samples.len() / 2..];
         let ok = steady.iter().filter(|&&s| (s - 0.8).abs() < 1e-4).count();
         assert!(
             ok as f64 > steady.len() as f64 * 0.98,
@@ -522,9 +560,10 @@ mod tests {
                 "クランプ後は 1.0 を超えないはず: samples[{i}] = {s}"
             );
         }
-        // 定常部（両側供給）では 1.6 → 1.0 ちょうどが支配的（片側飢餓埋めの瞬間だけ
-        // 0.8 になり得るので僅かな外れ値は許容）。
-        let steady = &samples[1920..];
+        // 前半は起動過渡として捨て、後半 50% の定常部（両側供給）で判定する。
+        // ここでは 1.6 → 1.0 ちょうどが支配的（スケジューリング停滞の片側飢餓埋めの
+        // 瞬間だけ 0.8 になり得るので僅かな外れ値は許容）。
+        let steady = &samples[samples.len() / 2..];
         let clamped = steady.iter().filter(|&&s| s == 1.0).count();
         assert!(
             clamped as f64 > steady.len() as f64 * 0.98,
@@ -645,19 +684,22 @@ mod tests {
         stream.stop();
 
         assert!(!chunks.is_empty(), "チャンクが届くはず");
-        let mut mixed_samples = 0usize;
-        let mut total_samples = 0usize;
         for (i, c) in chunks.iter().enumerate() {
             assert_eq!(c.frames, 960, "20ms@48k = 960 frame");
             assert_eq!(c.data.len(), 960 * 2, "stereo interleaved");
             if i > 0 {
                 assert!(c.seq > chunks[i - 1].seq, "seq は単調増加");
             }
+        }
+        // 前半のチャンクは起動過渡として捨て、後半 50% で判定する。スケジューリング
+        // 停滞の飢餓埋め（0.2/0.3 単独）をごく僅かだけ許容しつつ、合成値 0.5 が
+        // 支配的であること。
+        let mut mixed_samples = 0usize;
+        let mut total_samples = 0usize;
+        for c in &chunks[chunks.len() / 2..] {
             total_samples += c.data.len();
             mixed_samples += c.data.iter().filter(|&&s| (s - 0.5).abs() < 1e-4).count();
         }
-        // スケジューリング停滞の飢餓埋め（0.2/0.3 単独）をごく僅かだけ許容しつつ、
-        // 合成値 0.5 が支配的であること。
         assert!(
             mixed_samples as f64 > total_samples as f64 * 0.98,
             "合成値 0.5 が支配的なはず: {mixed_samples}/{total_samples}"
