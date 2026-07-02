@@ -10,8 +10,10 @@
 //!   backend のまま・触らない）。
 //! - 合成スレッド（1 本・`flexaudio-mix`）: 子リングを pop → 子ごとの [`Normalizer`]
 //!   で 48k/stereo 化 → 両側の揃ったフレームを側別ゲインで加算合成（±1.0 クランプ）
-//!   → 実 sink へ push。RT ではないのでヒープ確保可（ただしループ内の定常確保は
-//!   スクラッチ再利用で避ける）。
+//!   → 実 sink へ push。mic と system は別々の水晶で動きレートが数〜数百 ppm ずれる
+//!   ので、system 側だけを微リサンプルするドリフト補正（[`LinearStitcher`] +
+//!   [`DriftController`]）で吸収する。RT ではないのでヒープ確保可（ただしループ内の
+//!   定常確保はスクラッチ再利用で避ける）。
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,11 +37,40 @@ const STARVATION_FILL_THRESHOLD: Duration = Duration::from_millis(60);
 
 /// 片側の正規化済み FIFO の上限（f32 サンプル数）。約 500ms 分
 /// （48kHz × 2ch × 0.5s = 48_000）を超えたら古い方から捨てる安全弁。
-/// 子クロック間のドリフト補正は次ステージで実装予定なので、v1 は無限成長の防止のみ。
+/// 子クロック間のレート差はドリフト補正（[`DriftController`]）が吸収するので、
+/// 補正が効いている限り通常ここには到達しない。補正の範囲（±500ppm）で追い
+/// つかない異常（片側の暴走供給など）に対する最後の砦として残す。
 const FIFO_MAX_SAMPLES: usize = 48_000;
 
 /// 両側とも合成する材料が無いときの待ち時間（stream.rs の取り込みスレッドと同じ流儀）。
 const IDLE_SLEEP: Duration = Duration::from_millis(2);
+
+/// ドリフト補正で system 側の読み出し比率 r を動かせる幅（1.0 ± 500ppm）。
+/// 民生機の水晶の実ドリフトは通常数十〜百数十 ppm なのでこれで十分覆え、
+/// r がこの範囲なら線形補間による歪みは無視できる水準に収まる（補間点が常に
+/// 原サンプルのごく近傍に留まるため）。
+const DRIFT_RATIO_LIMIT: f64 = 500e-6;
+
+/// 比率を見直す間隔（合成出力の f32 サンプル数）。合成 100ms 分ごとに 1 回。
+/// 正規化チャンク（20ms）5 個分で、到着粒度より粗く、ドリフトの時間スケール
+/// （分オーダー）より十分細かい。
+const DRIFT_UPDATE_INTERVAL_SAMPLES: usize = (SAMPLE_RATE as usize / 10) * CHANNELS as usize;
+
+/// 残量差 EMA の係数。更新間隔 100ms と合わせて時定数はおよそ 1 秒。チャンク
+/// 到着のゆらぎ（20ms 粒度のノコギリ状の残量変動）を均しつつ、ドリフトの変化
+/// には十分追従できる。
+const DRIFT_EMA_ALPHA: f64 = 0.1;
+
+/// P 制御のゲイン。残量差 200ms 分（19_200 サンプル）でクランプ上限の 500ppm を
+/// 使い切る傾き。この穏やかさなら、実ドリフト（数十〜数百 ppm）に対する定常
+/// 残量差は数十〜百数十 ms 分（= ドリフト ÷ ゲイン）に落ち着き、500ms の安全弁
+/// には遠く及ばない。
+const DRIFT_GAIN: f64 = DRIFT_RATIO_LIMIT / 19_200.0;
+
+/// 1 回の見直しで比率を動かせる上限（slew）。100ms あたり 20ppm＝クランプ幅の
+/// 端から端まででも 5 秒かける。残量差の測定ノイズで比率が急変してピッチが
+/// 揺れるのを防ぐ。
+const DRIFT_SLEW_PER_UPDATE: f64 = 20e-6;
 
 /// mic + system の 2 子バックエンドを内部正規形で加算合成する合成バックエンド。
 ///
@@ -192,6 +223,131 @@ impl ChildLane {
     }
 }
 
+/// system レーン用の微リサンプラ（線形補間ステッチャ）。
+///
+/// mic を基準クロックとし（録音の時間軸は人の声＝マイク側に合わせるのが自然）、
+/// system の FIFO だけを比率 r 倍の速度で線形補間しながら読み出して、子クロック間
+/// のレート差を吸収する。読み出し位置の小数部だけを状態として持つ。
+struct LinearStitcher {
+    /// FIFO 先頭フレームから見た読み出し位置の小数部（フレーム単位、[0, 1)）。
+    frac: f64,
+}
+
+impl LinearStitcher {
+    fn new() -> Self {
+        Self { frac: 0.0 }
+    }
+
+    /// FIFO に `fifo_frames` フレームあるとき、比率 `ratio` で補間生成できる出力
+    /// フレーム数。k 番目（0 始まり）の出力は位置 `frac + k×ratio` の左右 2 フレーム
+    /// から作るので、位置が最終フレーム F-1 を超えない k までしか作れない
+    /// （最終フレームちょうどに乗る分は重み 0 なので作れる）。
+    fn producible(&self, fifo_frames: usize, ratio: f64) -> usize {
+        if fifo_frames == 0 {
+            return 0;
+        }
+        let span = (fifo_frames - 1) as f64 - self.frac;
+        if span < 0.0 {
+            return 0;
+        }
+        (span / ratio) as usize + 1
+    }
+
+    /// system FIFO から `out_frames` フレームを `ratio` 倍速の線形補間で読み出し、
+    /// interleaved のまま `out` へ書き足す。読み終えたフレームは FIFO から捨て、
+    /// 端数位置は次回へ持ち越す（ブロック境界をまたいでも位相が連続する）。
+    /// 呼び出し側は `out_frames <= producible(...)` を保証すること。
+    fn pull(&mut self, fifo: &mut Vec<f32>, ratio: f64, out_frames: usize, out: &mut Vec<f32>) {
+        let ch = CHANNELS as usize;
+        let frames = fifo.len() / ch;
+        debug_assert!(out_frames <= self.producible(frames, ratio));
+        for k in 0..out_frames {
+            let pos = self.frac + k as f64 * ratio;
+            let left = pos as usize;
+            // 位置がちょうど最終フレームに乗ったときだけ右端をクランプ
+            // （そのとき重みは 0 なので補間結果は変わらない）。
+            let right = (left + 1).min(frames - 1);
+            let w = (pos - left as f64) as f32;
+            for c in 0..ch {
+                let a = fifo[left * ch + c];
+                let b = fifo[right * ch + c];
+                out.push(a + w * (b - a));
+            }
+        }
+        // 次の読み出し位置。整数部のフレームは読み終わったので捨て、小数部だけ残す。
+        let end = self.frac + out_frames as f64 * ratio;
+        let consumed = (end as usize).min(frames);
+        self.frac = end - consumed as f64;
+        fifo.drain(..consumed * ch);
+    }
+
+    /// 飢餓経路で system FIFO を丸ごと吐き出したときの位相の仕切り直し。
+    fn reset(&mut self) {
+        self.frac = 0.0;
+    }
+}
+
+/// 残量差から読み出し比率 r を決めるフィードバック制御（EMA + P 制御 + slew）。
+///
+/// 合成が [`DRIFT_UPDATE_INTERVAL_SAMPLES`] 進むごとに、消費後の FIFO 残量差
+/// （mic - system）の指数移動平均を取り、差が負（system 側が溜まる）なら r を
+/// 上げて速く消費し、正なら下げる。P 制御で足りるのは、残量差自体がレート差の
+/// 積分だから（比例で押し返せば残量差は有限のところで釣り合う）。
+struct DriftController {
+    /// 現在の読み出し比率 r（1.0 中心に ±[`DRIFT_RATIO_LIMIT`] でクランプ）。
+    ratio: f64,
+    /// 残量差 (mic_len - system_len) の指数移動平均（f32 サンプル数）。
+    ema_diff: f64,
+    /// 前回の見直しからの合成出力サンプル数。
+    pending_samples: usize,
+}
+
+impl DriftController {
+    fn new() -> Self {
+        Self {
+            ratio: 1.0,
+            ema_diff: 0.0,
+            pending_samples: 0,
+        }
+    }
+
+    /// 合成出力が進んだ量を記録し、[`DRIFT_UPDATE_INTERVAL_SAMPLES`] に達したら
+    /// 比率を 1 回見直す。残量は消費後の値を渡すこと（消費前だと今回消費する分
+    /// まで差に見えてしまう）。
+    fn on_output(&mut self, samples: usize, mic_len: usize, system_len: usize) {
+        self.pending_samples += samples;
+        if self.pending_samples >= DRIFT_UPDATE_INTERVAL_SAMPLES {
+            self.pending_samples = 0;
+            self.update(mic_len, system_len);
+        }
+    }
+
+    /// 残量差の EMA を更新し、P 制御 + slew で比率を 1 段階動かす。
+    fn update(&mut self, mic_len: usize, system_len: usize) {
+        let diff = mic_len as f64 - system_len as f64;
+        self.ema_diff += DRIFT_EMA_ALPHA * (diff - self.ema_diff);
+        let target = (1.0 - DRIFT_GAIN * self.ema_diff)
+            .clamp(1.0 - DRIFT_RATIO_LIMIT, 1.0 + DRIFT_RATIO_LIMIT);
+        let step = (target - self.ratio).clamp(-DRIFT_SLEW_PER_UPDATE, DRIFT_SLEW_PER_UPDATE);
+        self.ratio += step;
+    }
+}
+
+/// ドリフト補正一式（ステッチャ + 比率コントローラ）。合成スレッドごとに 1 つ持つ。
+struct DriftCorrection {
+    stitcher: LinearStitcher,
+    controller: DriftController,
+}
+
+impl DriftCorrection {
+    fn new() -> Self {
+        Self {
+            stitcher: LinearStitcher::new(),
+            controller: DriftController::new(),
+        }
+    }
+}
+
 /// 子を 1 つ起動する: 専用の子 RawRing（stream.rs と同じ容量）を作り、子ネイティブ
 /// フォーマットの [`RawSink`] で `start` する。成功で [`ChildLane`] を返す。
 ///
@@ -261,6 +417,8 @@ fn run_mixer(
     // pop 用スクラッチ（子リング容量ぶん）と合成出力スクラッチ。ループ内で再利用する。
     let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
     let mut mixed: Vec<f32> = Vec::with_capacity(FIFO_MAX_SAMPLES);
+    // 子クロック間ドリフト補正の状態（start ごとに新調＝前回録音の比率を引きずらない）。
+    let mut drift = DriftCorrection::new();
 
     // 起動直後は子スレッドの立ち上がりがバラつくため、両側が流れ始めるまで
     // （上限は飢餓閾値）待ってから合成を始める＝録音の頭が片側だけになるのを防ぐ。
@@ -283,6 +441,7 @@ fn run_mixer(
             &mut system,
             mic_gain,
             system_gain,
+            &mut drift,
             &mut sink,
             &mut mixed,
         );
@@ -327,25 +486,55 @@ fn prime_lanes(
 /// sink へ push する。何か push したら `true`。
 ///
 /// 取り出し量の決め方:
-/// - 両側にデータがある → 揃っているフレーム数 min。
+/// - 両側にデータがある（定常経路）→ mic の在庫と system から補間で作れる量の min。
+///   mic は等速、system は [`LinearStitcher`] が比率 r 倍速の線形補間で読み出して
+///   子クロック間のドリフトを吸収する。r は消費後の残量差から [`DriftController`]
+///   が微調整する。
 /// - 片側だけデータがあり、もう片側が飢餓（60ms 以上供給ゼロ）→ ある側の全量を
-///   無音相手と合成（不足分 0.0 埋め）。
+///   無音相手と合成（不足分 0.0 埋め）。補正はこの経路には掛けない（既存の飢餓
+///   セマンティクスのまま）。
 /// - それ以外（両側空・相手がまだ飢餓でない）→ 何もしない（揃うのを待つ）。
 fn mix_and_push(
     mic: &mut ChildLane,
     system: &mut ChildLane,
     mic_gain: f32,
     system_gain: f32,
+    drift: &mut DriftCorrection,
     sink: &mut RawSink,
     mixed: &mut Vec<f32>,
 ) -> bool {
+    let ch = CHANNELS as usize;
+    let ratio = drift.controller.ratio;
+    let steady_frames =
+        (mic.fifo.len() / ch).min(drift.stitcher.producible(system.fifo.len() / ch, ratio));
+    if steady_frames > 0 {
+        // 定常経路: system 側だけを r 倍速の線形補間で読み出してから加算合成する。
+        mixed.clear();
+        drift
+            .stitcher
+            .pull(&mut system.fifo, ratio, steady_frames, mixed);
+        let count = steady_frames * ch;
+        for (i, out) in mixed.iter_mut().enumerate() {
+            *out = (mic.fifo[i] * mic_gain + *out * system_gain).clamp(-1.0, 1.0);
+        }
+        mic.fifo.drain(..count);
+        drift
+            .controller
+            .on_output(count, mic.fifo.len(), system.fifo.len());
+        // pts は stream.rs の取り込みと同様、単調 now でよい（sink 側では別途取り回す契約）。
+        sink.push(mixed, monotonic_now_ns());
+        return true;
+    }
+
+    // 飢餓経路（補正なし・既存セマンティクス）。
     let now = Instant::now();
-    let both = mic.fifo.len().min(system.fifo.len());
-    let (mic_take, system_take) = if both > 0 {
-        (both, both)
-    } else if !mic.fifo.is_empty() && system.is_starved(now) {
-        (mic.fifo.len(), 0)
-    } else if !system.fifo.is_empty() && mic.is_starved(now) {
+    let (mic_take, system_take) = if !mic.fifo.is_empty() && system.is_starved(now) {
+        // system 途絶: mic 全量を出す。補間の右端が来ないまま残った端数
+        // （高々 1 フレーム）もここで吐き切り、位相は仕切り直す。
+        drift.stitcher.reset();
+        (mic.fifo.len(), system.fifo.len())
+    } else if mic.fifo.is_empty() && !system.fifo.is_empty() && mic.is_starved(now) {
+        drift.stitcher.reset();
         (0, system.fifo.len())
     } else {
         return false;
@@ -798,6 +987,362 @@ mod tests {
             mixed_count >= ONE_CHUNK_SAMPLES,
             "合成値 0.5 が相応に出現するはず: {mixed_count}/{}",
             all.len()
+        );
+    }
+
+    // ---- ドリフト補正のコンポーネント単体（純粋・決定論） ----
+
+    /// system 側が溜まる（mic - system が負）と r は 1.0 より上（速く消費する方向）
+    /// へ、mic 側が溜まると 1.0 より下へ動く。
+    #[test]
+    fn drift_controller_moves_toward_lagging_side() {
+        let mut c = DriftController::new();
+        for _ in 0..50 {
+            c.update(0, 9_600);
+        }
+        assert!(
+            c.ratio > 1.0,
+            "system 側が溜まると r > 1.0 のはず: {}",
+            c.ratio
+        );
+
+        let mut c = DriftController::new();
+        for _ in 0..50 {
+            c.update(9_600, 0);
+        }
+        assert!(
+            c.ratio < 1.0,
+            "mic 側が溜まると r < 1.0 のはず: {}",
+            c.ratio
+        );
+    }
+
+    /// どれだけ大きな残量差を与え続けても r は 1.0 ± 500ppm で頭打ちになる。
+    #[test]
+    fn drift_controller_clamps_at_ratio_limit() {
+        let mut c = DriftController::new();
+        for _ in 0..1_000 {
+            c.update(0, 10_000_000);
+        }
+        assert!(
+            (c.ratio - (1.0 + DRIFT_RATIO_LIMIT)).abs() < 1e-12,
+            "上側クランプちょうどで止まるはず: {}",
+            c.ratio
+        );
+
+        let mut c = DriftController::new();
+        for _ in 0..1_000 {
+            c.update(10_000_000, 0);
+        }
+        assert!(
+            (c.ratio - (1.0 - DRIFT_RATIO_LIMIT)).abs() < 1e-12,
+            "下側クランプちょうどで止まるはず: {}",
+            c.ratio
+        );
+    }
+
+    /// 巨大な残量差を一撃で与えても、1 回の更新で動けるのは slew 幅まで。
+    #[test]
+    fn drift_controller_slew_limits_change_per_update() {
+        let mut c = DriftController::new();
+        c.update(0, 10_000_000);
+        assert!(
+            (c.ratio - (1.0 + DRIFT_SLEW_PER_UPDATE)).abs() < 1e-12,
+            "1 回目の更新は slew 幅ちょうどで頭打ちのはず: {}",
+            c.ratio
+        );
+        c.update(0, 10_000_000);
+        assert!(
+            (c.ratio - (1.0 + 2.0 * DRIFT_SLEW_PER_UPDATE)).abs() < 1e-12,
+            "2 回目も 1 段階ずつ: {}",
+            c.ratio
+        );
+
+        let mut c = DriftController::new();
+        c.update(10_000_000, 0);
+        assert!(
+            (c.ratio - (1.0 - DRIFT_SLEW_PER_UPDATE)).abs() < 1e-12,
+            "反対向きも slew 幅ちょうど: {}",
+            c.ratio
+        );
+    }
+
+    /// on_output は合成 100ms 分（更新間隔）たまるまでは比率を見直さない。
+    #[test]
+    fn drift_controller_updates_only_at_interval() {
+        let mut c = DriftController::new();
+        c.on_output(DRIFT_UPDATE_INTERVAL_SAMPLES - 1, 0, 10_000_000);
+        assert!(
+            (c.ratio - 1.0).abs() < 1e-15,
+            "間隔未満では動かないはず: {}",
+            c.ratio
+        );
+        c.on_output(1, 0, 10_000_000);
+        assert!(c.ratio > 1.0, "間隔に達したら見直すはず: {}", c.ratio);
+    }
+
+    /// 等速（r = 1.0・位相 0）ならステッチャは完全なパススルー: 入力と同じ値が
+    /// そのまま出て、FIFO は全量消費され、位相も 0 のまま。
+    #[test]
+    fn stitcher_unity_ratio_is_passthrough() {
+        let mut st = LinearStitcher::new();
+        let src: Vec<f32> = (0..10).flat_map(|f| [f as f32, -(f as f32)]).collect();
+        let mut fifo = src.clone();
+        assert_eq!(st.producible(10, 1.0), 10);
+        let mut out = Vec::new();
+        st.pull(&mut fifo, 1.0, 10, &mut out);
+        assert_eq!(out, src, "r=1.0 はパススルーのはず");
+        assert!(fifo.is_empty(), "全量消費されるはず: {} 残り", fifo.len());
+        assert!(st.frac.abs() < 1e-12, "位相は 0 のまま: {}", st.frac);
+    }
+
+    /// ランプ（frame k の値 = k）を r = 1.25 で読むと、出力は位置 0 / 1.25 / 2.5 /
+    /// 3.75 の線形補間値そのものになる（両チャンネルとも・決定論）。
+    #[test]
+    fn stitcher_interpolates_between_frames() {
+        let mut st = LinearStitcher::new();
+        let mut fifo: Vec<f32> = (0..5).flat_map(|f| [f as f32, f as f32 * 10.0]).collect();
+        // span = 4, floor(4 / 1.25) = 3 → 3 + 1 = 4 フレーム作れる。
+        assert_eq!(st.producible(5, 1.25), 4);
+        let mut out = Vec::new();
+        st.pull(&mut fifo, 1.25, 4, &mut out);
+        let expect = [0.0f32, 1.25, 2.5, 3.75];
+        for (k, &e) in expect.iter().enumerate() {
+            assert!(
+                (out[k * 2] - e).abs() < 1e-6,
+                "位置 {e} の補間値: {}",
+                out[k * 2]
+            );
+            assert!(
+                (out[k * 2 + 1] - e * 10.0).abs() < 1e-5,
+                "ch2 も同じ位置で補間: {}",
+                out[k * 2 + 1]
+            );
+        }
+        // floor(0 + 4×1.25) = 5 で全フレーム読み終わり、位相は 0 に戻る。
+        assert!(fifo.is_empty(), "全量消費されるはず: {} 残り", fifo.len());
+        assert!(st.frac.abs() < 1e-12, "位相: {}", st.frac);
+    }
+
+    // ---- スレッド無しの同期ドリフトシミュレーション（決定論） ----
+
+    /// スレッドを立てない同期シミュレーション用の ChildLane。リング・正規化器は
+    /// 形として持つだけで、供給はテストが [`sim_feed`] で FIFO へ直接行う。
+    fn sim_lane() -> ChildLane {
+        let (_producer, consumer) = raw_ring(16);
+        let normalizer = Normalizer::new(
+            SAMPLE_RATE,
+            CHANNELS,
+            OutputFormat {
+                sample_rate: SAMPLE_RATE,
+                channels: CHANNELS,
+            },
+        )
+        .expect("パススルー正規化器");
+        ChildLane {
+            consumer,
+            normalizer,
+            fifo: Vec::new(),
+            last_supply: Instant::now(),
+        }
+    }
+
+    /// ingest と同じ流儀（FIFO へ積む + 上限の安全弁）で直流フレームを直接供給する。
+    fn sim_feed(lane: &mut ChildLane, value: f32, frames: usize) {
+        let new_len = lane.fifo.len() + frames * CHANNELS as usize;
+        lane.fifo.resize(new_len, value);
+        if lane.fifo.len() > FIFO_MAX_SAMPLES {
+            let excess = lane.fifo.len() - FIFO_MAX_SAMPLES;
+            lane.fifo.drain(..excess);
+        }
+        lane.last_supply = Instant::now();
+    }
+
+    /// 同期ドリフトシミュレーションの計測結果。
+    struct DriftSimOutcome {
+        /// 1 シミュレーション秒ごとの消費後 FIFO 残量（f32 サンプル数）。
+        system_backlog: Vec<usize>,
+        mic_backlog: Vec<usize>,
+        final_ratio: f64,
+    }
+
+    /// スレッドを立てない同期シミュレーション。20ms を 1 tick として、mic に等速
+    /// （960 frame/tick）、system に (1 + ppm×1e-6) 倍レートの直流を「時間の進みを
+    /// サンプル数で模擬」しながら供給し、mix_and_push を直接ループで駆動する。
+    /// スレッド・壁時計に依存しないので完全に決定論。
+    ///
+    /// `fixed_unity_ratio` はコントローラを毎 tick 1.0 に戻す「補正なし」相当のパス。
+    /// ドリフト問題（残量の単調増大）がこのシミュレーションで実際に再現できている
+    /// ことの自己検証に使う。
+    ///
+    /// 出力値は毎 tick 全数検証する: 両側とも常に供給があるので、現れてよいのは
+    /// 合成値（0.2 + 0.3 = 0.5。直流の線形補間は同じ直流値）だけ。飢餓ゼロ埋めの
+    /// 0.0 や片側値が 1 サンプルでも出たら即 FAIL（「ゼロ埋めが定常発生しない」
+    /// ことの検証を兼ねる）。
+    fn run_drift_sim(ppm: f64, seconds: usize, fixed_unity_ratio: bool) -> DriftSimOutcome {
+        const TICK_FRAMES: usize = 960; // 20ms @48k
+        const TICKS_PER_SEC: usize = 50;
+
+        let mut mic = sim_lane();
+        let mut system = sim_lane();
+        let mut drift = DriftCorrection::new();
+        let (producer, mut consumer) = raw_ring(RAW_RING_SAMPLES);
+        let mut sink = RawSink::new(producer, SAMPLE_RATE, CHANNELS);
+        let mut mixed: Vec<f32> = Vec::with_capacity(FIFO_MAX_SAMPLES);
+        let mut scratch = vec![0.0f32; RAW_RING_SAMPLES];
+
+        // system 供給フレーム数の端数繰り越し（レート差をサンプル数で正確に模擬）。
+        let mut system_carry = 0.0f64;
+        let mut outcome = DriftSimOutcome {
+            system_backlog: Vec::new(),
+            mic_backlog: Vec::new(),
+            final_ratio: 1.0,
+        };
+
+        for tick in 0..seconds * TICKS_PER_SEC {
+            sim_feed(&mut mic, 0.2, TICK_FRAMES);
+            system_carry += TICK_FRAMES as f64 * (1.0 + ppm * 1e-6);
+            let system_frames = system_carry as usize;
+            system_carry -= system_frames as f64;
+            sim_feed(&mut system, 0.3, system_frames);
+
+            mix_and_push(
+                &mut mic,
+                &mut system,
+                1.0,
+                1.0,
+                &mut drift,
+                &mut sink,
+                &mut mixed,
+            );
+            if fixed_unity_ratio {
+                drift.controller.ratio = 1.0;
+                drift.controller.ema_diff = 0.0;
+            }
+
+            let got = consumer.pop_slice(&mut scratch);
+            for &s in &scratch[..got] {
+                assert!(
+                    (s - 0.5).abs() < VALUE_TOL,
+                    "定常シミュレーションの出力は合成値 0.5 だけのはず（ゼロ埋め・片側値は \
+                     出ない）: {s}"
+                );
+            }
+
+            if (tick + 1) % TICKS_PER_SEC == 0 {
+                outcome.system_backlog.push(system.fifo.len());
+                outcome.mic_backlog.push(mic.fifo.len());
+            }
+        }
+        outcome.final_ratio = drift.controller.ratio;
+        outcome
+    }
+
+    /// +300ppm（system が速い）を 60 秒: 補正ありでは system FIFO 残量が安全弁に
+    /// 届かず、伸びが減速し、補正なし相当より小さく収まる。補正なし相当（r = 1.0
+    /// 固定）では同条件で残量が単調増大する＝テスト自体がドリフト問題を再現できて
+    /// いることの自己検証。
+    #[test]
+    fn mix_drift_sim_plus_300ppm_stays_bounded() {
+        let corrected = run_drift_sim(300.0, 60, false);
+        let uncorrected = run_drift_sim(300.0, 60, true);
+
+        // 自己検証: 補正なしでは system 残量が毎秒単調増大（+300ppm ≒ +28.8 サンプル/秒）。
+        for (i, w) in uncorrected.system_backlog.windows(2).enumerate() {
+            assert!(
+                w[1] > w[0],
+                "補正なしでは残量が単調増大するはず: {i} 秒目 {} → {}",
+                w[0],
+                w[1]
+            );
+        }
+
+        // 補正あり: 残量は安全弁（FIFO_MAX_SAMPLES = 500ms 分）に到達しない。
+        let max_corrected = corrected.system_backlog.iter().copied().max().unwrap();
+        assert!(
+            max_corrected < FIFO_MAX_SAMPLES,
+            "補正ありなら安全弁に届かないはず: 最大 {max_corrected}"
+        );
+
+        // 補正あり: 補正なしより小さく収まる（補正が実際に効いている）。
+        let last_c = *corrected.system_backlog.last().unwrap();
+        let last_u = *uncorrected.system_backlog.last().unwrap();
+        assert!(
+            last_c < last_u,
+            "補正ありの残量 {last_c} < 補正なし {last_u} のはず"
+        );
+
+        // 補正あり: 残量の伸びが減速している（最初の 9 秒間の増分 > 最後の 9 秒間の増分）。
+        let sb = &corrected.system_backlog;
+        let early = sb[9] - sb[0];
+        let late = sb[59] - sb[50];
+        assert!(
+            late < early,
+            "比率が追い付くにつれ伸びが減速するはず: 序盤 +{early} vs 終盤 +{late}"
+        );
+
+        // 比率は「system を速く消費する」方向へ動き、クランプ内に収まる。
+        assert!(
+            corrected.final_ratio > 1.0 + 2e-5,
+            "r は 1.0 より上へ動くはず: {}",
+            corrected.final_ratio
+        );
+        assert!(
+            corrected.final_ratio <= 1.0 + DRIFT_RATIO_LIMIT + 1e-12,
+            "r はクランプ内: {}",
+            corrected.final_ratio
+        );
+    }
+
+    /// -300ppm（system が遅い）を 60 秒: 飢餓ゼロ埋めは定常発生せず（出力値検証は
+    /// run_drift_sim 内で毎 tick 全数実施）、補正ありでは mic 側の残量が安全弁に
+    /// 届かず補正なし相当より小さく収まる。
+    #[test]
+    fn mix_drift_sim_minus_300ppm_no_steady_zero_fill() {
+        let corrected = run_drift_sim(-300.0, 60, false);
+        let uncorrected = run_drift_sim(-300.0, 60, true);
+
+        // 自己検証: 補正なしでは遅い system に合わせるぶん mic 側の残量が単調増大。
+        for (i, w) in uncorrected.mic_backlog.windows(2).enumerate() {
+            assert!(
+                w[1] > w[0],
+                "補正なしでは mic 残量が単調増大するはず: {i} 秒目 {} → {}",
+                w[0],
+                w[1]
+            );
+        }
+
+        // 補正あり: mic 残量は安全弁に到達せず、補正なしより小さく収まる。
+        let max_corrected = corrected.mic_backlog.iter().copied().max().unwrap();
+        assert!(
+            max_corrected < FIFO_MAX_SAMPLES,
+            "補正ありなら安全弁に届かないはず: 最大 {max_corrected}"
+        );
+        let last_c = *corrected.mic_backlog.last().unwrap();
+        let last_u = *uncorrected.mic_backlog.last().unwrap();
+        assert!(
+            last_c < last_u,
+            "補正ありの mic 残量 {last_c} < 補正なし {last_u} のはず"
+        );
+
+        // system 側は消費が供給に追随するので溜まらない（高々補間の端数 + 直近の
+        // 端数チャンク程度）。
+        let max_sys = corrected.system_backlog.iter().copied().max().unwrap();
+        assert!(
+            max_sys < ONE_CHUNK_SAMPLES,
+            "system 側は溜まらないはず: 最大 {max_sys}"
+        );
+
+        // 比率は「system をゆっくり消費する」方向へ動き、クランプ内に収まる。
+        assert!(
+            corrected.final_ratio < 1.0 - 2e-5,
+            "r は 1.0 より下へ動くはず: {}",
+            corrected.final_ratio
+        );
+        assert!(
+            corrected.final_ratio >= 1.0 - DRIFT_RATIO_LIMIT - 1e-12,
+            "r はクランプ内: {}",
+            corrected.final_ratio
         );
     }
 }
