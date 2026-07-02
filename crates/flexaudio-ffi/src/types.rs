@@ -15,6 +15,8 @@ pub enum FlexSourceKind {
     System = 1,
     /// 特定プロセスの出力ループバック。
     Process = 2,
+    /// マイクとシステム音声を 1 本に合成して録る。
+    Mix = 3,
 }
 
 /// process ソースで対象 PID を含めるか除くか（[`flexaudio::ProcessMode`] に対応）。
@@ -41,7 +43,8 @@ pub struct FlexConfig {
     pub process_id: u32,
     /// 対象 PID を含めるか除くか（process ソースのみ）。
     pub mode: FlexProcessMode,
-    /// 自ホストの再生音をシステム音から除くか（system ソースのみ）。
+    /// 自ホストの再生音をシステム音から除くか（system ソースのみ。mix では system 側
+    /// に適用）。
     pub exclude_self: bool,
     /// 出力サンプルレート（Hz）。0 なら 48000。
     pub output_rate: u32,
@@ -52,6 +55,17 @@ pub struct FlexConfig {
     /// 開始時の入力ゲイン（線形倍率）。0 なら 1.0（既定）。実行時のミュートは
     /// `flexaudio_set_gain(s, 0.0)` を使う。
     pub gain: f32,
+    /// mix の mic 側で選ぶ入力デバイスの ID（UTF-8, NUL 終端・mix 専用）。
+    /// NULL なら既定入力。
+    pub mix_mic_device_id: *const c_char,
+    /// mix の system 側で選ぶ出力エンドポイントの ID（UTF-8, NUL 終端・mix 専用）。
+    /// NULL なら既定出力。
+    pub mix_system_device_id: *const c_char,
+    /// mix の mic 側の合成前倍率（線形・mix 専用）。0 なら 1.0（既定）。
+    /// 合成後にグローバル `gain` が掛かる。
+    pub mix_mic_gain: f32,
+    /// mix の system 側の合成前倍率（線形・mix 専用）。0 なら 1.0（既定）。
+    pub mix_system_gain: f32,
 }
 
 /// 取得した 1 チャンクのオーディオデータ。`flexaudio_poll_chunk` が埋める。

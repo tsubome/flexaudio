@@ -69,6 +69,10 @@ enum SourceArg {
     System,
     /// プロセス出力ループバック（Linux / Windows / macOS・`--process-id <PID>` 必須）。
     Process,
+    /// マイク + システム音声のミックス（Linux / Windows / macOS）。
+    /// デバイスは `--mic-device-id` / `--system-device-id`、側別ゲインは
+    /// `--mic-gain` / `--system-gain` で指定する。
+    Mix,
 }
 
 /// `--source process` の対象 PID の扱い（process 専用）。
@@ -180,6 +184,26 @@ struct Cli {
     /// 乗算後のサンプルは ±1.0 にクランプされる。負・NaN はエラー。
     #[arg(long, default_value_t = 1.0)]
     gain: f32,
+
+    /// `--source mix` の mic 側で選ぶ入力デバイスの ID（mix 専用・`--list-devices` の
+    /// ID 列からコピーする）。省略すると既定入力。mic / system / process では無視される。
+    #[arg(long)]
+    mic_device_id: Option<String>,
+
+    /// `--source mix` の system 側で選ぶ出力エンドポイントの ID（mix 専用）。
+    /// 省略すると既定出力。mic / system / process では無視される。
+    #[arg(long)]
+    system_device_id: Option<String>,
+
+    /// `--source mix` の mic 側の合成前倍率（線形・mix 専用）。既定 1.0。合成後に
+    /// `--gain` が掛かる。負・NaN はエラー。
+    #[arg(long, default_value_t = 1.0)]
+    mic_gain: f32,
+
+    /// `--source mix` の system 側の合成前倍率（線形・mix 専用）。既定 1.0。
+    /// 負・NaN はエラー。
+    #[arg(long, default_value_t = 1.0)]
+    system_gain: f32,
 }
 
 impl Cli {
@@ -290,6 +314,11 @@ fn config_for_kind(cli: &Cli, kind: SourceKind) -> StreamConfig {
         device_id: cli.device_id.clone(),
         // gain は切替では変わらない（core が無視する）が、初期 config と揃えておく。
         gain: cli.gain,
+        // mix 専用（mix 以外のセグメントでは facade が無視する）。
+        mix_mic_device_id: cli.mic_device_id.clone(),
+        mix_system_device_id: cli.system_device_id.clone(),
+        mix_mic_gain: cli.mic_gain,
+        mix_system_gain: cli.system_gain,
         ..Default::default()
     }
 }
@@ -432,6 +461,7 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
             SourceKind::Mic => "mic（既定入力デバイス）",
             SourceKind::SystemLoopback => "system（既定出力のループバック）",
             SourceKind::ProcessLoopback => "process（指定 PID の出力）",
+            SourceKind::Mix => "mix（マイク + システム音声の合成）",
         };
         (first, label)
     } else {
@@ -475,6 +505,20 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
                 );
                 }
             }
+            SourceArg::Mix => {
+                // system 側のループバックが必要なので、対応 OS は system と同じ。
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                {
+                    (SourceKind::Mix, "mix（マイク + システム音声の合成）")
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+                {
+                    return Err(
+                    "--source mix（マイク + システム音声のミックス）は現在 Linux / Windows / macOS のみ対応です。"
+                        .into(),
+                );
+                }
+            }
         }
     };
 
@@ -504,6 +548,12 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
         device_id: cli.device_id.clone(),
         // 開始時の入力ゲイン（線形倍率）。不正値は open が InvalidArg で弾く。
         gain: cli.gain,
+        // mix 専用のデバイス選択と側別ゲイン（mix 以外では facade が無視する。
+        // 不正な側別ゲインは open が InvalidArg で弾く）。
+        mix_mic_device_id: cli.mic_device_id.clone(),
+        mix_system_device_id: cli.system_device_id.clone(),
+        mix_mic_gain: cli.mic_gain,
+        mix_system_gain: cli.system_gain,
         ..Default::default()
     };
     let mut stream = flexaudio::open(config).map_err(describe_error)?;
@@ -511,12 +561,19 @@ fn run(cli: &Cli) -> std::result::Result<(), String> {
     // --- ネイティブフォーマット表示 ---
     let (native_rate, native_ch) = stream.native_format();
     log!("ソース            : {source_label}");
-    // device_id 指定時は選択デバイスを明示（mic と system で有効。process では無視）。
+    // device_id 指定時は選択デバイスを明示（mic と system で有効。process / mix では無視）。
     if let Some(id) = &cli.device_id {
-        if kind == SourceKind::ProcessLoopback {
-            log!("デバイス ID        : {id}（注: process では無視されます）");
-        } else {
-            log!("デバイス ID        : {id}");
+        match kind {
+            SourceKind::ProcessLoopback => {
+                log!("デバイス ID        : {id}（注: process では無視されます）");
+            }
+            SourceKind::Mix => {
+                log!(
+                    "デバイス ID        : {id}（注: mix では無視されます。\
+                     --mic-device-id / --system-device-id を使ってください）"
+                );
+            }
+            _ => log!("デバイス ID        : {id}"),
         }
     }
     log!("ネイティブフォーマット: {native_rate} Hz / {native_ch} ch");
@@ -680,6 +737,7 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
         SourceKind::Mic => "mic",
         SourceKind::SystemLoopback => "system",
         SourceKind::ProcessLoopback => "process",
+        SourceKind::Mix => "mix",
     }
 }
 
@@ -1255,6 +1313,39 @@ mod tests {
         assert_eq!(source_kind_label(SourceKind::Mic), "mic");
         assert_eq!(source_kind_label(SourceKind::SystemLoopback), "system");
         assert_eq!(source_kind_label(SourceKind::ProcessLoopback), "process");
+        assert_eq!(source_kind_label(SourceKind::Mix), "mix");
+    }
+
+    /// mix 用フラグ（--mic-device-id / --system-device-id / --mic-gain / --system-gain）
+    /// が StreamConfig の mix_* フィールドへ反映される。既定は None / 1.0。
+    #[test]
+    fn config_for_kind_reflects_mix_settings() {
+        let cli = cli_from(&[
+            "--source",
+            "mix",
+            "--mic-device-id",
+            "mic-a",
+            "--system-device-id",
+            "sink-b",
+            "--mic-gain",
+            "0.5",
+            "--system-gain",
+            "2.0",
+        ]);
+        let cfg = config_for_kind(&cli, SourceKind::Mix);
+        assert_eq!(cfg.kind, SourceKind::Mix);
+        assert_eq!(cfg.mix_mic_device_id.as_deref(), Some("mic-a"));
+        assert_eq!(cfg.mix_system_device_id.as_deref(), Some("sink-b"));
+        assert_eq!(cfg.mix_mic_gain, 0.5);
+        assert_eq!(cfg.mix_system_gain, 2.0);
+
+        // 未指定なら既定（デバイス None・側別ゲイン 1.0）。
+        let cli2 = cli_from(&["--source", "mix"]);
+        let cfg2 = config_for_kind(&cli2, SourceKind::Mix);
+        assert_eq!(cfg2.mix_mic_device_id, None);
+        assert_eq!(cfg2.mix_system_device_id, None);
+        assert_eq!(cfg2.mix_mic_gain, 1.0);
+        assert_eq!(cfg2.mix_system_gain, 1.0);
     }
 
     /// `truncate` は max 文字以下ならそのまま、超過なら … 付きで max 文字に収める。

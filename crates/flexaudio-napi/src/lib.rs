@@ -95,7 +95,7 @@ pub struct JsDeviceEvent {
 /// openStream / __openMockStream のオプション。
 #[napi(object)]
 pub struct OpenOptions {
-    /// "mic" | "system" | "process"
+    /// "mic" | "system" | "process" | "mix"
     pub kind: String,
     pub device_id: Option<String>,
     pub process_id: Option<u32>,
@@ -103,8 +103,9 @@ pub struct OpenOptions {
     /// include=対象 PID だけ録る / exclude=対象 PID 以外の全システム音（process_id 必須）。
     /// mic / system では無視。Linux / Windows / macOS の 3 OS とも対応。
     pub mode: Option<String>,
-    /// システム音から自ホスト（自プロセス）の音を除くか（system 専用）。既定 false。
-    /// mic / process では無視。Linux / Windows / macOS の 3 OS とも対応。
+    /// システム音から自ホスト（自プロセス）の音を除くか（system 専用。mix では
+    /// system 側に適用）。既定 false。mic / process では無視。
+    /// Linux / Windows / macOS の 3 OS とも対応。
     pub exclude_self: Option<bool>,
     /// 既定 48000
     pub output_rate: Option<u32>,
@@ -115,6 +116,14 @@ pub struct OpenOptions {
     /// 開始時の入力ゲイン（線形倍率）。既定 1.0。1.0=そのまま、2.0=約+6dB、0.0=無音。
     /// 実行時変更は `setGain`。
     pub gain: Option<f64>,
+    /// mix の mic 側で選ぶ入力デバイス ID（mix 専用）。未指定なら既定入力。
+    pub mic_device_id: Option<String>,
+    /// mix の system 側で選ぶ出力エンドポイント ID（mix 専用）。未指定なら既定出力。
+    pub system_device_id: Option<String>,
+    /// mix の mic 側の合成前倍率（線形・mix 専用）。既定 1.0。合成後に `gain` が掛かる。
+    pub mic_gain: Option<f64>,
+    /// mix の system 側の合成前倍率（線形・mix 専用）。既定 1.0。
+    pub system_gain: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +135,7 @@ fn source_kind_str(k: SourceKind) -> String {
         SourceKind::Mic => "mic",
         SourceKind::SystemLoopback => "system",
         SourceKind::ProcessLoopback => "process",
+        SourceKind::Mix => "mix",
     }
     .to_string()
 }
@@ -135,9 +145,10 @@ fn parse_source_kind(s: &str) -> NapiResult<SourceKind> {
         "mic" => Ok(SourceKind::Mic),
         "system" => Ok(SourceKind::SystemLoopback),
         "process" => Ok(SourceKind::ProcessLoopback),
+        "mix" => Ok(SourceKind::Mix),
         other => Err(NapiError::new(
             Status::InvalidArg,
-            format!("unknown kind: {other:?} (expected mic|system|process)"),
+            format!("unknown kind: {other:?} (expected mic|system|process|mix)"),
         )),
     }
 }
@@ -270,6 +281,11 @@ fn build_config(options: &OpenOptions) -> NapiResult<StreamConfig> {
         mode,
         exclude_self: options.exclude_self.unwrap_or(false),
         gain: options.gain.unwrap_or(1.0) as f32,
+        // mix 専用（mic/system/process では facade が無視する）。側別ゲインは未指定 1.0。
+        mix_mic_device_id: options.mic_device_id.clone(),
+        mix_system_device_id: options.system_device_id.clone(),
+        mix_mic_gain: options.mic_gain.unwrap_or(1.0) as f32,
+        mix_system_gain: options.system_gain.unwrap_or(1.0) as f32,
         ..Default::default()
     };
     if let Some(ms) = options.chunk_ms {
@@ -645,6 +661,7 @@ mod tests {
             ("mic", SourceKind::Mic),
             ("system", SourceKind::SystemLoopback),
             ("process", SourceKind::ProcessLoopback),
+            ("mix", SourceKind::Mix),
         ] {
             assert_eq!(parse_source_kind(s).unwrap(), k);
             assert_eq!(source_kind_str(k), s);
@@ -682,10 +699,10 @@ mod tests {
 
     // --- build_config ---
 
-    #[test]
-    fn build_config_defaults() {
-        let opts = OpenOptions {
-            kind: "mic".to_string(),
+    /// OpenOptions を全フィールド未指定（kind のみ）で作るヘルパ。
+    fn options_with_kind(kind: &str) -> OpenOptions {
+        OpenOptions {
+            kind: kind.to_string(),
             device_id: None,
             process_id: None,
             mode: None,
@@ -694,7 +711,16 @@ mod tests {
             output_channels: None,
             chunk_ms: None,
             gain: None,
-        };
+            mic_device_id: None,
+            system_device_id: None,
+            mic_gain: None,
+            system_gain: None,
+        }
+    }
+
+    #[test]
+    fn build_config_defaults() {
+        let opts = options_with_kind("mic");
         let cfg = build_config(&opts).unwrap();
         assert_eq!(cfg.kind, SourceKind::Mic);
         // 既定 output {48000, 2}。
@@ -708,6 +734,11 @@ mod tests {
         assert_eq!(cfg.chunk_ms, 20);
         // gain 未指定なら既定 1.0。
         assert_eq!(cfg.gain, 1.0);
+        // mix 専用フィールドの既定（デバイス未指定・側別ゲイン 1.0）。
+        assert_eq!(cfg.mix_mic_device_id, None);
+        assert_eq!(cfg.mix_system_device_id, None);
+        assert_eq!(cfg.mix_mic_gain, 1.0);
+        assert_eq!(cfg.mix_system_gain, 1.0);
     }
 
     #[test]
@@ -722,6 +753,10 @@ mod tests {
             output_channels: Some(1),
             chunk_ms: Some(20),
             gain: Some(2.5),
+            mic_device_id: None,
+            system_device_id: None,
+            mic_gain: None,
+            system_gain: None,
         };
         let cfg = build_config(&opts).unwrap();
         assert_eq!(cfg.kind, SourceKind::ProcessLoopback);
@@ -736,18 +771,23 @@ mod tests {
     }
 
     #[test]
+    fn build_config_reflects_mix_fields() {
+        let mut opts = options_with_kind("mix");
+        opts.mic_device_id = Some("mic-a".to_string());
+        opts.system_device_id = Some("sink-b".to_string());
+        opts.mic_gain = Some(0.5);
+        opts.system_gain = Some(2.0);
+        let cfg = build_config(&opts).unwrap();
+        assert_eq!(cfg.kind, SourceKind::Mix);
+        assert_eq!(cfg.mix_mic_device_id.as_deref(), Some("mic-a"));
+        assert_eq!(cfg.mix_system_device_id.as_deref(), Some("sink-b"));
+        assert_eq!(cfg.mix_mic_gain, 0.5);
+        assert_eq!(cfg.mix_system_gain, 2.0);
+    }
+
+    #[test]
     fn build_config_rejects_unknown_kind() {
-        let opts = OpenOptions {
-            kind: "speaker".to_string(),
-            device_id: None,
-            process_id: None,
-            mode: None,
-            exclude_self: None,
-            output_rate: None,
-            output_channels: None,
-            chunk_ms: None,
-            gain: None,
-        };
+        let opts = options_with_kind("speaker");
         let err = build_config(&opts).unwrap_err();
         assert_eq!(err.status, Status::InvalidArg);
     }

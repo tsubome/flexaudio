@@ -32,6 +32,7 @@ fn source_kind_from_c(kind: FlexSourceKind) -> SourceKind {
         FlexSourceKind::Mic => SourceKind::Mic,
         FlexSourceKind::System => SourceKind::SystemLoopback,
         FlexSourceKind::Process => SourceKind::ProcessLoopback,
+        FlexSourceKind::Mix => SourceKind::Mix,
     }
 }
 
@@ -41,6 +42,7 @@ fn source_kind_to_c(kind: SourceKind) -> FlexSourceKind {
         SourceKind::Mic => FlexSourceKind::Mic,
         SourceKind::SystemLoopback => FlexSourceKind::System,
         SourceKind::ProcessLoopback => FlexSourceKind::Process,
+        SourceKind::Mix => FlexSourceKind::Mix,
     }
 }
 
@@ -54,35 +56,48 @@ fn process_mode_from_c(mode: FlexProcessMode) -> ProcessMode {
 
 /// NUL 終端 C 文字列を `Option<String>` にする。NULL は `None`。
 ///
-/// UTF-8 として不正なら last_error をセットして `Err` を返す（呼び出し元は InvalidArg
-/// として扱う）。安全のため、呼び出し側が有効な NUL 終端ポインタ（または NULL）を渡す
-/// ことを前提にする。
+/// UTF-8 として不正なら last_error に `field`（フィールド名）入りのメッセージを
+/// セットして `Err` を返す（呼び出し元は InvalidArg として扱う）。安全のため、
+/// 呼び出し側が有効な NUL 終端ポインタ（または NULL）を渡すことを前提にする。
 ///
 /// # Safety
 /// `ptr` は NULL か、有効な NUL 終端 C 文字列を指していなければならない。
-unsafe fn opt_string_from_c(ptr: *const c_char) -> Result<Option<String>, ()> {
+unsafe fn opt_string_from_c(ptr: *const c_char, field: &str) -> Result<Option<String>, ()> {
     if ptr.is_null() {
         return Ok(None);
     }
     match CStr::from_ptr(ptr).to_str() {
         Ok(s) => Ok(Some(s.to_string())),
         Err(_) => {
-            set_last_error("device_id is not valid UTF-8");
+            set_last_error(format!("{field} is not valid UTF-8"));
             Err(())
         }
+    }
+}
+
+/// 番兵 0.0 を既定 1.0 に写すゲイン変換（`gain` / `mix_*_gain` 共通の流儀）。
+fn gain_or_default(gain: f32) -> f32 {
+    if gain == 0.0 {
+        DEFAULT_GAIN
+    } else {
+        gain
     }
 }
 
 /// `FlexConfig` から [`StreamConfig`] を組み立てる。napi の `build_config` と同じ方針で、
 /// `ring_capacity_chunks` は公開せず既定値を使う。番兵 0 のフィールドは既定へ写す。
 ///
-/// `device_id` が不正な UTF-8 なら last_error をセットして `Err`。
+/// `device_id` / `mix_mic_device_id` / `mix_system_device_id` が不正な UTF-8 なら
+/// last_error をセットして `Err`。
 ///
 /// # Safety
-/// `config` は有効な `FlexConfig` を指し、その `device_id` は NULL か有効な NUL 終端
-/// C 文字列でなければならない。
+/// `config` は有効な `FlexConfig` を指し、その文字列フィールドはいずれも NULL か
+/// 有効な NUL 終端 C 文字列でなければならない。
 pub unsafe fn build_config(config: &FlexConfig) -> Result<StreamConfig, ()> {
-    let device_id = opt_string_from_c(config.device_id)?;
+    let device_id = opt_string_from_c(config.device_id, "device_id")?;
+    let mix_mic_device_id = opt_string_from_c(config.mix_mic_device_id, "mix_mic_device_id")?;
+    let mix_system_device_id =
+        opt_string_from_c(config.mix_system_device_id, "mix_system_device_id")?;
 
     let output = OutputFormat {
         sample_rate: if config.output_rate == 0 {
@@ -114,13 +129,14 @@ pub unsafe fn build_config(config: &FlexConfig) -> Result<StreamConfig, ()> {
         } else {
             config.chunk_ms
         },
-        // gain 0.0 も番兵＝既定 1.0（output_rate 0→48000 と同じ流儀）。実行時に無音へ
-        // したいときは flexaudio_set_gain(s, 0.0) を使う。
-        gain: if config.gain == 0.0 {
-            DEFAULT_GAIN
-        } else {
-            config.gain
-        },
+        // gain 0.0 は番兵＝既定 1.0（output_rate 0→48000 と同じ流儀）。実行時に無音へ
+        // したいときは flexaudio_set_gain(s, 0.0) を使う。mix の側別ゲインも同じ流儀
+        // （0.0 番兵 → 1.0。合成前に側だけ無音にする用途は現状想定しない）。
+        gain: gain_or_default(config.gain),
+        mix_mic_device_id,
+        mix_system_device_id,
+        mix_mic_gain: gain_or_default(config.mix_mic_gain),
+        mix_system_gain: gain_or_default(config.mix_system_gain),
         output,
         // ring_capacity_chunks は公開しない（StreamConfig 既定の値を使う）。
         ..Default::default()
@@ -268,7 +284,7 @@ mod tests {
     use super::*;
     use flexaudio::ChunkFlags;
 
-    // FlexConfig をテスト用に組み立てる（device_id は NULL = 既定）。
+    // FlexConfig をテスト用に組み立てる（文字列は NULL = 既定、数値は 0 番兵）。
     fn make_config(kind: FlexSourceKind) -> FlexConfig {
         FlexConfig {
             kind,
@@ -280,6 +296,10 @@ mod tests {
             output_channels: 0,
             chunk_ms: 0,
             gain: 0.0,
+            mix_mic_device_id: ptr::null(),
+            mix_system_device_id: ptr::null(),
+            mix_mic_gain: 0.0,
+            mix_system_gain: 0.0,
         }
     }
 
@@ -298,6 +318,11 @@ mod tests {
         assert!(!cfg.exclude_self);
         // gain も 0 番兵 → 既定 1.0。
         assert_eq!(cfg.gain, 1.0);
+        // mix 専用フィールドも番兵から既定へ（NULL → None / 0.0 → 1.0）。
+        assert_eq!(cfg.mix_mic_device_id, None);
+        assert_eq!(cfg.mix_system_device_id, None);
+        assert_eq!(cfg.mix_mic_gain, 1.0);
+        assert_eq!(cfg.mix_system_gain, 1.0);
         // 公開しない ring_capacity_chunks は StreamConfig 既定（50）。
         assert_eq!(cfg.ring_capacity_chunks, 50);
     }
@@ -346,11 +371,29 @@ mod tests {
     }
 
     #[test]
+    fn build_config_reflects_mix_fields() {
+        let mic_id = CString::new("mic-a").unwrap();
+        let sys_id = CString::new("sink-b").unwrap();
+        let mut c = make_config(FlexSourceKind::Mix);
+        c.mix_mic_device_id = mic_id.as_ptr();
+        c.mix_system_device_id = sys_id.as_ptr();
+        c.mix_mic_gain = 0.5;
+        c.mix_system_gain = 2.0;
+        let cfg = unsafe { build_config(&c) }.unwrap();
+        assert_eq!(cfg.kind, SourceKind::Mix);
+        assert_eq!(cfg.mix_mic_device_id.as_deref(), Some("mic-a"));
+        assert_eq!(cfg.mix_system_device_id.as_deref(), Some("sink-b"));
+        assert_eq!(cfg.mix_mic_gain, 0.5);
+        assert_eq!(cfg.mix_system_gain, 2.0);
+    }
+
+    #[test]
     fn source_kind_roundtrips() {
         for (c, k) in [
             (FlexSourceKind::Mic, SourceKind::Mic),
             (FlexSourceKind::System, SourceKind::SystemLoopback),
             (FlexSourceKind::Process, SourceKind::ProcessLoopback),
+            (FlexSourceKind::Mix, SourceKind::Mix),
         ] {
             assert_eq!(source_kind_from_c(c), k);
             assert_eq!(source_kind_to_c(k), c);

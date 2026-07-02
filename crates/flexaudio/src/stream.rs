@@ -35,7 +35,8 @@ use flexaudio_core::types::{
 
 /// RawRing の容量（f32 サンプル単位）。ネイティブ SR×ch に依存させず、
 /// 多めに確保して RT 経路のドロップを避ける（約 0.5 秒 @ 48k stereo 相当の余裕）。
-const RAW_RING_SAMPLES: usize = 48_000;
+/// mix ソースの合成バックエンド（`mix.rs`）も子リングに同じ容量を使う。
+pub(crate) const RAW_RING_SAMPLES: usize = 48_000;
 
 /// ウォッチドッグの tick 間隔。
 const WATCHDOG_TICK: Duration = Duration::from_millis(250);

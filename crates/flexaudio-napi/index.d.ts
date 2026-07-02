@@ -42,19 +42,20 @@ export interface JsDeviceEvent {
 }
 /** openStream / __openMockStream のオプション。 */
 export interface OpenOptions {
-  /** "mic" | "system" | "process" */
+  /** "mic" | "system" | "process" | "mix" */
   kind: string
   deviceId?: string
   processId?: number
   /**
    * process の対象 PID の扱い（process 専用）。"include"（既定）| "exclude"。
    * include=対象 PID だけ録る / exclude=対象 PID 以外の全システム音（process_id 必須）。
-   * mic / system では無視。Linux では "exclude" は未実装で start 時に例外。
+   * mic / system では無視。Linux / Windows / macOS の 3 OS とも対応。
    */
   mode?: string
   /**
-   * システム音から自ホスト（自プロセス）の音を除くか（system 専用）。既定 false。
-   * mic / process では無視。Linux では true は未実装で start 時に例外。
+   * システム音から自ホスト（自プロセス）の音を除くか（system 専用。mix では
+   * system 側に適用）。既定 false。mic / process では無視。
+   * Linux / Windows / macOS の 3 OS とも対応。
    */
   excludeSelf?: boolean
   /** 既定 48000 */
@@ -68,6 +69,14 @@ export interface OpenOptions {
    * 実行時変更は `setGain`。
    */
   gain?: number
+  /** mix の mic 側で選ぶ入力デバイス ID（mix 専用）。未指定なら既定入力。 */
+  micDeviceId?: string
+  /** mix の system 側で選ぶ出力エンドポイント ID（mix 専用）。未指定なら既定出力。 */
+  systemDeviceId?: string
+  /** mix の mic 側の合成前倍率（線形・mix 専用）。既定 1.0。合成後に `gain` が掛かる。 */
+  micGain?: number
+  /** mix の system 側の合成前倍率（線形・mix 専用）。既定 1.0。 */
+  systemGain?: number
 }
 /** 利用可能なデバイスを列挙する。ヘッドレス環境では空配列でも throw しない。 */
 export declare function devices(): NapiResult

@@ -42,23 +42,25 @@ fn to_py_err(err: fa::Error) -> PyErr {
 // 列挙体 ↔ 文字列の変換ヘルパ
 // ---------------------------------------------------------------------------
 
-/// [`SourceKind`] を Python 向け文字列（"mic"|"system"|"process"）へ。
+/// [`SourceKind`] を Python 向け文字列（"mic"|"system"|"process"|"mix"）へ。
 fn source_kind_str(k: SourceKind) -> &'static str {
     match k {
         SourceKind::Mic => "mic",
         SourceKind::SystemLoopback => "system",
         SourceKind::ProcessLoopback => "process",
+        SourceKind::Mix => "mix",
     }
 }
 
-/// "mic"|"system"|"process" を [`SourceKind`] へ。不正値は `ValueError`。
+/// "mic"|"system"|"process"|"mix" を [`SourceKind`] へ。不正値は `ValueError`。
 fn parse_source_kind(s: &str) -> PyResult<SourceKind> {
     match s {
         "mic" => Ok(SourceKind::Mic),
         "system" => Ok(SourceKind::SystemLoopback),
         "process" => Ok(SourceKind::ProcessLoopback),
+        "mix" => Ok(SourceKind::Mix),
         other => Err(PyValueError::new_err(format!(
-            "unknown kind: {other:?} (expected mic|system|process)"
+            "unknown kind: {other:?} (expected mic|system|process|mix)"
         ))),
     }
 }
@@ -80,7 +82,8 @@ fn parse_process_mode(s: &str) -> PyResult<ProcessMode> {
 
 /// Python 引数から [`StreamConfig`] を組む。`ring_capacity_chunks` は既定値を使う。
 /// napi の `build_config` と同じく kind/device_id/process_id/mode/exclude_self/
-/// output_rate/output_channels/chunk_ms/gain だけを受ける。
+/// output_rate/output_channels/chunk_ms/gain と mix 専用の mic_device_id/
+/// system_device_id/mic_gain/system_gain を受ける。
 #[allow(clippy::too_many_arguments)]
 fn build_config(
     kind: &str,
@@ -92,6 +95,10 @@ fn build_config(
     output_channels: u16,
     chunk_ms: u32,
     gain: f32,
+    mic_device_id: Option<String>,
+    system_device_id: Option<String>,
+    mic_gain: f32,
+    system_gain: f32,
 ) -> PyResult<StreamConfig> {
     let kind = parse_source_kind(kind)?;
     let mode = parse_process_mode(mode)?;
@@ -109,6 +116,11 @@ fn build_config(
         exclude_self,
         chunk_ms,
         gain,
+        // mix 専用（mix 以外では facade が無視する）。
+        mix_mic_device_id: mic_device_id,
+        mix_system_device_id: system_device_id,
+        mix_mic_gain: mic_gain,
+        mix_system_gain: system_gain,
         // ring_capacity_chunks は既定値を使う。
         ..Default::default()
     })
@@ -349,11 +361,13 @@ impl Stream {
         self.inner.poll_event().map(event_to_py)
     }
 
-    /// 録音を止めずに入力ソース（mic/system/process）をホットスワップする。
+    /// 録音を止めずに入力ソース（mic/system/process/mix）をホットスワップする。
     ///
     /// 出力フォーマット（output_rate/output_channels）は切替では変えられない。変更を
     /// 要求すると `switch_source` がエラーを返し、ここで例外になる。
     /// `gain` も受けるがコアが無視する（ゲインはストリームの状態。変更は `set_gain`）。
+    /// `mic_device_id`/`system_device_id`/`mic_gain`/`system_gain` は mix 専用
+    /// （他ソースでは無視される）。
     #[pyo3(signature = (
         kind,
         *,
@@ -365,6 +379,10 @@ impl Stream {
         output_channels = 2,
         chunk_ms = 20,
         gain = 1.0,
+        mic_device_id = None,
+        system_device_id = None,
+        mic_gain = 1.0,
+        system_gain = 1.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn switch_source(
@@ -378,6 +396,10 @@ impl Stream {
         output_channels: u16,
         chunk_ms: u32,
         gain: f32,
+        mic_device_id: Option<String>,
+        system_device_id: Option<String>,
+        mic_gain: f32,
+        system_gain: f32,
     ) -> PyResult<()> {
         let config = build_config(
             kind,
@@ -389,6 +411,10 @@ impl Stream {
             output_channels,
             chunk_ms,
             gain,
+            mic_device_id,
+            system_device_id,
+            mic_gain,
+            system_gain,
         )?;
         self.inner.switch_source(config).map_err(to_py_err)
     }
@@ -423,8 +449,11 @@ fn devices() -> PyResult<Vec<PyDeviceInfo>> {
 
 /// ストリームを開いて `start()` まで済ませ、[`Stream`] を返す。
 ///
-/// `kind` は "mic"|"system"|"process"。不正値は `ValueError`。デバイスが無い環境では
-/// open / start が flexaudio のエラーを上げる（`RuntimeError` 等に変換される）。
+/// `kind` は "mic"|"system"|"process"|"mix"。不正値は `ValueError`。デバイスが無い
+/// 環境では open / start が flexaudio のエラーを上げる（`RuntimeError` 等に変換される）。
+/// `mic_device_id`/`system_device_id`/`mic_gain`/`system_gain` は mix 専用で、mix の
+/// mic 側 / system 側のデバイス選択と合成前倍率を決める（他ソースでは無視される。
+/// 合成後にグローバル `gain` が掛かる）。
 #[pyfunction]
 #[pyo3(signature = (
     kind,
@@ -437,6 +466,10 @@ fn devices() -> PyResult<Vec<PyDeviceInfo>> {
     output_channels = 2,
     chunk_ms = 20,
     gain = 1.0,
+    mic_device_id = None,
+    system_device_id = None,
+    mic_gain = 1.0,
+    system_gain = 1.0,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn open(
@@ -449,6 +482,10 @@ fn open(
     output_channels: u16,
     chunk_ms: u32,
     gain: f32,
+    mic_device_id: Option<String>,
+    system_device_id: Option<String>,
+    mic_gain: f32,
+    system_gain: f32,
 ) -> PyResult<Stream> {
     let config = build_config(
         kind,
@@ -460,6 +497,10 @@ fn open(
         output_channels,
         chunk_ms,
         gain,
+        mic_device_id,
+        system_device_id,
+        mic_gain,
+        system_gain,
     )?;
     let mut stream = fa::open(config).map_err(to_py_err)?;
     stream.start().map_err(to_py_err)?;
@@ -515,6 +556,7 @@ mod tests {
             ("mic", SourceKind::Mic),
             ("system", SourceKind::SystemLoopback),
             ("process", SourceKind::ProcessLoopback),
+            ("mix", SourceKind::Mix),
         ] {
             assert_eq!(parse_source_kind(s).unwrap(), k);
             assert_eq!(source_kind_str(k), s);
@@ -533,9 +575,16 @@ mod tests {
         assert!(parse_process_mode("nope").is_err());
     }
 
+    /// 既定引数相当で build_config を呼ぶヘルパ（open/switch_source の既定と揃える）。
+    fn build_config_with_defaults(kind: &str) -> PyResult<StreamConfig> {
+        build_config(
+            kind, None, None, "include", false, 48_000, 2, 20, 1.0, None, None, 1.0, 1.0,
+        )
+    }
+
     #[test]
     fn build_config_defaults() {
-        let cfg = build_config("mic", None, None, "include", false, 48_000, 2, 20, 1.0).unwrap();
+        let cfg = build_config_with_defaults("mic").unwrap();
         assert_eq!(cfg.kind, SourceKind::Mic);
         assert_eq!(cfg.output.sample_rate, 48_000);
         assert_eq!(cfg.output.channels, 2);
@@ -545,6 +594,11 @@ mod tests {
         assert_eq!(cfg.device_id, None);
         assert_eq!(cfg.chunk_ms, 20);
         assert_eq!(cfg.gain, 1.0);
+        // mix 専用フィールドの既定（デバイス未指定・側別ゲイン 1.0）。
+        assert_eq!(cfg.mix_mic_device_id, None);
+        assert_eq!(cfg.mix_system_device_id, None);
+        assert_eq!(cfg.mix_mic_gain, 1.0);
+        assert_eq!(cfg.mix_system_gain, 1.0);
         // 指定外の ring_capacity_chunks は StreamConfig 既定（50）。
         assert_eq!(
             cfg.ring_capacity_chunks,
@@ -564,6 +618,10 @@ mod tests {
             1,
             20,
             2.5,
+            None,
+            None,
+            1.0,
+            1.0,
         )
         .unwrap();
         assert_eq!(cfg.kind, SourceKind::ProcessLoopback);
@@ -577,8 +635,33 @@ mod tests {
     }
 
     #[test]
+    fn build_config_reflects_mix_fields() {
+        let cfg = build_config(
+            "mix",
+            None,
+            None,
+            "include",
+            false,
+            48_000,
+            2,
+            20,
+            1.0,
+            Some("mic-a".to_string()),
+            Some("sink-b".to_string()),
+            0.5,
+            2.0,
+        )
+        .unwrap();
+        assert_eq!(cfg.kind, SourceKind::Mix);
+        assert_eq!(cfg.mix_mic_device_id.as_deref(), Some("mic-a"));
+        assert_eq!(cfg.mix_system_device_id.as_deref(), Some("sink-b"));
+        assert_eq!(cfg.mix_mic_gain, 0.5);
+        assert_eq!(cfg.mix_system_gain, 2.0);
+    }
+
+    #[test]
     fn build_config_rejects_unknown_kind() {
-        assert!(build_config("speaker", None, None, "include", false, 48_000, 2, 20, 1.0).is_err());
+        assert!(build_config_with_defaults("speaker").is_err());
     }
 
     #[test]

@@ -127,6 +127,8 @@ pub enum SourceKind {
     SystemLoopback,
     /// 特定プロセスの出力ループバック。
     ProcessLoopback,
+    /// マイクとシステム音声を 1 本に合成して録る（mic + system のミックス）。
+    Mix,
 }
 
 /// [`SourceKind::ProcessLoopback`] で対象 PID をどう扱うか（process ソース専用）。
@@ -209,18 +211,22 @@ impl Default for OutputFormat {
 /// 1 ストリームを開くための構成。
 ///
 /// [`Default`] は `chunk_ms = 20`, `ring_capacity_chunks = 50`, `mode = Include`,
-/// `exclude_self = false`, `kind = Mic`, `output = {48000, 2}`, `gain = 1.0` を返す。
+/// `exclude_self = false`, `kind = Mic`, `output = {48000, 2}`, `gain = 1.0`,
+/// `mix_mic_device_id = None`, `mix_system_device_id = None`, `mix_mic_gain = 1.0`,
+/// `mix_system_gain = 1.0` を返す。
 ///
 /// process ソースの対象 PID 扱いは [`mode`](Self::mode) だけ、system ソースの自ホスト
 /// 除外は [`exclude_self`](Self::exclude_self) だけが決める。process ソースは
 /// `exclude_self` を、system ソースは `mode` を無視する（mic は両方無関係）。
+/// `mix_*` の 4 フィールドは [`SourceKind::Mix`] 専用で、それ以外のソースでは無視される。
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamConfig {
     /// 選ぶデバイス。mic（入力デバイス）と system（出力エンドポイント）の両方に効く。
     /// `None` なら既定（mic=既定入力 / system=既定出力）、`Some(id)` なら `devices()`
     /// が返す安定 ID に一致するデバイス。不一致なら `start` 時に
     /// [`Error::DeviceNotFound`]。[`SourceKind::ProcessLoopback`] では無視される
-    /// （`target_pid` で対象を決める）。
+    /// （`target_pid` で対象を決める）。[`SourceKind::Mix`] でも無視される
+    /// （代わりに `mix_mic_device_id` / `mix_system_device_id` で各側を選ぶ）。
     pub device_id: Option<String>,
     /// ソース種別。
     pub kind: SourceKind,
@@ -236,7 +242,8 @@ pub struct StreamConfig {
     pub mode: ProcessMode,
     /// 自ホスト（自プロセス）の再生音をシステム音から除外するか（system ソースのみ。
     /// フィードバックループ防止）。`true` で self PID（`std::process::id()`）を除外
-    /// する。[`SourceKind::SystemLoopback`] 以外では無視される。
+    /// する。[`SourceKind::Mix`] では system 側の子キャプチャに適用される。
+    /// それ以外のソースでは無視される。
     pub exclude_self: bool,
     /// 出力チャンクのフォーマット。既定 `{48000, 2}`（パススルー）。
     pub output: OutputFormat,
@@ -244,6 +251,19 @@ pub struct StreamConfig {
     /// 有限かつ 0.0 以上であること（外れていれば open が [`Error::InvalidArg`]）。
     /// 実行時変更は `Stream::set_gain`。
     pub gain: f32,
+    /// [`SourceKind::Mix`] の mic 側で選ぶ入力デバイス。`None` なら既定入力。
+    /// id は `devices()` が返す mic の安定 ID。`Mix` 以外では無視される。
+    pub mix_mic_device_id: Option<String>,
+    /// [`SourceKind::Mix`] の system 側で選ぶ出力エンドポイント。`None` なら既定出力。
+    /// id は `devices()` が返す system の安定 ID。`Mix` 以外では無視される。
+    pub mix_system_device_id: Option<String>,
+    /// [`SourceKind::Mix`] の mic 側の合成前倍率（線形）。既定 1.0。`Mix` 以外では
+    /// 無視される。既存の [`gain`](Self::gain) はグローバルで合成後に適用される
+    /// （最終値 ≒ clamp(clamp(mic×mix_mic_gain + sys×mix_system_gain) × gain)）。
+    pub mix_mic_gain: f32,
+    /// [`SourceKind::Mix`] の system 側の合成前倍率（線形）。既定 1.0。`Mix` 以外では
+    /// 無視される。合成後のグローバル倍率は [`gain`](Self::gain) を参照。
+    pub mix_system_gain: f32,
 }
 
 impl Default for StreamConfig {
@@ -258,6 +278,10 @@ impl Default for StreamConfig {
             exclude_self: false,
             output: OutputFormat::default(),
             gain: 1.0,
+            mix_mic_device_id: None,
+            mix_system_device_id: None,
+            mix_mic_gain: 1.0,
+            mix_system_gain: 1.0,
         }
     }
 }
@@ -338,6 +362,11 @@ mod tests {
         assert_eq!(c.device_id, None);
         assert_eq!(c.target_pid, None);
         assert_eq!(c.gain, 1.0);
+        // Mix 専用フィールドの既定（デバイス未指定・合成前倍率 1.0）。
+        assert_eq!(c.mix_mic_device_id, None);
+        assert_eq!(c.mix_system_device_id, None);
+        assert_eq!(c.mix_mic_gain, 1.0);
+        assert_eq!(c.mix_system_gain, 1.0);
         // 既定の出力は内部正規形と同一（第 2 段パススルー）。
         assert_eq!(c.output.sample_rate, SAMPLE_RATE);
         assert_eq!(c.output.channels, CHANNELS);
